@@ -1,0 +1,55 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+sdist/
+wheels/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Compiled extensions
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Protobuf generated stubs (produced by `make -C kv-service proto-python`)
+src/contextstore/kvservice_client/_pb/*_pb2.py
+src/contextstore/kvservice_client/_pb/*_pb2_grpc.py
+src/contextstore/kvservice_client/_pb/*.pyi
+
+# ---- Rust ----
+**/target/
+**/*.rs.bk
+# Cargo.lock IS committed for the binary crates (server / client-rs / rdma-ffi)
+# for reproducible builds. Do not add Cargo.lock to this ignore list.
+
+# ---- Local / OS ----
+.DS_Store
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data & logs
+/tmp/
+/data/
+*.log
+*.pt
+*.ckpt

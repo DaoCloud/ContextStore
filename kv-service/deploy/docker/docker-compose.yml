@@ -1,0 +1,38 @@
+version: "3.8"
+
+# Build context must be the repository root because the Dockerfile references
+# `kv-service/server/` and `kv-service/proto/`. From this file's location
+# (kv-service/deploy/docker/) that is `../../..`.
+services:
+  kv-service:
+    image: contextstore/kv-service:latest
+    build:
+      context: ../../..
+      dockerfile: kv-service/deploy/docker/Dockerfile
+    container_name: contextstore-kv
+    restart: unless-stopped
+    network_mode: host          # Share host network (gRPC + RDMA)
+    privileged: true            # Access NVMe devices
+    volumes:
+      - ../../configs/server.toml:/etc/contextstore/server.toml:ro
+      - cs-data-0:/data/nvme0
+      - cs-data-1:/data/nvme1
+      - cs-data-2:/data/nvme2
+      - cs-data-3:/data/nvme3
+      - cs-meta:/var/lib/contextstore
+    environment:
+      - RUST_LOG=info
+    ulimits:
+      memlock: -1
+      nofile: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+volumes:
+  cs-data-0: {}
+  cs-data-1: {}
+  cs-data-2: {}
+  cs-data-3: {}
+  cs-meta:   {}

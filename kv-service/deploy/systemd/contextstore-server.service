@@ -1,0 +1,27 @@
+[Unit]
+Description=ContextStore KV Service
+Documentation=https://github.com/DaoCloud/ContextStore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=contextstore
+Group=contextstore
+ExecStart=/usr/local/bin/contextstore-server --config /etc/contextstore/server.toml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Resource limits
+MemoryMax=140G
+TasksMax=8192
+
+# Sandbox hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/contextstore /var/log/contextstore /mnt/cs
+
+[Install]
+WantedBy=multi-user.target

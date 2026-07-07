@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: contextstore-kv
+  labels:
+    app: contextstore-kv
+spec:
+  serviceName: contextstore-kv
+  replicas: 3
+  selector:
+    matchLabels:
+      app: contextstore-kv
+  template:
+    metadata:
+      labels:
+        app: contextstore-kv
+    spec:
+      # Anti-affinity: one pod per node, avoids single-node failure taking out multiple replicas
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["contextstore-kv"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: kv-service
+          image: contextstore/kv-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/contextstore
+              readOnly: true
+            - name: nvme-0
+              mountPath: /data/nvme0
+            - name: nvme-1
+              mountPath: /data/nvme1
+            - name: nvme-2
+              mountPath: /data/nvme2
+            - name: nvme-3
+              mountPath: /data/nvme3
+            - name: metadata
+              mountPath: /var/lib/contextstore
+          resources:
+            requests:
+              memory: "140Gi"
+              cpu: "16"
+            limits:
+              memory: "140Gi"
+              cpu: "32"
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: contextstore-kv-config
+        - name: nvme-0
+          hostPath: {path: /mnt/cs/nvme1, type: DirectoryOrCreate}
+        - name: nvme-1
+          hostPath: {path: /mnt/cs/nvme2, type: DirectoryOrCreate}
+        - name: nvme-2
+          hostPath: {path: /mnt/cs/nvme3, type: DirectoryOrCreate}
+        - name: nvme-3
+          hostPath: {path: /mnt/cs/nvme4, type: DirectoryOrCreate}
+        - name: metadata
+          hostPath: {path: /var/lib/contextstore, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: contextstore-kv
+spec:
+  clusterIP: None    # Headless service, provides stable DNS for the StatefulSet
+  selector:
+    app: contextstore-kv
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: contextstore-kv-config
+data:
+  server.toml: |
+    [api]
+    listen = "0.0.0.0:50051"
+    max_connections = 2000
+
+    [storage]
+    devices = ["/data/nvme0", "/data/nvme1", "/data/nvme2", "/data/nvme3"]
+    data_subdir = "contextstore"
+
+    [memory_tier]
+    capacity_mb = 131072
+    slab_size_mb = 64
+    use_pinned_memory = true
+
+    [io_executor]
+    kind = "tier_b"
+    thread_pool_size = 32
+    io_uring_depth = 256
+
+    [router]
+    strategy = "object_hash"
+
+    [metadata]
+    rocksdb_path = "/var/lib/contextstore/metadata"

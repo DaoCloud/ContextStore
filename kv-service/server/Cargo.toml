@@ -1,0 +1,104 @@
+[package]
+name = "contextstore-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["ContextStore Team"]
+description = "ContextStore KV Service - distributed storage service for LLM KV cache"
+license = "Apache-2.0"
+
+[[bin]]
+name = "contextstore-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "cs-kvservice-bench"
+path = "src/bin/cs_kvservice_bench.rs"
+
+[dependencies]
+# gRPC
+tonic = "0.11"
+prost = "0.12"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Metadata store
+rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
+
+# Hashing & sharding
+md-5 = "0.10"
+twox-hash = "1.6"
+
+# Concurrency
+parking_lot = "0.12"
+dashmap = "5"
+crossbeam-channel = "0.5"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Time
+chrono = "0.4"
+
+# Cache
+lru = "0.12"
+
+# Metrics (optional)
+prometheus = { version = "0.13", optional = true }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"], optional = true }
+
+# Tier B: io_uring (when enabled, only actually compiles on Linux; see src/io_executor/mod.rs)
+io-uring = { version = "0.6", optional = true }
+libc = { version = "0.2", optional = true }
+
+# GDS: loads libcufile.so + libcudart.so at runtime via libloading.
+# Not linked at build time; falls back gracefully at runtime when the libraries are missing.
+libloading = { version = "0.8", optional = true }
+once_cell = "1"
+
+# RDMA: raw libibverbs FFI (requires libibverbs-dev on the host)
+rdma-sys = { version = "0.3", optional = true }
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[features]
+default = []
+metrics = ["dep:prometheus", "dep:hyper"]
+# Tier B io_uring backend (requires Linux kernel >= 5.10)
+io-uring = ["dep:io-uring", "dep:libc"]
+# GDS (GPUDirect Storage): enables cuFile on the Tier B path for direct DMA into GPU HBM.
+# Loaded at runtime via libloading; the host must have libcufile.so + the nvidia-fs kmod.
+# No CUDA / cuFile headers are required at build time.
+gds = ["io-uring", "dep:libloading", "dep:libc"]
+# Tier C SPDK backend (requires an external SPDK install)
+spdk = []
+# RDMA tier: bypasses gRPC and pushes payloads via verbs RC WRITE straight into client memory.
+# Requires libibverbs-dev + a ConnectX-x class HCA.
+rdma = ["dep:rdma-sys", "dep:libc"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

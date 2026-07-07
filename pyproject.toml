@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextstore"
+dynamic = ["version"]
+description = "KV Cache tiered storage platform for LLM inference (vLLM / Dynamo / NIXL)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ContextStore Team" }]
+
+# Runtime dependencies
+# - torch/numpy: Connector codec + tensor ops
+# - grpcio/protobuf: KVService gRPC client
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.24",
+    "grpcio>=1.60",
+    "protobuf>=4.25",
+]
+
+[project.optional-dependencies]
+# Back PrefixIndex with Redis (for cross-instance sharing)
+redis = ["redis>=5.0"]
+
+# Regenerate KVService protobuf (`make -C kv-service proto-python`)
+proto = ["grpcio-tools>=1.60"]
+
+# Run `pytest tests/`
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "fakeredis>=2.20",
+]
+
+# Developer toolchain
+dev = [
+    "black>=23",
+    "ruff>=0.1",
+    "grpcio-tools>=1.60",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "fakeredis>=2.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/DaoCloud/ContextStore"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["contextstore*"]
+
+[tool.setuptools.package-data]
+# Ship the generated KVService gRPC stubs alongside the client
+"contextstore.kvservice_client" = ["_pb/*.py", "_pb/*.pyi"]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

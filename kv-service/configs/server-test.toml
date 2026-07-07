@@ -1,0 +1,53 @@
+# ContextStore KV Service — test config (8× local NVMe: /mnt/cs/nvme2..9)
+#
+# Safety contract (verified against the source):
+#   - Server only creates subdirectories under each device's data_subdir and writes .bin files
+#   - Delete RPC only removes individual files; it never removes directories
+#   - Never formats, never touches raw devices, never touches nvme0n1 / nvme1n1
+#   - Data layout: <mountpoint>/contextstore/data/<model>/<hh>/<lo>/<layer>.bin
+
+[api]
+listen = "0.0.0.0:50051"
+max_connections = 2000
+
+[storage]
+# The 8 NVMe devices you have already mounted — note these are not the default nvme1..8
+devices = [
+    "/mnt/cs/nvme2",
+    "/mnt/cs/nvme3",
+    "/mnt/cs/nvme4",
+    "/mnt/cs/nvme5",
+    "/mnt/cs/nvme6",
+    "/mnt/cs/nvme7",
+    "/mnt/cs/nvme8",
+    "/mnt/cs/nvme9",
+]
+data_subdir = "contextstore"
+striping_threshold = 268435456    # 256 MB; 0 disables striping
+striping_chunk_size = 67108864    # 64 MB
+
+[memory_tier]
+capacity_mb = 16384         # L1 = 16 GB, tune to available node RAM
+slab_size_mb = 64
+use_pinned_memory = false   # Do not lock pages: avoids fighting CUDA/vLLM for pinned memory
+
+[io_executor]
+# tier_a = cross-platform ThreadPool+POSIX, works with the default build (safest starting point)
+# tier_b = io_uring, requires `cargo build --release --features io-uring`
+kind = "tier_a"
+thread_pool_size = 32
+io_uring_depth = 256
+
+[router]
+strategy = "object_hash"   # Shard by opaque object identity
+
+[metadata]
+# RocksDB metadata: keep on a persistent disk, separate from data_subdir for easier
+# management / backup.
+# NOTE: losing this directory means already-persisted data can no longer be indexed.
+# Do not delete it accidentally.
+rocksdb_path = "/mnt/cs/nvme2/contextstore-meta"
+
+[metrics]
+enabled = false             # Set to true after building with --features metrics
+listen = "0.0.0.0:9090"

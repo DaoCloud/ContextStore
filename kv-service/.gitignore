@@ -1,0 +1,14 @@
+# Rust build artifacts
+server/target/
+client-rs/target/
+rdma-ffi/target/
+**/*.rs.bk
+
+# Local data / logs (KVService data directory)
+data/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp

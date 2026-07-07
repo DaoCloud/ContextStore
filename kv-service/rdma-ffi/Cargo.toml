@@ -1,0 +1,21 @@
+[package]
+name = "contextstore-rdma-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "ContextStore RDMA client as C ABI cdylib, for Python ctypes use"
+license = "Apache-2.0"
+
+[lib]
+name = "contextstore_rdma_ffi"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+rdma-sys = "0.3"
+anyhow = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

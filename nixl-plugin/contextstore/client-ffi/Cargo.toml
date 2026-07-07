@@ -1,0 +1,21 @@
+[package]
+name = "contextstore-nixl-client-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "ContextStore NIXL client C ABI for the CONTEXTSTORE NIXL backend plugin"
+license = "Apache-2.0"
+
+[lib]
+name = "contextstore_nixl_client"
+crate-type = ["cdylib"]
+
+[dependencies]
+contextstore-client-rs = { path = "../../../kv-service/client-rs" }
+contextstore-rdma-ffi = { path = "../../../kv-service/rdma-ffi", optional = true }
+libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[features]
+default = []
+rdma = ["dep:contextstore-rdma-ffi"]
+

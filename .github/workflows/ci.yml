@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ==========================================================================
+  # Python: Connector + KVService client SDK
+  # ==========================================================================
+  python:
+    name: Python (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package + test extras
+        run: |
+          python -m pip install --upgrade pip
+          # torch is a heavy dep and only needed for codec/connector tests;
+          # install the CPU wheel explicitly so we don't pull CUDA.
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.2.0'
+          pip install -e '.[test]'
+
+      - name: Ruff (lint)
+        run: |
+          pip install ruff
+          ruff check src/ tests/
+
+      - name: Black (format check)
+        run: |
+          pip install black
+          black --check src/ tests/
+
+      - name: Pytest
+        run: pytest tests/ -v --tb=short
+
+  # ==========================================================================
+  # Rust: KVService server + client-rs + rdma-ffi
+  # ==========================================================================
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              protobuf-compiler libclang-dev pkg-config cmake \
+              libibverbs-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kv-service/server/target
+            kv-service/client-rs/target
+            kv-service/rdma-ffi/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build server (default features)
+        working-directory: kv-service/server
+        run: cargo build --release
+
+      - name: Build server (--features io-uring)
+        working-directory: kv-service/server
+        run: cargo build --release --features io-uring
+
+      - name: Build server (--features rdma)
+        working-directory: kv-service/server
+        run: cargo build --release --features rdma
+
+      - name: Build server (--features metrics)
+        working-directory: kv-service/server
+        run: cargo build --release --features metrics
+
+      - name: Build client-rs
+        working-directory: kv-service/client-rs
+        run: cargo build --release
+
+      - name: Build client-rs (--features rdma, for cs-rdma-bench)
+        working-directory: kv-service/client-rs
+        run: cargo build --release --features rdma
+
+      - name: Build rdma-ffi cdylib
+        working-directory: kv-service/rdma-ffi
+        run: cargo build --release
+
+      - name: Cargo test (server)
+        working-directory: kv-service/server
+        run: cargo test --release
+
+      - name: Cargo fmt --check
+        run: |
+          cd kv-service/server   && cargo fmt --check
+          cd ../client-rs        && cargo fmt --check
+          cd ../rdma-ffi         && cargo fmt --check
+
+      - name: Cargo clippy (server)
+        working-directory: kv-service/server
+        run: cargo clippy --release -- -D warnings
+
+      - name: Cargo clippy (client-rs)
+        working-directory: kv-service/client-rs
+        run: cargo clippy --release -- -D warnings
+
+      - name: Cargo clippy (rdma-ffi)
+        working-directory: kv-service/rdma-ffi
+        run: cargo clippy --release -- -D warnings
