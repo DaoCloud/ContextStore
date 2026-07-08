@@ -247,6 +247,7 @@ message PutChunk {
   // The server uses it to BytesMut::with_capacity in one shot during recv, eliminating
   // realloc overhead as data accumulates.
   int64 total_size = 6;
+  PutOptions options = 7;   // Only required in the first chunk; carries if_not_exists / ttl semantics.
 }
 
 // ============ GPU zero-copy ============

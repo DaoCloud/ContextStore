@@ -658,7 +658,9 @@ class KVClient:
             if ch.is_last:
                 break
         if fresh is None:
-            return None
+            fresh = descriptor
+        if fresh_placement is None:
+            fresh_placement = placement
         return chunks, fresh, fresh_placement
 
     def get_stream_chunks_cached(
