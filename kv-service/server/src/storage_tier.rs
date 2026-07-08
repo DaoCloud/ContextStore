@@ -335,6 +335,43 @@ impl StorageTier {
         Ok(())
     }
 
+    /// PUT-if-absent: check metadata and write under the same per-key lock.
+    pub fn put_if_absent(&self, key: &ObjectKey, data: Bytes, meta: BlockMeta) -> Result<bool> {
+        let write_lock = self.key_write_lock(key);
+        let _guard = write_lock.lock();
+
+        if self.metadata.get_block(&key.to_string_key())?.is_some() {
+            return Ok(false);
+        }
+        if self.should_stripe(data.len()) {
+            self.put_striped(key, data, meta)?;
+            return Ok(true);
+        }
+
+        let mut meta = self.prepare_write_meta(key, meta, data.len() as u64)?;
+        let device_id = self.router.route(key);
+        let path = self.router.key_to_versioned_path(
+            key,
+            device_id,
+            meta.object_generation,
+            meta.layout_version,
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let nbytes = data.len();
+        self.executor.write_file(&path, &data)?;
+        meta.file_path = path.to_string_lossy().to_string();
+        meta.size = nbytes as u64;
+        meta.device_id = device_id as u32;
+        meta.striping = None;
+        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        self.writes_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(nbytes as u64, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Multi-segment PUT — zero-copy passthrough: caller supplies a set of `Bytes` (typical: 240 2MB
     /// chunks accumulated by put_stream). On the striping path, segments are rebucketed on
     /// `striping_chunk_size` boundaries into N groups, each `writev`'d to a single disk file in one
@@ -356,6 +393,31 @@ impl StorageTier {
         let write_lock = self.key_write_lock(key);
         let _guard = write_lock.lock();
         self.put_striped_chunks(key, segments, total, meta)
+    }
+
+    /// Multi-segment PUT-if-absent. The existence check and write share one per-key lock, so
+    /// concurrent stream writes for the same object cannot overwrite each other.
+    pub fn put_chunks_if_absent(
+        &self,
+        key: &ObjectKey,
+        segments: Vec<Bytes>,
+        meta: BlockMeta,
+    ) -> Result<bool> {
+        let total: usize = segments.iter().map(|s| s.len()).sum();
+        if !self.should_stripe(total) {
+            let mut buf = BytesMut::with_capacity(total);
+            for s in &segments {
+                buf.extend_from_slice(s);
+            }
+            return self.put_if_absent(key, buf.freeze(), meta);
+        }
+        let write_lock = self.key_write_lock(key);
+        let _guard = write_lock.lock();
+        if self.metadata.get_block(&key.to_string_key())?.is_some() {
+            return Ok(false);
+        }
+        self.put_striped_chunks(key, segments, total, meta)?;
+        Ok(true)
     }
 
     /// **RDMA PUT data-plane only** — data is already in caller-pinned 4K-aligned memory (an RDMA
@@ -1346,6 +1408,13 @@ mod tests {
         }
     }
 
+    fn flatten_segments(segments: &[Bytes]) -> Vec<u8> {
+        segments
+            .iter()
+            .flat_map(|segment| segment.iter().copied())
+            .collect()
+    }
+
     #[test]
     fn put_get_delete_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -1376,6 +1445,81 @@ mod tests {
         assert!(st.exists(&key).unwrap());
         assert!(st.delete(&key).unwrap());
         assert!(!st.exists(&key).unwrap());
+    }
+
+    #[test]
+    fn put_if_absent_does_not_overwrite_existing_object() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "immutable/object".into(),
+        };
+
+        assert!(st
+            .put_if_absent(&key, Bytes::from_static(b"first"), mk_meta())
+            .unwrap());
+        let first_meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+
+        assert!(!st
+            .put_if_absent(&key, Bytes::from_static(b"second"), mk_meta())
+            .unwrap());
+        let (data, meta) = st.get(&key).unwrap().unwrap();
+
+        assert_eq!(data.as_ref(), b"first");
+        assert_eq!(meta.object_generation, first_meta.object_generation);
+        assert_eq!(meta.content_etag, first_meta.content_etag);
+        assert_eq!(meta.file_path, first_meta.file_path);
+    }
+
+    #[test]
+    fn put_chunks_if_absent_does_not_overwrite_striped_object() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "immutable/striped".into(),
+        };
+
+        assert!(st
+            .put_chunks_if_absent(
+                &key,
+                vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"efghij")],
+                mk_meta(),
+            )
+            .unwrap());
+        let first_meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+
+        assert!(!st
+            .put_chunks_if_absent(
+                &key,
+                vec![Bytes::from_static(b"ZZZZ"), Bytes::from_static(b"YYYYYY")],
+                mk_meta(),
+            )
+            .unwrap());
+        let (segments, meta) = st.get_chunks(&key).unwrap().unwrap();
+
+        assert_eq!(flatten_segments(&segments), b"abcdefghij");
+        assert_eq!(meta.object_generation, first_meta.object_generation);
+        assert_eq!(meta.content_etag, first_meta.content_etag);
+        assert_eq!(
+            meta.striping.unwrap().chunk_paths,
+            first_meta.striping.unwrap().chunk_paths
+        );
     }
 
     #[test]

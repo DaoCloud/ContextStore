@@ -4,8 +4,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
 use futures::{future::join_all, Stream};
 use prost::bytes::{Bytes, BytesMut};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
@@ -25,6 +27,7 @@ struct DataNode {
 
 pub struct KVServiceImpl {
     ctx: Arc<KVServiceContext>,
+    write_locks: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 #[cfg(test)]
@@ -131,11 +134,17 @@ mod tests {
 
 impl KVServiceImpl {
     pub fn new(ctx: KVServiceContext) -> Self {
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            write_locks: Arc::new(DashMap::new()),
+        }
     }
 
     pub fn new_shared(ctx: Arc<KVServiceContext>) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            write_locks: Arc::new(DashMap::new()),
+        }
     }
 
     fn record_request<T>(
@@ -161,6 +170,23 @@ impl KVServiceImpl {
 
     fn should_use_distributed_placement(&self, len: usize) -> bool {
         distributed_placement_enabled(&self.ctx, len)
+    }
+
+    fn key_write_lock(&self, key: &InternalKey) -> Arc<AsyncMutex<()>> {
+        let str_key = key.to_string_key();
+        self.write_locks
+            .entry(str_key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    async fn metadata_exists(&self, key: &InternalKey) -> Result<bool, Status> {
+        let metadata = self.ctx.metadata.clone();
+        let str_key = key.to_string_key();
+        tokio::task::spawn_blocking(move || metadata.get_block(&str_key).map(|m| m.is_some()))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::from)
     }
 
     fn make_distributed_descriptor(
@@ -323,6 +349,23 @@ impl KVServiceImpl {
             .put_block(&key.to_string_key(), &committed)
             .map_err(Status::from)?;
         Ok(())
+    }
+
+    async fn put_distributed_bytes_if_absent(
+        &self,
+        key: InternalKey,
+        data: Bytes,
+        meta: BlockMeta,
+    ) -> Result<bool, Status> {
+        let write_lock = self.key_write_lock(&key);
+        let _guard = write_lock.lock().await;
+
+        if self.metadata_exists(&key).await? {
+            return Ok(false);
+        }
+
+        self.put_distributed_bytes(key, data, meta).await?;
+        Ok(true)
     }
 
     fn placement_has_remote_chunks(&self, placement: &pb::PlacementDescriptor) -> bool {
@@ -524,6 +567,10 @@ fn meta_to_pb(m: &BlockMeta) -> pb::KvMetadata {
         created_at: m.created_at,
         last_accessed_at: m.last_accessed_at,
     }
+}
+
+fn put_options_if_not_exists(options: Option<&pb::PutOptions>) -> bool {
+    options.map(|opts| opts.if_not_exists).unwrap_or(false)
 }
 
 fn grpc_uri(endpoint: &str) -> String {
@@ -850,23 +897,45 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .ok_or_else(|| Status::invalid_argument("missing key"))?;
             let internal = pb_key_to_internal(&key);
             let meta = meta_from_pb(req.metadata.as_ref());
+            let if_not_exists = put_options_if_not_exists(req.options.as_ref());
             // pb::PutRequest.data is Bytes (a buffer reference handed over by the gRPC framework, no copy)
             let data: Bytes = req.data;
             if self.should_use_distributed_placement(data.len()) {
-                self.put_distributed_bytes(internal, data, meta).await?;
+                let inserted = if if_not_exists {
+                    self.put_distributed_bytes_if_absent(internal, data, meta)
+                        .await?
+                } else {
+                    self.put_distributed_bytes(internal, data, meta).await?;
+                    true
+                };
                 return Ok(Response::new(pb::PutResponse {
-                    success: true,
-                    message: String::new(),
+                    success: inserted,
+                    message: if inserted {
+                        String::new()
+                    } else {
+                        "already exists".to_string()
+                    },
                 }));
             }
             let ctx = self.ctx.clone();
-            tokio::task::spawn_blocking(move || ctx.memory.put(&internal, data, meta))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .map_err(Status::from)?;
+            let inserted = tokio::task::spawn_blocking(move || {
+                if if_not_exists {
+                    ctx.memory.put_if_absent(&internal, data, meta)
+                } else {
+                    ctx.memory.put(&internal, data, meta)?;
+                    Ok(true)
+                }
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::from)?;
             Ok(Response::new(pb::PutResponse {
-                success: true,
-                message: String::new(),
+                success: inserted,
+                message: if inserted {
+                    String::new()
+                } else {
+                    "already exists".to_string()
+                },
             }))
         }
         .await;
@@ -1192,19 +1261,45 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
     ) -> Result<Response<pb::PutBatchResponse>, Status> {
         let req = req.into_inner();
         // item.data is Bytes (a refcounted view over the gRPC framework buffer)
-        let mut items: Vec<(InternalKey, Bytes, BlockMeta)> = Vec::with_capacity(req.items.len());
+        let mut items: Vec<(InternalKey, Bytes, BlockMeta, bool)> =
+            Vec::with_capacity(req.items.len());
+        let mut has_if_not_exists = false;
         for item in req.items {
             let k = item
                 .key
                 .ok_or_else(|| Status::invalid_argument("missing key in batch item"))?;
             let m = meta_from_pb(item.metadata.as_ref());
-            items.push((pb_key_to_internal(&k), item.data, m));
+            let if_not_exists = put_options_if_not_exists(item.options.as_ref());
+            has_if_not_exists |= if_not_exists;
+            items.push((pb_key_to_internal(&k), item.data, m, if_not_exists));
         }
         let ctx = self.ctx.clone();
-        let results = tokio::task::spawn_blocking(move || ctx.memory.put_batch(items))
+        let success = if has_if_not_exists {
+            tokio::task::spawn_blocking(move || {
+                items
+                    .into_iter()
+                    .map(|(key, data, meta, if_not_exists)| {
+                        if if_not_exists {
+                            ctx.memory.put_if_absent(&key, data, meta)
+                        } else {
+                            ctx.memory.put(&key, data, meta).map(|_| true)
+                        }
+                        .unwrap_or(false)
+                    })
+                    .collect::<Vec<bool>>()
+            })
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let success: Vec<bool> = results.iter().map(|r| r.is_ok()).collect();
+            .map_err(|e| Status::internal(e.to_string()))?
+        } else {
+            let batch_items = items
+                .into_iter()
+                .map(|(key, data, meta, _)| (key, data, meta))
+                .collect();
+            let results = tokio::task::spawn_blocking(move || ctx.memory.put_batch(batch_items))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            results.iter().map(|r| r.is_ok()).collect()
+        };
         Ok(Response::new(pb::PutBatchResponse { success }))
     }
 
@@ -1443,6 +1538,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let mut stream = req.into_inner();
         let mut key: Option<pb::ObjectKey> = None;
         let mut meta_opt: Option<pb::KvMetadata> = None;
+        let mut options_opt: Option<pb::PutOptions> = None;
         let mut segments: Vec<Bytes> = Vec::new();
         let mut declared_total: i64 = 0;
         let mut got_first = false;
@@ -1452,6 +1548,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             if !got_first {
                 key = chunk.key;
                 meta_opt = chunk.metadata;
+                options_opt = chunk.options;
                 declared_total = chunk.total_size;
                 if declared_total > 0 {
                     segments.reserve(((declared_total as usize) / (2 * 1024 * 1024)).max(8));
@@ -1474,12 +1571,19 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let key = key.ok_or_else(|| Status::invalid_argument("first chunk must include key"))?;
         let internal = pb_key_to_internal(&key);
         let m = meta_from_pb(meta_opt.as_ref());
+        let if_not_exists = put_options_if_not_exists(options_opt.as_ref());
         let ctx = self.ctx.clone();
         let total_bytes: usize = segments.iter().map(|s| s.len()).sum();
         let n_segs = segments.len();
         if self.should_use_distributed_placement(total_bytes) {
             let data = Self::flatten_segments(segments);
-            self.put_distributed_bytes(internal, data, m).await?;
+            let inserted = if if_not_exists {
+                self.put_distributed_bytes_if_absent(internal, data, m)
+                    .await?
+            } else {
+                self.put_distributed_bytes(internal, data, m).await?;
+                true
+            };
             let t_total = t0.elapsed();
             tracing::trace!(
                 "PUT_PERF bytes={} n_segs={} recv_ms={} put_ms={} total_ms={} BW={:.2}GB/s mode=distributed",
@@ -1491,17 +1595,28 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 total_bytes as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
             );
             let result = Ok(Response::new(pb::PutResponse {
-                success: true,
-                message: String::new(),
+                success: inserted,
+                message: if inserted {
+                    String::new()
+                } else {
+                    "already exists".to_string()
+                },
             }));
             self.record_request("put_stream", request_start, &result, "ok");
             return result;
         }
         // Pass-through put_chunks: no concatenation; the storage layer rebuckets on stripe boundaries and flushes via writev
-        tokio::task::spawn_blocking(move || ctx.memory.put_chunks(&internal, segments, m))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(Status::from)?;
+        let inserted = tokio::task::spawn_blocking(move || {
+            if if_not_exists {
+                ctx.memory.put_chunks_if_absent(&internal, segments, m)
+            } else {
+                ctx.memory.put_chunks(&internal, segments, m)?;
+                Ok(true)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::from)?;
         let t_total = t0.elapsed();
         tracing::trace!(
             "PUT_PERF bytes={} n_segs={} recv_ms={} put_ms={} total_ms={} BW={:.2}GB/s",
@@ -1514,8 +1629,12 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         );
         let _ = declared_total; // silence unused
         let result = Ok(Response::new(pb::PutResponse {
-            success: true,
-            message: String::new(),
+            success: inserted,
+            message: if inserted {
+                String::new()
+            } else {
+                "already exists".to_string()
+            },
         }));
         self.record_request("put_stream", request_start, &result, "ok");
         result

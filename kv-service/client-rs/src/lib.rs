@@ -18,6 +18,28 @@ use tonic::transport::Channel;
 
 const TWO_GIB: usize = 2 * 1024 * 1024 * 1024;
 
+/// Result of a KVService object lookup. Redhare can keep the descriptor identity in
+/// `storage_ref`, then read through `read_by_descriptor_stream_chunks`.
+#[derive(Clone, Debug)]
+pub struct ObjectLookup {
+    /// Server-generated object identity, including generation / etag / layout version.
+    pub descriptor: pb::ObjectDescriptor,
+    /// Actual object placement. The first gRPC descriptor-read path can pass it back to
+    /// the server without interpreting it.
+    pub placement: Option<pb::PlacementDescriptor>,
+}
+
+/// Descriptor-read result, preserving the fresh descriptor / placement returned by the server.
+#[derive(Clone, Debug)]
+pub struct DescriptorReadChunks {
+    /// Data segments returned in offset order.
+    pub segments: Vec<Bytes>,
+    /// Fresh descriptor returned by the server; redhare may refresh storage_ref with it.
+    pub descriptor: pb::ObjectDescriptor,
+    /// Fresh placement returned by the server; later RDMA/GDS paths can reuse it.
+    pub placement: Option<pb::PlacementDescriptor>,
+}
+
 /// Rust gRPC client wrapper for the KV Service.
 #[derive(Clone)]
 pub struct KvClient {
@@ -53,6 +75,16 @@ impl KvClient {
         }
     }
 
+    /// Construct immutable write options: the server returns `Ok(false)` if the object
+    /// already exists and does not overwrite it.
+    pub fn put_options_if_absent() -> pb::PutOptions {
+        pb::PutOptions {
+            ttl_seconds: 0,
+            if_not_exists: true,
+            compression: pb::CompressionType::None as i32,
+        }
+    }
+
     /// Single PUT. `data` is moved directly into the request; Vec<u8> → Bytes is a
     /// zero-copy takeover.
     pub async fn put(
@@ -61,14 +93,43 @@ impl KvClient {
         object_key: &str,
         data: Vec<u8>,
     ) -> Result<bool, tonic::Status> {
+        self.put_with_options(namespace, object_key, data, None)
+            .await
+    }
+
+    /// Single PUT with `PutOptions`. `Ok(false)` means the server explicitly rejected
+    /// the write, typically because `if_not_exists=true` and the object already exists.
+    pub async fn put_with_options(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        data: Vec<u8>,
+        options: Option<pb::PutOptions>,
+    ) -> Result<bool, tonic::Status> {
         let req = pb::PutRequest {
             key: Some(Self::key(namespace, object_key)),
             data: Bytes::from(data),
             metadata: None,
-            options: None,
+            options,
         };
         let resp = self.inner.put(req).await?;
         Ok(resp.into_inner().success)
+    }
+
+    /// Single immutable PUT. Returns `Ok(false)` when the object already exists.
+    pub async fn put_if_absent(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        data: Vec<u8>,
+    ) -> Result<bool, tonic::Status> {
+        self.put_with_options(
+            namespace,
+            object_key,
+            data,
+            Some(Self::put_options_if_absent()),
+        )
+        .await
     }
 
     /// Single GET, returns `data` (None = not found). Bytes → Vec<u8> is a zero-copy
@@ -102,6 +163,41 @@ impl KvClient {
         };
         let resp = self.inner.exists(req).await?;
         Ok(resp.into_inner().exists)
+    }
+
+    /// Delete an object. `false` means the object was absent or no underlying bytes were removed.
+    pub async fn delete(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+    ) -> Result<bool, tonic::Status> {
+        let req = pb::DeleteRequest {
+            key: Some(Self::key(namespace, object_key)),
+        };
+        let resp = self.inner.delete(req).await?;
+        Ok(resp.into_inner().success)
+    }
+
+    /// Look up object descriptor and actual placement without reading the value.
+    pub async fn lookup_object(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+    ) -> Result<Option<ObjectLookup>, tonic::Status> {
+        let req = pb::LookupObjectRequest {
+            key: Some(Self::key(namespace, object_key)),
+        };
+        let resp = self.inner.lookup_object(req).await?.into_inner();
+        if !resp.found {
+            return Ok(None);
+        }
+        let Some(descriptor) = resp.descriptor else {
+            return Ok(None);
+        };
+        Ok(Some(ObjectLookup {
+            descriptor,
+            placement: resp.placement,
+        }))
     }
 
     /// Batch PUT (single RPC; server writes in parallel).
@@ -162,6 +258,19 @@ impl KvClient {
         data: Vec<u8>,
         chunk_size: usize,
     ) -> Result<bool, tonic::Status> {
+        self.put_stream_with_options(namespace, object_key, data, chunk_size, None)
+            .await
+    }
+
+    /// Streaming PUT with `PutOptions`. Options are sent only on the first PutChunk.
+    pub async fn put_stream_with_options(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        data: Vec<u8>,
+        chunk_size: usize,
+        options: Option<pb::PutOptions>,
+    ) -> Result<bool, tonic::Status> {
         // Vec<u8> → Bytes is a zero-copy takeover; then slice into N Bytes (Arc-refcounted)
         // and delegate to the chunks variant.
         let total = data.len();
@@ -178,8 +287,26 @@ impl KvClient {
             let end = (start + chunk_size).min(total);
             segments.push(big.slice(start..end));
         }
-        self.put_stream_chunks(namespace, object_key, segments)
+        self.put_stream_chunks_with_options(namespace, object_key, segments, options)
             .await
+    }
+
+    /// Streaming immutable PUT. Returns `Ok(false)` when the object already exists.
+    pub async fn put_stream_if_absent(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        data: Vec<u8>,
+        chunk_size: usize,
+    ) -> Result<bool, tonic::Status> {
+        self.put_stream_with_options(
+            namespace,
+            object_key,
+            data,
+            chunk_size,
+            Some(Self::put_options_if_absent()),
+        )
+        .await
     }
 
     /// Streaming PUT passthrough (zero-copy): caller has already split the data into N
@@ -192,6 +319,21 @@ impl KvClient {
         object_key: &str,
         segments: Vec<Bytes>,
     ) -> Result<bool, tonic::Status> {
+        self.put_stream_chunks_with_options(namespace, object_key, segments, None)
+            .await
+    }
+
+    /// Streaming PUT passthrough with `PutOptions`. Options are sent only on the first chunk.
+    pub async fn put_stream_chunks_with_options(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        mut segments: Vec<Bytes>,
+        options: Option<pb::PutOptions>,
+    ) -> Result<bool, tonic::Status> {
+        if segments.is_empty() {
+            segments.push(Bytes::new());
+        }
         let key = Self::key(namespace, object_key);
         let total: usize = segments.iter().map(|s| s.len()).sum();
         let n_chunks = segments.len().max(1);
@@ -208,12 +350,29 @@ impl KvClient {
                 is_last: i + 1 == n_chunks,
                 metadata: None,
                 total_size: if is_first { total as i64 } else { 0 },
+                options: if is_first { options.clone() } else { None },
             });
             running_offset += seg_len;
         }
         let outbound = tokio_stream::iter(chunks);
         let resp = self.inner.put_stream(outbound).await?;
         Ok(resp.into_inner().success)
+    }
+
+    /// Streaming immutable PUT passthrough. Returns `Ok(false)` when the object already exists.
+    pub async fn put_stream_chunks_if_absent(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        segments: Vec<Bytes>,
+    ) -> Result<bool, tonic::Status> {
+        self.put_stream_chunks_with_options(
+            namespace,
+            object_key,
+            segments,
+            Some(Self::put_options_if_absent()),
+        )
+        .await
     }
 
     /// Streaming GET: consume the DataChunk stream and concatenate into a Vec<u8>
@@ -278,5 +437,51 @@ impl KvClient {
             }
         }
         Ok(Some(segments))
+    }
+
+    /// Read an object using a client-held descriptor. The server validates generation / etag /
+    /// layout first. A stale descriptor returns `FAILED_PRECONDITION`; callers should lookup again.
+    pub async fn read_by_descriptor_stream_chunks(
+        &mut self,
+        descriptor: pb::ObjectDescriptor,
+        placement: Option<pb::PlacementDescriptor>,
+    ) -> Result<Option<DescriptorReadChunks>, tonic::Status> {
+        use tokio_stream::StreamExt;
+
+        let req = pb::ReadByDescriptorRequest {
+            descriptor: Some(descriptor),
+            placement,
+        };
+        let mut stream = match self.inner.read_by_descriptor_stream(req).await {
+            Ok(s) => s.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(status),
+        };
+
+        let mut segments = Vec::new();
+        let mut fresh_descriptor: Option<pb::ObjectDescriptor> = None;
+        let mut fresh_placement: Option<pb::PlacementDescriptor> = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if fresh_descriptor.is_none() {
+                fresh_descriptor = chunk.descriptor;
+            }
+            if fresh_placement.is_none() {
+                fresh_placement = chunk.placement;
+            }
+            segments.push(chunk.data);
+            if chunk.is_last {
+                break;
+            }
+        }
+
+        let Some(descriptor) = fresh_descriptor else {
+            return Ok(None);
+        };
+        Ok(Some(DescriptorReadChunks {
+            segments,
+            descriptor,
+            placement: fresh_placement,
+        }))
     }
 }

@@ -222,6 +222,24 @@ impl MemoryTier {
         Ok(())
     }
 
+    /// PUT-if-absent: keep the existing object and L1 entry when the object already exists.
+    pub fn put_if_absent(&self, key: &ObjectKey, data: Bytes, meta: BlockMeta) -> Result<bool> {
+        let str_key = key.to_string_key();
+        let fallback_meta = meta.clone();
+        let inserted = self.storage.put_if_absent(key, data.clone(), meta)?;
+        if !inserted {
+            return Ok(false);
+        }
+        let stored_meta = self
+            .storage
+            .metadata()
+            .get_block(&str_key)?
+            .unwrap_or(fallback_meta);
+        self.invalidate_l1_entry(&str_key);
+        self.cache_insert(str_key, data, stored_meta);
+        Ok(true)
+    }
+
     /// Multi-segment PUT — zero-copy passthrough: caller supplies N Bytes segments (typical: 240 2MB
     /// chunks accumulated by put_stream, each one a refcount view from the gRPC framework).
     /// **Does not concat into a single large Bytes** before L2. Since LruCache requires a single Bytes
@@ -241,6 +259,32 @@ impl MemoryTier {
         let total_size: usize = segments.iter().map(|b| b.len()).sum();
         self.chunks_cache_insert(str_key, segments, stored_meta, total_size);
         Ok(())
+    }
+
+    /// Multi-segment PUT-if-absent: do not update the chunks cache when the object already exists.
+    pub fn put_chunks_if_absent(
+        &self,
+        key: &ObjectKey,
+        segments: Vec<Bytes>,
+        meta: BlockMeta,
+    ) -> Result<bool> {
+        let str_key = key.to_string_key();
+        let fallback_meta = meta.clone();
+        let inserted = self
+            .storage
+            .put_chunks_if_absent(key, segments.clone(), meta)?;
+        if !inserted {
+            return Ok(false);
+        }
+        let stored_meta = self
+            .storage
+            .metadata()
+            .get_block(&str_key)?
+            .unwrap_or(fallback_meta);
+        self.invalidate_l1_entry(&str_key);
+        let total_size: usize = segments.iter().map(|b| b.len()).sum();
+        self.chunks_cache_insert(str_key, segments, stored_meta, total_size);
+        Ok(true)
     }
 
     pub fn delete(&self, key: &ObjectKey) -> Result<bool> {
@@ -688,6 +732,64 @@ mod tests {
         let (h, m, _, _) = tier.stats();
         assert_eq!(h, 1);
         assert_eq!(m, 0);
+    }
+
+    #[test]
+    fn put_if_absent_keeps_existing_cache_entry() {
+        let tmp = TempDir::new().unwrap();
+        let tier = make_tier(tmp.path());
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "immutable/object".into(),
+        };
+
+        assert!(tier
+            .put_if_absent(&key, Bytes::from_static(b"first"), mk_meta())
+            .unwrap());
+        let (first, first_meta) = tier.get(&key).unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"first");
+
+        assert!(!tier
+            .put_if_absent(&key, Bytes::from_static(b"second"), mk_meta())
+            .unwrap());
+        let (data, meta) = tier.get(&key).unwrap().unwrap();
+
+        assert_eq!(data.as_ref(), b"first");
+        assert_eq!(meta.object_generation, first_meta.object_generation);
+        assert_eq!(meta.content_etag, first_meta.content_etag);
+    }
+
+    #[test]
+    fn put_chunks_if_absent_keeps_existing_chunks_cache_entry() {
+        let tmp = TempDir::new().unwrap();
+        let tier = make_tier(tmp.path());
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "immutable/chunks".into(),
+        };
+
+        assert!(tier
+            .put_chunks_if_absent(
+                &key,
+                vec![Bytes::from_static(b"fir"), Bytes::from_static(b"st")],
+                mk_meta(),
+            )
+            .unwrap());
+        let (first_segments, first_meta) = tier.get_chunks(&key).unwrap().unwrap();
+        assert_eq!(flatten_segments(&first_segments), b"first");
+
+        assert!(!tier
+            .put_chunks_if_absent(
+                &key,
+                vec![Bytes::from_static(b"sec"), Bytes::from_static(b"ond")],
+                mk_meta(),
+            )
+            .unwrap());
+        let (segments, meta) = tier.get_chunks(&key).unwrap().unwrap();
+
+        assert_eq!(flatten_segments(&segments), b"first");
+        assert_eq!(meta.object_generation, first_meta.object_generation);
+        assert_eq!(meta.content_etag, first_meta.content_etag);
     }
 
     #[test]
