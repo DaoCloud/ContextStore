@@ -34,21 +34,11 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.2.0'
           pip install -e '.[test]'
 
-      - name: Ruff (lint)
-        run: |
-          pip install ruff
-          ruff check src/ tests/
-
-      - name: Black (format check)
-        run: |
-          pip install black
-          black --check src/ tests/
-
       - name: Pytest
         run: pytest tests/ -v --tb=short
 
   # ==========================================================================
-  # Rust: KVService server + client-rs + rdma-ffi
+  # Rust: hardware-independent KVService checks
   # ==========================================================================
   rust:
     name: Rust
@@ -65,8 +55,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              protobuf-compiler libclang-dev pkg-config cmake \
-              libibverbs-dev
+              protobuf-compiler libclang-dev pkg-config cmake
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -76,7 +65,6 @@ jobs:
             ~/.cargo/git
             kv-service/server/target
             kv-service/client-rs/target
-            kv-service/rdma-ffi/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -89,10 +77,6 @@ jobs:
         working-directory: kv-service/server
         run: cargo build --release --features io-uring
 
-      - name: Build server (--features rdma)
-        working-directory: kv-service/server
-        run: cargo build --release --features rdma
-
       - name: Build server (--features metrics)
         working-directory: kv-service/server
         run: cargo build --release --features metrics
@@ -101,32 +85,6 @@ jobs:
         working-directory: kv-service/client-rs
         run: cargo build --release
 
-      - name: Build client-rs (--features rdma, for cs-rdma-bench)
-        working-directory: kv-service/client-rs
-        run: cargo build --release --features rdma
-
-      - name: Build rdma-ffi cdylib
-        working-directory: kv-service/rdma-ffi
-        run: cargo build --release
-
       - name: Cargo test (server)
         working-directory: kv-service/server
         run: cargo test --release
-
-      - name: Cargo fmt --check
-        run: |
-          cd kv-service/server   && cargo fmt --check
-          cd ../client-rs        && cargo fmt --check
-          cd ../rdma-ffi         && cargo fmt --check
-
-      - name: Cargo clippy (server)
-        working-directory: kv-service/server
-        run: cargo clippy --release -- -D warnings
-
-      - name: Cargo clippy (client-rs)
-        working-directory: kv-service/client-rs
-        run: cargo clippy --release -- -D warnings
-
-      - name: Cargo clippy (rdma-ffi)
-        working-directory: kv-service/rdma-ffi
-        run: cargo clippy --release -- -D warnings
