@@ -18,8 +18,9 @@ use tonic::transport::Channel;
 
 const TWO_GIB: usize = 2 * 1024 * 1024 * 1024;
 
-/// Result of a KVService object lookup. Redhare can keep the descriptor identity in
-/// `storage_ref`, then read through `read_by_descriptor_stream_chunks`.
+/// Result of a KVService object lookup. Upper-layer tier clients can keep the
+/// descriptor identity in their cached object reference, then read through
+/// `read_by_descriptor_stream_chunks`.
 #[derive(Clone, Debug)]
 pub struct ObjectLookup {
     /// Server-generated object identity, including generation / etag / layout version.
@@ -34,7 +35,7 @@ pub struct ObjectLookup {
 pub struct DescriptorReadChunks {
     /// Data segments returned in offset order.
     pub segments: Vec<Bytes>,
-    /// Fresh descriptor returned by the server; redhare may refresh storage_ref with it.
+    /// Fresh descriptor returned by the server; callers may refresh cached object references with it.
     pub descriptor: pb::ObjectDescriptor,
     /// Fresh placement returned by the server; later RDMA/GDS paths can reuse it.
     pub placement: Option<pb::PlacementDescriptor>,
