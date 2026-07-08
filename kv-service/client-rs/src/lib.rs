@@ -449,8 +449,8 @@ impl KvClient {
         use tokio_stream::StreamExt;
 
         let req = pb::ReadByDescriptorRequest {
-            descriptor: Some(descriptor),
-            placement,
+            descriptor: Some(descriptor.clone()),
+            placement: placement.clone(),
         };
         let mut stream = match self.inner.read_by_descriptor_stream(req).await {
             Ok(s) => s.into_inner(),
@@ -475,13 +475,11 @@ impl KvClient {
             }
         }
 
-        let Some(descriptor) = fresh_descriptor else {
-            return Ok(None);
-        };
+        let descriptor = fresh_descriptor.unwrap_or(descriptor);
         Ok(Some(DescriptorReadChunks {
             segments,
             descriptor,
-            placement: fresh_placement,
+            placement: fresh_placement.or(placement),
         }))
     }
 }

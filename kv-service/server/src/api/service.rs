@@ -286,7 +286,7 @@ impl KVServiceImpl {
         Ok(pb_chunk_to_location(&chunk))
     }
 
-    async fn put_distributed_bytes(
+    async fn put_distributed_bytes_impl(
         &self,
         key: InternalKey,
         data: Bytes,
@@ -351,6 +351,17 @@ impl KVServiceImpl {
         Ok(())
     }
 
+    async fn put_distributed_bytes(
+        &self,
+        key: InternalKey,
+        data: Bytes,
+        meta: BlockMeta,
+    ) -> Result<(), Status> {
+        let write_lock = self.key_write_lock(&key);
+        let _guard = write_lock.lock().await;
+        self.put_distributed_bytes_impl(key, data, meta).await
+    }
+
     async fn put_distributed_bytes_if_absent(
         &self,
         key: InternalKey,
@@ -364,7 +375,7 @@ impl KVServiceImpl {
             return Ok(false);
         }
 
-        self.put_distributed_bytes(key, data, meta).await?;
+        self.put_distributed_bytes_impl(key, data, meta).await?;
         Ok(true)
     }
 
