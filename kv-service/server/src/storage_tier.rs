@@ -219,6 +219,37 @@ impl StorageTier {
         Ok((device_id as u32, path.to_string_lossy().to_string()))
     }
 
+    /// Validate that a placement chunk handle matches the descriptor identity and router layout.
+    pub fn validate_placement_chunk_handle(
+        &self,
+        key: &ObjectKey,
+        stripe_index: usize,
+        generation: u64,
+        layout_version: u64,
+        device_id: u32,
+        storage_handle: &str,
+    ) -> Result<()> {
+        let path = PathBuf::from(storage_handle);
+        self.ensure_managed_path(&path)?;
+        let device_id = device_id as usize;
+        if device_id >= self.router.num_devices() {
+            return Err(KVError::InvalidArgument(format!(
+                "placement chunk device out of range: {}",
+                device_id
+            )));
+        }
+        let expected =
+            self.router
+                .chunk_versioned_path(key, stripe_index, device_id, generation, layout_version);
+        if path != expected {
+            return Err(KVError::InvalidArgument(format!(
+                "placement chunk handle does not match descriptor: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Data-node internal API: read a stripe by a storage_handle previously returned by the server.
     pub fn read_placement_chunk(
         &self,

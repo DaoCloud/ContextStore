@@ -1180,12 +1180,26 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         req: Request<pb::ReadPlacementChunkRequest>,
     ) -> Result<Response<Self::ReadPlacementChunkStream>, Status> {
         let req = req.into_inner();
+        let descriptor = req
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
+        let internal = key_from_descriptor(&descriptor)?;
         let chunk = req
             .chunk
             .ok_or_else(|| Status::invalid_argument("missing placement chunk"))?;
         let storage = self.ctx.storage.clone();
         let handle = chunk.storage_handle.clone();
         let expected_len = chunk.length;
+        storage
+            .validate_placement_chunk_handle(
+                &internal,
+                chunk.stripe_index as usize,
+                descriptor.object_generation,
+                descriptor.layout_version,
+                chunk.device_id,
+                &handle,
+            )
+            .map_err(Status::from)?;
         let data = tokio::task::spawn_blocking(move || {
             storage.read_placement_chunk(&handle, expected_len)
         })
