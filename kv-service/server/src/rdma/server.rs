@@ -1182,7 +1182,7 @@ fn handle_put(
     if ok {
         let t_inject_start = std::time::Instant::now();
         // Re-fetch BlockMeta from metadata (with correct striping/file_path) so that when a
-        // GET hits cache, valid meta is available. One metadata fetch is a single-KV RocksDB
+        // GET hits cache, valid meta is available. One metadata fetch is a single-key metadata
         // query, microsecond-scale overhead.
         let real_meta_opt = kv_ctx.metadata.get_block(&put_req.key);
         match real_meta_opt {

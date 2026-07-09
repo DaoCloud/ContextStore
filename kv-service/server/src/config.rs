@@ -171,13 +171,20 @@ impl Default for RouterConfig {
 // ===== Metadata =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataConfig {
-    pub rocksdb_path: PathBuf,
+    pub redis_url: String,
+    #[serde(default = "default_redis_key_prefix")]
+    pub redis_key_prefix: String,
+}
+
+fn default_redis_key_prefix() -> String {
+    "contextstore:metadata:".to_string()
 }
 
 impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
-            rocksdb_path: PathBuf::from("./data/metadata"),
+            redis_url: "redis://127.0.0.1:6379/".to_string(),
+            redis_key_prefix: default_redis_key_prefix(),
         }
     }
 }
@@ -237,8 +244,13 @@ impl Default for Config {
 
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| KVError::Config(format!("failed to read config file {}: {}", path.display(), e)))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            KVError::Config(format!(
+                "failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
         let config: Config = toml::from_str(&content)
             .map_err(|e| KVError::Config(format!("failed to parse TOML: {}", e)))?;
         config.validate()?;
@@ -247,7 +259,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         if self.storage.devices.is_empty() {
-            return Err(KVError::Config("at least one storage device must be configured".to_string()));
+            return Err(KVError::Config(
+                "at least one storage device must be configured".to_string(),
+            ));
         }
         for node in &self.cluster.data_nodes {
             if node.grpc_endpoint.trim().is_empty() {
@@ -258,11 +272,37 @@ impl Config {
         }
         match self.router.strategy.as_str() {
             "object_hash" => {}
-            other => return Err(KVError::Config(format!("unknown router strategy: {}", other))),
+            other => {
+                return Err(KVError::Config(format!(
+                    "unknown router strategy: {}",
+                    other
+                )))
+            }
         }
         match self.io_executor.kind.as_str() {
             "tier_a" | "tier_b" | "tier_c" => {}
-            other => return Err(KVError::Config(format!("unknown io_executor.kind: {}", other))),
+            other => {
+                return Err(KVError::Config(format!(
+                    "unknown io_executor.kind: {}",
+                    other
+                )))
+            }
+        }
+        if self.metadata.redis_url.trim().is_empty() {
+            return Err(KVError::Config(
+                "metadata.redis_url must not be empty".to_string(),
+            ));
+        }
+        #[cfg(not(test))]
+        if self.metadata.redis_url.starts_with("memory://") {
+            return Err(KVError::Config(
+                "metadata.redis_url memory:// is only available in unit tests".to_string(),
+            ));
+        }
+        if self.metadata.redis_key_prefix.trim().is_empty() {
+            return Err(KVError::Config(
+                "metadata.redis_key_prefix must not be empty".to_string(),
+            ));
         }
         Ok(())
     }

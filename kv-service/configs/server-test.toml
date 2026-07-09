@@ -42,11 +42,10 @@ io_uring_depth = 256
 strategy = "object_hash"   # Shard by opaque object identity
 
 [metadata]
-# RocksDB metadata: keep on a persistent disk, separate from data_subdir for easier
-# management / backup.
-# NOTE: losing this directory means already-persisted data can no longer be indexed.
-# Do not delete it accidentally.
-rocksdb_path = "/mnt/cs/nvme2/contextstore-meta"
+# Shared Redis metadata store. All KVService nodes must use the same Redis URL
+# and key prefix to share object metadata and placement descriptors.
+redis_url = "redis://127.0.0.1:6379/"
+redis_key_prefix = "contextstore:metadata:"
 
 [metrics]
 enabled = false             # Set to true after building with --features metrics

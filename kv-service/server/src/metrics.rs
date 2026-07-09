@@ -477,7 +477,7 @@ mod enabled {
         fn make_test_config(tmp: &TempDir) -> Config {
             let mut config = Config::default();
             config.storage.devices = vec![tmp.path().join("nvme0"), tmp.path().join("nvme1")];
-            config.metadata.rocksdb_path = tmp.path().join("metadata");
+            config.metadata.redis_url = format!("memory://metrics-{}", tmp.path().display());
             config.memory_tier.capacity_mb = 1;
             config
         }

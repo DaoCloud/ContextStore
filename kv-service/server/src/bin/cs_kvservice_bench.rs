@@ -291,7 +291,6 @@ fn make_memory_tier(args: &Args, root: &Path) -> Result<MemoryTier> {
     let mut cfg = Config::default();
     cfg.storage.devices = vec![root.join("nvme0")];
     cfg.storage.striping_threshold = 0;
-    cfg.metadata.rocksdb_path = root.join("meta");
     cfg.memory_tier.capacity_mb = args.memory_mb;
     let router = Arc::new(ShardRouter::new(&cfg)?);
     let storage = Arc::new(StorageTier::new(&cfg, router)?);
@@ -306,7 +305,6 @@ fn make_storage_tier(args: &Args, root: &Path) -> Result<Arc<StorageTier>> {
         cfg.storage.devices = vec![root.join("nvme0")];
         cfg.storage.striping_threshold = 256 * 1024 * 1024;
         cfg.storage.striping_chunk_size = 64 * 1024 * 1024;
-        cfg.metadata.rocksdb_path = root.join("meta");
         cfg
     };
     if cfg.storage.devices.len() == 1 && args.storage_size_mb < 256 {

@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Metadata store
-rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
+redis = "0.27"
 
 # Hashing & sharding
 md-5 = "0.10"

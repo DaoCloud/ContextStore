@@ -1,14 +1,18 @@
-//! Metadata Service — object metadata
-//!
-//! Backed by an embedded RocksDB. Cluster mode can be extended to etcd.
+//! Metadata Service — shared object metadata backed by Redis.
 
 use crate::config::Config;
 use crate::error::{KVError, Result};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use parking_lot::Mutex;
+use redis::Commands;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-const CF_BLOCK_META: &str = "block_meta";
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::{Arc, OnceLock};
+
+const BLOCK_META_SEGMENT: &str = "block_meta";
+const GENERATION_SEGMENT: &str = "generation";
 
 fn default_object_generation() -> u64 {
     1
@@ -81,87 +85,290 @@ pub struct BlockMeta {
     pub striping: Option<StripingInfo>,
 }
 
+enum MetadataBackend {
+    Redis(RedisMetadataBackend),
+    #[cfg(test)]
+    Memory(MemoryMetadataBackend),
+}
+
 pub struct MetadataService {
-    db: Arc<DB>,
+    backend: MetadataBackend,
 }
 
 impl MetadataService {
     pub fn new(config: &Config) -> Result<Self> {
-        std::fs::create_dir_all(&config.metadata.rocksdb_path)?;
+        #[cfg(test)]
+        if config.metadata.redis_url.starts_with("memory://") {
+            return Ok(Self {
+                backend: MetadataBackend::Memory(MemoryMetadataBackend::for_url(
+                    &config.metadata.redis_url,
+                )),
+            });
+        }
 
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-
-        let cfs = vec![ColumnFamilyDescriptor::new(
-            CF_BLOCK_META,
-            Options::default(),
-        )];
-
-        let db = DB::open_cf_descriptors(&opts, &config.metadata.rocksdb_path, cfs)?;
-
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            backend: MetadataBackend::Redis(RedisMetadataBackend::new(config)?),
+        })
     }
 
     // ===== Block Meta =====
 
     pub fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(CF_BLOCK_META)
-            .ok_or_else(|| KVError::Metadata("CF block_meta missing".to_string()))?;
-        let bytes =
-            serde_json::to_vec(meta).map_err(|e| KVError::Metadata(format!("serialize: {}", e)))?;
-        self.db.put_cf(&cf, key.as_bytes(), bytes)?;
-        Ok(())
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.put_block(key, meta),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.put_block(key, meta),
+        }
+    }
+
+    pub fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.put_block_if_absent(key, meta),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.put_block_if_absent(key, meta),
+        }
     }
 
     pub fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
-        let cf = self
-            .db
-            .cf_handle(CF_BLOCK_META)
-            .ok_or_else(|| KVError::Metadata("CF block_meta missing".to_string()))?;
-        match self.db.get_cf(&cf, key.as_bytes())? {
-            Some(bytes) => {
-                let meta: BlockMeta = serde_json::from_slice(&bytes)
-                    .map_err(|e| KVError::Metadata(format!("deserialize: {}", e)))?;
-                Ok(Some(meta))
-            }
-            None => Ok(None),
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.get_block(key),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.get_block(key),
         }
     }
 
     pub fn delete_block(&self, key: &str) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(CF_BLOCK_META)
-            .ok_or_else(|| KVError::Metadata("CF block_meta missing".to_string()))?;
-        self.db.delete_cf(&cf, key.as_bytes())?;
-        Ok(())
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.delete_block(key),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.delete_block(key),
+        }
     }
 
     pub fn exists_block(&self, key: &str) -> Result<bool> {
-        Ok(self.get_block(key)?.is_some())
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.exists_block(key),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.exists_block(key),
+        }
+    }
+
+    pub fn next_generation(&self, key: &str) -> Result<u64> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.next_generation(key),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.next_generation(key),
+        }
+    }
+}
+
+struct RedisMetadataBackend {
+    prefix: String,
+    connection: Mutex<redis::Connection>,
+}
+
+impl RedisMetadataBackend {
+    fn new(config: &Config) -> Result<Self> {
+        let client = redis::Client::open(config.metadata.redis_url.as_str())
+            .map_err(|e| KVError::Metadata(format!("open Redis client: {}", e)))?;
+        let mut connection = client
+            .get_connection()
+            .map_err(|e| KVError::Metadata(format!("connect Redis metadata store: {}", e)))?;
+        redis::cmd("PING")
+            .query::<String>(&mut connection)
+            .map_err(|e| KVError::Metadata(format!("ping Redis metadata store: {}", e)))?;
+
+        Ok(Self {
+            prefix: config.metadata.redis_key_prefix.clone(),
+            connection: Mutex::new(connection),
+        })
+    }
+
+    fn block_key(&self, key: &str) -> String {
+        format!("{}{}:{}", self.prefix, BLOCK_META_SEGMENT, key)
+    }
+
+    fn generation_key(&self, key: &str) -> String {
+        format!("{}{}:{}", self.prefix, GENERATION_SEGMENT, key)
+    }
+
+    fn serialize(meta: &BlockMeta) -> Result<Vec<u8>> {
+        serde_json::to_vec(meta).map_err(|e| KVError::Metadata(format!("serialize: {}", e)))
+    }
+
+    fn deserialize(bytes: &[u8]) -> Result<BlockMeta> {
+        serde_json::from_slice(bytes).map_err(|e| KVError::Metadata(format!("deserialize: {}", e)))
+    }
+
+    fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let bytes = Self::serialize(meta)?;
+        connection
+            .set::<_, _, ()>(self.block_key(key), bytes)
+            .map_err(|e| KVError::Metadata(format!("redis SET block metadata: {}", e)))?;
+        Ok(())
+    }
+
+    fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
+        let mut connection = self.connection.lock();
+        let bytes = Self::serialize(meta)?;
+        let result = redis::cmd("SET")
+            .arg(self.block_key(key))
+            .arg(bytes)
+            .arg("NX")
+            .query::<Option<String>>(&mut *connection)
+            .map_err(|e| KVError::Metadata(format!("redis SET NX block metadata: {}", e)))?;
+        Ok(result.is_some())
+    }
+
+    fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
+        let mut connection = self.connection.lock();
+        let bytes = connection
+            .get::<_, Option<Vec<u8>>>(self.block_key(key))
+            .map_err(|e| KVError::Metadata(format!("redis GET block metadata: {}", e)))?;
+        bytes.as_deref().map(Self::deserialize).transpose()
+    }
+
+    fn delete_block(&self, key: &str) -> Result<()> {
+        let mut connection = self.connection.lock();
+        connection
+            .del::<_, ()>(self.block_key(key))
+            .map_err(|e| KVError::Metadata(format!("redis DEL block metadata: {}", e)))?;
+        Ok(())
+    }
+
+    fn exists_block(&self, key: &str) -> Result<bool> {
+        let mut connection = self.connection.lock();
+        connection
+            .exists(self.block_key(key))
+            .map_err(|e| KVError::Metadata(format!("redis EXISTS block metadata: {}", e)))
+    }
+
+    fn next_generation(&self, key: &str) -> Result<u64> {
+        let mut connection = self.connection.lock();
+        redis::Script::new(
+            r#"
+            local meta = redis.call("GET", KEYS[1])
+            local current = tonumber(redis.call("GET", KEYS[2]) or "0")
+            local base = current
+            if meta then
+                local ok, decoded = pcall(cjson.decode, meta)
+                if ok and decoded["object_generation"] then
+                    local old_generation = tonumber(decoded["object_generation"]) or 0
+                    if old_generation > base then
+                        base = old_generation
+                    end
+                end
+            end
+            local next_generation = base + 1
+            redis.call("SET", KEYS[2], next_generation)
+            return next_generation
+            "#,
+        )
+        .key(self.block_key(key))
+        .key(self.generation_key(key))
+        .invoke::<u64>(&mut *connection)
+        .map_err(|e| KVError::Metadata(format!("redis allocate generation: {}", e)))
+    }
+}
+
+#[cfg(test)]
+#[derive(Default, Clone)]
+struct MemoryMetadataBackend {
+    inner: Arc<Mutex<MemoryMetadataInner>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MemoryMetadataInner {
+    blocks: HashMap<String, Vec<u8>>,
+    generations: HashMap<String, u64>,
+}
+
+#[cfg(test)]
+impl MemoryMetadataBackend {
+    fn for_url(url: &str) -> Self {
+        static STORES: OnceLock<Mutex<HashMap<String, Arc<Mutex<MemoryMetadataInner>>>>> =
+            OnceLock::new();
+        let mut stores = STORES.get_or_init(|| Mutex::new(HashMap::new())).lock();
+        let inner = stores
+            .entry(url.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(MemoryMetadataInner::default())))
+            .clone();
+        Self { inner }
+    }
+
+    fn serialize(meta: &BlockMeta) -> Result<Vec<u8>> {
+        serde_json::to_vec(meta).map_err(|e| KVError::Metadata(format!("serialize: {}", e)))
+    }
+
+    fn deserialize(bytes: &[u8]) -> Result<BlockMeta> {
+        serde_json::from_slice(bytes).map_err(|e| KVError::Metadata(format!("deserialize: {}", e)))
+    }
+
+    fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
+        self.inner
+            .lock()
+            .blocks
+            .insert(key.to_string(), Self::serialize(meta)?);
+        Ok(())
+    }
+
+    fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner.blocks.contains_key(key) {
+            return Ok(false);
+        }
+        inner.blocks.insert(key.to_string(), Self::serialize(meta)?);
+        Ok(true)
+    }
+
+    fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
+        self.inner
+            .lock()
+            .blocks
+            .get(key)
+            .map(|bytes| Self::deserialize(bytes))
+            .transpose()
+    }
+
+    fn delete_block(&self, key: &str) -> Result<()> {
+        self.inner.lock().blocks.remove(key);
+        Ok(())
+    }
+
+    fn exists_block(&self, key: &str) -> Result<bool> {
+        Ok(self.inner.lock().blocks.contains_key(key))
+    }
+
+    fn next_generation(&self, key: &str) -> Result<u64> {
+        let mut inner = self.inner.lock();
+        let current = inner.generations.get(key).copied().unwrap_or(0);
+        let old_generation = inner
+            .blocks
+            .get(key)
+            .map(|bytes| Self::deserialize(bytes))
+            .transpose()?
+            .map(|meta| meta.object_generation)
+            .unwrap_or(0);
+        let next = current.max(old_generation) + 1;
+        inner.generations.insert(key.to_string(), next);
+        Ok(next)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use tempfile::TempDir;
 
-    fn test_config(dir: &Path) -> Config {
+    fn test_config(name: &str) -> Config {
         let mut cfg = Config::default();
-        cfg.metadata.rocksdb_path = dir.to_path_buf();
+        cfg.metadata.redis_url = format!("memory://metadata-{}", name);
         cfg
     }
 
-    #[test]
-    fn test_block_meta_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let svc = MetadataService::new(&test_config(tmp.path())).unwrap();
-        let meta = BlockMeta {
+    fn meta() -> BlockMeta {
+        BlockMeta {
             device_id: 0,
             file_path: "/tmp/x.bin".to_string(),
             size: 1024,
@@ -177,7 +384,13 @@ mod tests {
             dtype: "bfloat16".to_string(),
             compressed: false,
             striping: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_block_meta_roundtrip() {
+        let svc = MetadataService::new(&test_config("roundtrip")).unwrap();
+        let meta = meta();
         svc.put_block("k1", &meta).unwrap();
         let got = svc.get_block("k1").unwrap().unwrap();
         assert_eq!(got.size, 1024);
@@ -189,5 +402,32 @@ mod tests {
         assert!(svc.exists_block("k1").unwrap());
         svc.delete_block("k1").unwrap();
         assert!(!svc.exists_block("k1").unwrap());
+    }
+
+    #[test]
+    fn put_block_if_absent_commits_only_once() {
+        let svc = MetadataService::new(&test_config("if-absent")).unwrap();
+        let mut first = meta();
+        first.object_generation = 1;
+        let mut second = meta();
+        second.object_generation = 2;
+
+        assert!(svc.put_block_if_absent("k1", &first).unwrap());
+        assert!(!svc.put_block_if_absent("k1", &second).unwrap());
+
+        let got = svc.get_block("k1").unwrap().unwrap();
+        assert_eq!(got.object_generation, 1);
+    }
+
+    #[test]
+    fn next_generation_is_monotonic() {
+        let svc = MetadataService::new(&test_config("generation")).unwrap();
+        assert_eq!(svc.next_generation("k1").unwrap(), 1);
+        assert_eq!(svc.next_generation("k1").unwrap(), 2);
+
+        let mut meta = meta();
+        meta.object_generation = 10;
+        svc.put_block("k1", &meta).unwrap();
+        assert_eq!(svc.next_generation("k1").unwrap(), 11);
     }
 }

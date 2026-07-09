@@ -22,7 +22,7 @@ pub struct ObjectKey {
 }
 
 impl ObjectKey {
-    /// Canonical string key used by RocksDB metadata and RDMA wire.
+    /// Canonical string key used by shared metadata and RDMA wire.
     ///
     /// The format is `<namespace_byte_len>:<namespace><object_key>`, which
     /// avoids ambiguity when business keys contain `:` or `/` characters.

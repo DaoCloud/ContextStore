@@ -43,7 +43,8 @@ io_uring_depth = 256
 strategy = "object_hash"  # Shard by opaque object identity
 
 [metadata]
-rocksdb_path = "/var/lib/contextstore/metadata"
+redis_url = "redis://127.0.0.1:6379/"
+redis_key_prefix = "contextstore:metadata:"
 
 [metrics]
 enabled = true
