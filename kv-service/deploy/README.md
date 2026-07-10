@@ -2,6 +2,10 @@
 
 Four supported deployment shapes for the Rust `contextstore-server`. Pick one; the layouts are independent.
 
+The server reads one TOML config file at startup. See
+[`../configs/README.md`](../configs/README.md) for the complete config reference
+and the Redis metadata requirements.
+
 ```
 deploy/
 ├── docker/
@@ -50,6 +54,9 @@ kubectl get pods -l app=contextstore-kv
 ```
 
 Edit the ConfigMap section of `statefulset.yaml` (or replace it with a mounted `configs/server.toml`) before applying to a real cluster.
+The manifest expects Redis to be reachable at the URL configured in the
+`[metadata]` section; deploy Redis separately or point the ConfigMap at an
+existing Redis service.
 
 ---
 

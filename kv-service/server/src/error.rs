@@ -21,9 +21,6 @@ pub enum KVError {
     #[error("metadata error: {0}")]
     Metadata(String),
 
-    #[error("RocksDB error: {0}")]
-    RocksDb(#[from] rocksdb::Error),
-
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 

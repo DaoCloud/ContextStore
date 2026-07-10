@@ -90,8 +90,7 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.cluster.node_id = "coordinator".to_string();
         cfg.cluster.grpc_advertise = "127.0.0.1:50051".to_string();
-        let tmp = tempfile::TempDir::new().unwrap();
-        cfg.metadata.rocksdb_path = tmp.path().join("meta");
+        cfg.metadata.redis_url = "memory://api-service-placement".to_string();
         let ctx = KVServiceContext::new(cfg).unwrap();
         let mut meta = meta();
         meta.size = 12;
@@ -291,7 +290,8 @@ impl KVServiceImpl {
         key: InternalKey,
         data: Bytes,
         meta: BlockMeta,
-    ) -> Result<(), Status> {
+        if_absent: bool,
+    ) -> Result<bool, Status> {
         let total = data.len();
         let chunk_size = self.ctx.storage.striping_chunk_size().max(1) as usize;
         let stripe_count = total.div_ceil(chunk_size);
@@ -327,6 +327,10 @@ impl KVServiceImpl {
         }
         locations.sort_by_key(|loc| loc.stripe_index);
 
+        let rollback_chunks = locations
+            .iter()
+            .map(|loc| chunk_location_to_pb(&key, loc))
+            .collect::<Vec<_>>();
         let chunk_devices = locations.iter().map(|loc| loc.device_id).collect();
         let chunk_paths = locations
             .iter()
@@ -344,11 +348,26 @@ impl KVServiceImpl {
             chunk_locations: locations,
         });
         self.ctx.memory.invalidate(&key);
-        self.ctx
-            .metadata
-            .put_block(&key.to_string_key(), &committed)
-            .map_err(Status::from)?;
-        Ok(())
+        let metadata = self.ctx.metadata.clone();
+        let str_key = key.to_string_key();
+        let committed_meta = committed.clone();
+        let committed = tokio::task::spawn_blocking(move || {
+            if if_absent {
+                metadata.put_block_if_absent(&str_key, &committed_meta)
+            } else {
+                metadata.put_block(&str_key, &committed_meta).map(|_| true)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::from)?;
+        if !committed {
+            for chunk in rollback_chunks {
+                let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     async fn put_distributed_bytes(
@@ -359,7 +378,9 @@ impl KVServiceImpl {
     ) -> Result<(), Status> {
         let write_lock = self.key_write_lock(&key);
         let _guard = write_lock.lock().await;
-        self.put_distributed_bytes_impl(key, data, meta).await
+        self.put_distributed_bytes_impl(key, data, meta, false)
+            .await
+            .map(|_| ())
     }
 
     async fn put_distributed_bytes_if_absent(
@@ -375,8 +396,7 @@ impl KVServiceImpl {
             return Ok(false);
         }
 
-        self.put_distributed_bytes_impl(key, data, meta).await?;
-        Ok(true)
+        self.put_distributed_bytes_impl(key, data, meta, true).await
     }
 
     fn placement_has_remote_chunks(&self, placement: &pb::PlacementDescriptor) -> bool {

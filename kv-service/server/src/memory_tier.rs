@@ -703,7 +703,7 @@ mod tests {
     fn make_tier(dir: &std::path::Path) -> MemoryTier {
         let mut cfg = Config::default();
         cfg.storage.devices = vec![dir.join("nvme0")];
-        cfg.metadata.rocksdb_path = dir.join("meta");
+        cfg.metadata.redis_url = format!("memory://memory-tier-{}", dir.display());
         cfg.memory_tier.capacity_mb = 1; // 1MB cap
         let router = Arc::new(ShardRouter::new(&cfg).unwrap());
         let storage = Arc::new(StorageTier::new(&cfg, router).unwrap());

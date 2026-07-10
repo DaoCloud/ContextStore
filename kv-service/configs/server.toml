@@ -44,9 +44,11 @@ io_uring_depth = 256
 strategy = "object_hash"
 
 [metadata]
-# Object metadata / block allocator persistence.
-# Single-host uses embedded RocksDB; cluster mode can switch to etcd.
-rocksdb_path = "./data/metadata"
+# Shared Redis metadata store. KVService fails to start if Redis is unavailable.
+redis_url = "redis://127.0.0.1:6379/"
+redis_key_prefix = "contextstore:metadata:"
+redis_connect_timeout_ms = 1000
+redis_command_timeout_ms = 1000
 
 [metrics]
 # Prometheus HTTP exporter (requires --features metrics at build time).

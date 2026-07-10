@@ -47,8 +47,6 @@ spec:
               mountPath: /data/nvme2
             - name: nvme-3
               mountPath: /data/nvme3
-            - name: metadata
-              mountPath: /var/lib/contextstore
           resources:
             requests:
               memory: "140Gi"
@@ -78,8 +76,6 @@ spec:
           hostPath: {path: /mnt/cs/nvme3, type: DirectoryOrCreate}
         - name: nvme-3
           hostPath: {path: /mnt/cs/nvme4, type: DirectoryOrCreate}
-        - name: metadata
-          hostPath: {path: /var/lib/contextstore, type: DirectoryOrCreate}
 ---
 apiVersion: v1
 kind: Service
@@ -122,4 +118,7 @@ data:
     strategy = "object_hash"
 
     [metadata]
-    rocksdb_path = "/var/lib/contextstore/metadata"
+    redis_url = "redis://contextstore-redis:6379/"
+    redis_key_prefix = "contextstore:metadata:"
+    redis_connect_timeout_ms = 1000
+    redis_command_timeout_ms = 1000

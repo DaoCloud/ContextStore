@@ -162,11 +162,7 @@ impl StorageTier {
         mut meta: BlockMeta,
         size: u64,
     ) -> Result<BlockMeta> {
-        let generation = self
-            .metadata
-            .get_block(&key.to_string_key())?
-            .map(|old| old.object_generation.saturating_add(1).max(1))
-            .unwrap_or_else(|| meta.object_generation.max(1));
+        let generation = self.metadata.next_generation(&key.to_string_key())?;
         let layout_version = 1;
         meta.size = size;
         meta.object_generation = generation;
@@ -238,9 +234,13 @@ impl StorageTier {
                 device_id
             )));
         }
-        let expected =
-            self.router
-                .chunk_versioned_path(key, stripe_index, device_id, generation, layout_version);
+        let expected = self.router.chunk_versioned_path(
+            key,
+            stripe_index,
+            device_id,
+            generation,
+            layout_version,
+        );
         if path != expected {
             return Err(KVError::InvalidArgument(format!(
                 "placement chunk handle does not match descriptor: {}",
@@ -375,8 +375,8 @@ impl StorageTier {
             return Ok(false);
         }
         if self.should_stripe(data.len()) {
-            self.put_striped(key, data, meta)?;
-            return Ok(true);
+            let total = data.len();
+            return self.put_striped_chunks_impl(key, vec![data], total, meta, true);
         }
 
         let mut meta = self.prepare_write_meta(key, meta, data.len() as u64)?;
@@ -396,7 +396,13 @@ impl StorageTier {
         meta.size = nbytes as u64;
         meta.device_id = device_id as u32;
         meta.striping = None;
-        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        if !self
+            .metadata
+            .put_block_if_absent(&key.to_string_key(), &meta)?
+        {
+            let _ = self.executor.delete_file(&path);
+            return Ok(false);
+        }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(nbytes as u64, Ordering::Relaxed);
@@ -447,8 +453,7 @@ impl StorageTier {
         if self.metadata.get_block(&key.to_string_key())?.is_some() {
             return Ok(false);
         }
-        self.put_striped_chunks(key, segments, total, meta)?;
-        Ok(true)
+        self.put_striped_chunks_impl(key, segments, total, meta, true)
     }
 
     /// **RDMA PUT data-plane only** — data is already in caller-pinned 4K-aligned memory (an RDMA
@@ -733,6 +738,18 @@ impl StorageTier {
         total: usize,
         meta: BlockMeta,
     ) -> Result<()> {
+        self.put_striped_chunks_impl(key, segments, total, meta, false)
+            .map(|_| ())
+    }
+
+    fn put_striped_chunks_impl(
+        &self,
+        key: &ObjectKey,
+        segments: Vec<Bytes>,
+        total: usize,
+        meta: BlockMeta,
+        if_absent: bool,
+    ) -> Result<bool> {
         let mut meta = self.prepare_write_meta(key, meta, total as u64)?;
         let chunk_size = self.striping_chunk_size as usize;
         let n_stripes = (total + chunk_size - 1) / chunk_size;
@@ -827,12 +844,26 @@ impl StorageTier {
             total_size: total as u64,
             chunk_locations: Vec::new(),
         });
-        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        let committed = if if_absent {
+            self.metadata
+                .put_block_if_absent(&key.to_string_key(), &meta)?
+        } else {
+            self.metadata.put_block(&key.to_string_key(), &meta)?;
+            true
+        };
+        if !committed {
+            if let Some(stripe) = &meta.striping {
+                for path in &stripe.chunk_paths {
+                    let _ = self.executor.delete_file(std::path::Path::new(path));
+                }
+            }
+            return Ok(false);
+        }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.striped_writes.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(total as u64, Ordering::Relaxed);
-        Ok(())
+        Ok(true)
     }
 
     fn read_striped(&self, key: &ObjectKey, stripe: &StripingInfo) -> Result<Vec<u8>> {
@@ -1415,7 +1446,7 @@ mod tests {
         cfg.storage.devices = (0..n_devices)
             .map(|i| dir.join(format!("nvme{}", i)))
             .collect();
-        cfg.metadata.rocksdb_path = dir.join("meta");
+        cfg.metadata.redis_url = format!("memory://storage-tier-{}", dir.display());
         cfg
     }
 
