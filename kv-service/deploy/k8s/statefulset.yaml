@@ -120,3 +120,5 @@ data:
     [metadata]
     redis_url = "redis://contextstore-redis:6379/"
     redis_key_prefix = "contextstore:metadata:"
+    redis_connect_timeout_ms = 1000
+    redis_command_timeout_ms = 1000

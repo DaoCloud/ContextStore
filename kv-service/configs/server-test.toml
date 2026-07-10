@@ -46,6 +46,8 @@ strategy = "object_hash"   # Shard by opaque object identity
 # and key prefix to share object metadata and placement descriptors.
 redis_url = "redis://127.0.0.1:6379/"
 redis_key_prefix = "contextstore:metadata:"
+redis_connect_timeout_ms = 1000
+redis_command_timeout_ms = 1000
 
 [metrics]
 enabled = false             # Set to true after building with --features metrics

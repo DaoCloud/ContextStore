@@ -174,10 +174,22 @@ pub struct MetadataConfig {
     pub redis_url: String,
     #[serde(default = "default_redis_key_prefix")]
     pub redis_key_prefix: String,
+    #[serde(default = "default_redis_connect_timeout_ms")]
+    pub redis_connect_timeout_ms: u64,
+    #[serde(default = "default_redis_command_timeout_ms")]
+    pub redis_command_timeout_ms: u64,
 }
 
 fn default_redis_key_prefix() -> String {
     "contextstore:metadata:".to_string()
+}
+
+fn default_redis_connect_timeout_ms() -> u64 {
+    1000
+}
+
+fn default_redis_command_timeout_ms() -> u64 {
+    1000
 }
 
 impl Default for MetadataConfig {
@@ -185,6 +197,8 @@ impl Default for MetadataConfig {
         Self {
             redis_url: "redis://127.0.0.1:6379/".to_string(),
             redis_key_prefix: default_redis_key_prefix(),
+            redis_connect_timeout_ms: default_redis_connect_timeout_ms(),
+            redis_command_timeout_ms: default_redis_command_timeout_ms(),
         }
     }
 }
@@ -302,6 +316,16 @@ impl Config {
         if self.metadata.redis_key_prefix.trim().is_empty() {
             return Err(KVError::Config(
                 "metadata.redis_key_prefix must not be empty".to_string(),
+            ));
+        }
+        if self.metadata.redis_connect_timeout_ms == 0 {
+            return Err(KVError::Config(
+                "metadata.redis_connect_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+        if self.metadata.redis_command_timeout_ms == 0 {
+            return Err(KVError::Config(
+                "metadata.redis_command_timeout_ms must be greater than 0".to_string(),
             ));
         }
         Ok(())
