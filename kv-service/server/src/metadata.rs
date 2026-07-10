@@ -5,12 +5,13 @@ use crate::error::{KVError, Result};
 use parking_lot::Mutex;
 use redis::Commands;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[cfg(test)]
 use std::collections::HashMap;
 #[cfg(test)]
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 const BLOCK_META_SEGMENT: &str = "block_meta";
 const GENERATION_SEGMENT: &str = "generation";
@@ -301,9 +302,10 @@ impl RedisMetadataBackend {
     }
 
     fn next_generation(&self, key: &str) -> Result<u64> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
         let block_key = self.block_key(key);
         let generation_key = self.generation_key(key);
-        self.run_with_reconnect("allocate generation", |connection| {
+        let script = SCRIPT.get_or_init(|| {
             redis::Script::new(
                 r#"
             local meta = redis.call("GET", KEYS[1])
@@ -311,7 +313,7 @@ impl RedisMetadataBackend {
             local base = current
             if meta then
                 local ok, decoded = pcall(cjson.decode, meta)
-                if ok and decoded["object_generation"] then
+                if ok and type(decoded) == "table" and decoded["object_generation"] then
                     local old_generation = tonumber(decoded["object_generation"]) or 0
                     if old_generation > base then
                         base = old_generation
@@ -323,9 +325,12 @@ impl RedisMetadataBackend {
             return next_generation
             "#,
             )
-            .key(&block_key)
-            .key(&generation_key)
-            .invoke::<u64>(connection)
+        });
+        self.run_with_reconnect("allocate generation", |connection| {
+            script
+                .key(&block_key)
+                .key(&generation_key)
+                .invoke::<u64>(connection)
         })
     }
 }

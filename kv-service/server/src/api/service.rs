@@ -348,18 +348,19 @@ impl KVServiceImpl {
             chunk_locations: locations,
         });
         self.ctx.memory.invalidate(&key);
-        let committed = if if_absent {
-            self.ctx
-                .metadata
-                .put_block_if_absent(&key.to_string_key(), &committed)
-                .map_err(Status::from)?
-        } else {
-            self.ctx
-                .metadata
-                .put_block(&key.to_string_key(), &committed)
-                .map_err(Status::from)?;
-            true
-        };
+        let metadata = self.ctx.metadata.clone();
+        let str_key = key.to_string_key();
+        let committed_meta = committed.clone();
+        let committed = tokio::task::spawn_blocking(move || {
+            if if_absent {
+                metadata.put_block_if_absent(&str_key, &committed_meta)
+            } else {
+                metadata.put_block(&str_key, &committed_meta).map(|_| true)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::from)?;
         if !committed {
             for chunk in rollback_chunks {
                 let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
