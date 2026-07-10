@@ -50,7 +50,7 @@ Connector and KVService are built and deployed independently. The Connector hand
 
 KVService exposes an **object store** (not a byte-addressable KV): each write produces an object identified by `ObjectKey{namespace, object_key}`, and each object carries server-generated metadata that clients treat as opaque.
 
-**Metadata service (Rust side).** `MetadataService` (`kv-service/server/src/metadata.rs`) persists per-object records in RocksDB under the `block_meta` column family. Each `BlockMeta` includes:
+**Metadata service (Rust side).** `MetadataService` (`kv-service/server/src/metadata.rs`) persists per-object records in a shared Redis metadata store. Each `BlockMeta` includes:
 
 | Field | Meaning |
 |-------|---------|
@@ -98,6 +98,10 @@ make -C kv-service build
 ./kv-service/server/target/release/contextstore-server \
     --config kv-service/configs/server.toml
 ```
+
+KVService reads one TOML config file and requires a reachable Redis metadata
+store. See [`kv-service/configs/README.md`](kv-service/configs/README.md) for
+the config file format and examples.
 
 Enable the RDMA data path:
 
@@ -203,7 +207,9 @@ python kv-service/benchmarks/run_benchmark.py --endpoint localhost:50051
 - **Systemd** — `kv-service/deploy/systemd/contextstore-server.service`.
 - **JBOF over NVMe-oF** — `kv-service/configs/server-nvmeof.toml` plus the SPDK target and NVMe-oF initiator helpers in `kv-service/deploy/jbof/`. Pair with `--features rdma` for the pre-registered-slab, zero-memcpy RDMA WRITE data path.
 
-See [`kv-service/deploy/README.md`](kv-service/deploy/README.md) for the exact commands.
+See [`kv-service/configs/README.md`](kv-service/configs/README.md) for config
+fields and [`kv-service/deploy/README.md`](kv-service/deploy/README.md) for the
+exact deployment commands.
 
 ---
 
