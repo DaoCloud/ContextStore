@@ -92,13 +92,3 @@ rdma = ["dep:rdma-sys", "dep:libc"]
 tempfile = "3"
 tokio-test = "0.4"
 libc = "0.2"
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-strip = true
-
-[profile.dev]
-opt-level = 0
-debug = true
