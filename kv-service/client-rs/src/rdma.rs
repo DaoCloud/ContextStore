@@ -264,21 +264,42 @@ impl RdmaClient {
     pub fn register_buffer<'a>(&self, buffer: &'a mut [u8]) -> Result<RegisteredBuffer<'a>> {
         let ptr = NonNull::new(buffer.as_mut_ptr())
             .ok_or_else(|| anyhow!("cannot register an empty RDMA buffer"))?;
-        if buffer.is_empty() {
+        self.register_parts(ptr, buffer.len())
+    }
+
+    /// Register caller-owned memory whose lifetime cannot be expressed as a
+    /// Rust slice, such as a buffer received through an FFI boundary.
+    ///
+    /// # Safety
+    /// `ptr..ptr + len` must be valid writable memory and must remain alive,
+    /// unmoved, and exclusively available to the RDMA operation until the
+    /// returned [`RegisteredBuffer`] is dropped. The caller must not release
+    /// or reuse the memory while the NIC can still access it.
+    pub unsafe fn register_raw_buffer(
+        &self,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Result<RegisteredBuffer<'static>> {
+        let ptr = NonNull::new(ptr).ok_or_else(|| anyhow!("cannot register a null RDMA buffer"))?;
+        self.register_parts(ptr, len)
+    }
+
+    fn register_parts<'a>(&self, ptr: NonNull<u8>, len: usize) -> Result<RegisteredBuffer<'a>> {
+        if len == 0 {
             return Err(anyhow!("cannot register an empty RDMA buffer"));
         }
         let mr = unsafe {
             NonNull::new(ibv_reg_mr(
                 self.resources.pd.as_ptr(),
                 ptr.as_ptr() as *mut c_void,
-                buffer.len(),
+                len,
                 access_flags(),
             ))
         }
         .ok_or_else(|| {
             anyhow!(
                 "ibv_reg_mr for {} bytes failed: {}",
-                buffer.len(),
+                len,
                 std::io::Error::last_os_error()
             )
         })?;
@@ -286,7 +307,7 @@ impl RdmaClient {
             _resources: Arc::clone(&self.resources),
             mr,
             ptr,
-            len: buffer.len(),
+            len,
             _buffer: PhantomData,
         })
     }
