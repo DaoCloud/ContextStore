@@ -12,6 +12,13 @@ pub mod pb {
     tonic::include_proto!("contextstore.kv.v1");
 }
 
+/// Optional native RDMA data-plane client.
+///
+/// This module is only available with the `rdma` cargo feature. The default
+/// gRPC-only SDK build therefore has no libibverbs dependency.
+#[cfg(feature = "rdma")]
+pub mod rdma;
+
 use pb::kv_service_client::KvServiceClient;
 use prost::bytes::Bytes;
 use tonic::transport::Channel;
