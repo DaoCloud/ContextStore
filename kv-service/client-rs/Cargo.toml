@@ -36,3 +36,4 @@ rdma = ["dep:rdma-sys", "dep:anyhow", "dep:libc"]
 
 [build-dependencies]
 tonic-build = "0.11"
+protoc-bin-vendored = "3"
