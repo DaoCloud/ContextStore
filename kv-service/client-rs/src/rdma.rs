@@ -29,7 +29,11 @@ const MSG_PUT_READY: u8 = 5;
 const MSG_PUT_COMMIT: u8 = 6;
 const MSG_PUT_RESP: u8 = 7;
 const MSG_GET_DESCRIPTOR_REQ: u8 = 8;
+const MSG_PUT_IF_ABSENT_REQ: u8 = 9;
 const MSG_BYE: u8 = 99;
+const PUT_RESULT_FAILED: u8 = 0;
+const PUT_RESULT_STORED: u8 = 1;
+const PUT_RESULT_EXISTS: u8 = 2;
 const CQ_DEPTH: i32 = 128;
 const MAX_WRITE_BYTES: u64 = 1 << 30;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -361,28 +365,75 @@ impl RdmaClient {
         offset: usize,
         size: usize,
     ) -> Result<()> {
+        if !self.put_key_from(
+            &canonical_key(namespace, object_key),
+            buffer,
+            offset,
+            size,
+            false,
+        )? {
+            return Err(anyhow!("server rejected RDMA PUT"));
+        }
+        Ok(())
+    }
+
+    /// Immutably write `buffer[offset..offset + size]`. Returns `Ok(true)`
+    /// when this client stored the object and `Ok(false)` when it already
+    /// existed. The server uses the same metadata `SET NX` contract as the
+    /// gRPC `put_if_absent` API.
+    pub fn put_if_absent_from(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        buffer: &RegisteredBuffer<'_>,
+        offset: usize,
+        size: usize,
+    ) -> Result<bool> {
+        self.put_key_from(
+            &canonical_key(namespace, object_key),
+            buffer,
+            offset,
+            size,
+            true,
+        )
+    }
+
+    fn put_key_from(
+        &mut self,
+        key: &str,
+        buffer: &RegisteredBuffer<'_>,
+        offset: usize,
+        size: usize,
+        if_not_exists: bool,
+    ) -> Result<bool> {
         let (src_addr, lkey) = buffer.source(offset, size)?;
-        let key = canonical_key(namespace, object_key);
-        let request = build_put_request(&key, size as u64)?;
+        let message = if if_not_exists {
+            MSG_PUT_IF_ABSENT_REQ
+        } else {
+            MSG_PUT_REQ
+        };
+        let request = build_put_request(message, key, size as u64)?;
         self.stream.write_all(&request)?;
         self.stream.flush()?;
 
         let ready = read_put_ready(&mut self.stream)?;
         if !ready.ok {
-            let response = read_put_response(&mut self.stream)?;
-            if !response {
-                return Err(anyhow!("server rejected RDMA PUT: no writable slab extent"));
+            let result = read_put_result(&mut self.stream)?;
+            if if_not_exists && result == PUT_RESULT_EXISTS {
+                return Ok(false);
             }
-            return Err(anyhow!("server rejected RDMA PUT"));
+            return Err(anyhow!("server rejected RDMA PUT before data transfer"));
         }
 
         self.write_remote(src_addr, lkey, ready.addr, ready.rkey, size)?;
         self.stream.write_all(&[MSG_PUT_COMMIT])?;
         self.stream.flush()?;
-        if !read_put_response(&mut self.stream)? {
-            return Err(anyhow!("server failed to persist RDMA PUT"));
+        match read_put_result(&mut self.stream)? {
+            PUT_RESULT_STORED => Ok(true),
+            PUT_RESULT_EXISTS if if_not_exists => Ok(false),
+            PUT_RESULT_FAILED => Err(anyhow!("server failed to persist RDMA PUT")),
+            result => Err(anyhow!("invalid RDMA PUT result code {result}")),
         }
-        Ok(())
     }
 
     fn get_key_into(
@@ -672,9 +723,9 @@ fn build_descriptor_get_request(
     Ok(request)
 }
 
-fn build_put_request(key: &str, size: u64) -> Result<Vec<u8>> {
+fn build_put_request(message: u8, key: &str, size: u64) -> Result<Vec<u8>> {
     let mut request = Vec::with_capacity(1 + 2 + key.len() + 8);
-    request.push(MSG_PUT_REQ);
+    request.push(message);
     push_string(&mut request, key, "key")?;
     request.extend_from_slice(&size.to_le_bytes());
     Ok(request)
@@ -736,7 +787,7 @@ fn read_put_ready(stream: &mut TcpStream) -> Result<PutReady> {
     })
 }
 
-fn read_put_response(stream: &mut TcpStream) -> Result<bool> {
+fn read_put_result(stream: &mut TcpStream) -> Result<u8> {
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag)?;
     if tag[0] != MSG_PUT_RESP {
@@ -744,7 +795,7 @@ fn read_put_response(stream: &mut TcpStream) -> Result<bool> {
     }
     let mut body = [0u8; 1];
     stream.read_exact(&mut body)?;
-    Ok(body[0] != 0)
+    Ok(body[0])
 }
 
 fn post_write(qp: NonNull<ibv_qp>, write: &RemoteWrite) -> Result<()> {
@@ -841,6 +892,7 @@ mod tests {
     fn request_rejects_oversized_wire_string() {
         let key = "x".repeat(u16::MAX as usize + 1);
         assert!(build_get_request(&key, 1, 2, 3).is_err());
+        assert!(build_put_request(MSG_PUT_REQ, &key, 3).is_err());
     }
 
     #[test]

@@ -484,11 +484,40 @@ impl StorageTier {
         total: usize,
         meta: BlockMeta,
     ) -> Result<()> {
+        self.put_from_ptr_with_options(key, ptr, total, meta, false)
+            .map(|_| ())
+    }
+
+    /// RDMA PUT-if-absent variant. The metadata existence check and the
+    /// physical write are protected by the same per-key lock used by gRPC PUT.
+    /// A cross-node metadata race is resolved by Redis `SET NX`; loser files
+    /// are removed before returning `false`.
+    pub fn put_from_ptr_if_absent(
+        &self,
+        key: &ObjectKey,
+        ptr: *const u8,
+        total: usize,
+        meta: BlockMeta,
+    ) -> Result<bool> {
+        self.put_from_ptr_with_options(key, ptr, total, meta, true)
+    }
+
+    fn put_from_ptr_with_options(
+        &self,
+        key: &ObjectKey,
+        ptr: *const u8,
+        total: usize,
+        meta: BlockMeta,
+        if_not_exists: bool,
+    ) -> Result<bool> {
         if total == 0 {
             return Err(KVError::Internal("put_from_ptr: empty data".into()));
         }
         let write_lock = self.key_write_lock(key);
         let _guard = write_lock.lock();
+        if if_not_exists && self.metadata.get_block(&key.to_string_key())?.is_some() {
+            return Ok(false);
+        }
         // The RDMA PUT path only serves large values; small values never take this route. But as a
         // fallback: no stripe → single-file pwrite (via write_aligned_batch with one item).
         if !self.should_stripe(total) {
@@ -516,13 +545,23 @@ impl StorageTier {
             meta.size = total as u64;
             meta.device_id = device_id as u32;
             meta.striping = None;
-            self.metadata.put_block(&key.to_string_key(), &meta)?;
+            let committed = if if_not_exists {
+                self.metadata
+                    .put_block_if_absent(&key.to_string_key(), &meta)?
+            } else {
+                self.metadata.put_block(&key.to_string_key(), &meta)?;
+                true
+            };
+            if !committed {
+                let _ = self.executor.delete_file(&path);
+                return Ok(false);
+            }
             self.writes_total.fetch_add(1, Ordering::Relaxed);
             self.bytes_written
                 .fetch_add(total as u64, Ordering::Relaxed);
-            return Ok(());
+            return Ok(true);
         }
-        self.put_from_ptr_striped(key, ptr, total, meta)
+        self.put_from_ptr_striped(key, ptr, total, meta, if_not_exists)
     }
 
     /// Internal: put_from_ptr implementation for the striping path.
@@ -536,7 +575,8 @@ impl StorageTier {
         ptr: *const u8,
         total: usize,
         meta: BlockMeta,
-    ) -> Result<()> {
+        if_not_exists: bool,
+    ) -> Result<bool> {
         let mut meta = self.prepare_write_meta(key, meta, total as u64)?;
         let chunk_size = self.striping_chunk_size as usize;
         let n_stripes = total.div_ceil(chunk_size);
@@ -606,12 +646,26 @@ impl StorageTier {
             total_size: total as u64,
             chunk_locations: Vec::new(),
         });
-        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        let committed = if if_not_exists {
+            self.metadata
+                .put_block_if_absent(&key.to_string_key(), &meta)?
+        } else {
+            self.metadata.put_block(&key.to_string_key(), &meta)?;
+            true
+        };
+        if !committed {
+            if let Some(striping) = &meta.striping {
+                for path in &striping.chunk_paths {
+                    let _ = self.executor.delete_file(std::path::Path::new(path));
+                }
+            }
+            return Ok(false);
+        }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.striped_writes.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(total as u64, Ordering::Relaxed);
-        Ok(())
+        Ok(true)
     }
 
     pub fn delete(&self, key: &ObjectKey) -> Result<bool> {

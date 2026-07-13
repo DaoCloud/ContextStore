@@ -66,8 +66,9 @@ fn rdma_put_and_get_round_trip() {
     let registered_write = rdma
         .register_buffer(&mut write_buffer)
         .expect("register RDMA write buffer");
-    rdma.put_from(namespace, &write_key, &registered_write, 0, payload.len())
-        .expect("write through RDMA");
+    assert!(rdma
+        .put_if_absent_from(namespace, &write_key, &registered_write, 0, payload.len())
+        .expect("write through RDMA"));
     drop(registered_write);
 
     assert_eq!(
@@ -76,4 +77,20 @@ fn rdma_put_and_get_round_trip() {
             .expect("verify RDMA write through gRPC"),
         Some(payload)
     );
+
+    let mut second_write = vec![42u8; 8192];
+    let second_write_len = second_write.len();
+    let registered_second = rdma
+        .register_buffer(&mut second_write)
+        .expect("register second RDMA write buffer");
+    assert!(!rdma
+        .put_if_absent_from(
+            namespace,
+            &write_key,
+            &registered_second,
+            0,
+            second_write_len
+        )
+        .expect("repeat immutable RDMA write"));
+    drop(registered_second);
 }

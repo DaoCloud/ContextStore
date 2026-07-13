@@ -39,6 +39,9 @@ pub const MSG_PUT_RESP: u8 = 7;
 /// Descriptor GET data plane: client carries an ObjectDescriptor identity; server rebuilds the
 /// physical layout from the descriptor to read, and validates the version against current metadata.
 pub const MSG_GET_DESCRIPTOR_REQ: u8 = 8;
+/// Immutable RDMA PUT. It uses the same body as `MSG_PUT_REQ`, but the server
+/// commits metadata with `SET NX` and reports an existing object distinctly.
+pub const MSG_PUT_IF_ABSENT_REQ: u8 = 9;
 const MSG_BYE: u8 = 99;
 
 /// Synchronous read of exactly N bytes (TCP control plane messages are small; blocking read is fine).
@@ -379,13 +382,33 @@ pub struct PutRespMsg {
     pub ok: bool,
 }
 
+/// `PUT_IF_ABSENT` completion codes. Legacy PUT only uses `STORED` and
+/// `FAILED`, so existing clients remain wire-compatible.
+pub const PUT_RESULT_FAILED: u8 = 0;
+pub const PUT_RESULT_STORED: u8 = 1;
+pub const PUT_RESULT_EXISTS: u8 = 2;
+
 pub fn send_put_resp(stream: &mut TcpStream, msg: &PutRespMsg) -> Result<()> {
     let mut frame = [0u8; 2];
     frame[0] = MSG_PUT_RESP;
-    frame[1] = if msg.ok { 1 } else { 0 };
+    frame[1] = if msg.ok {
+        PUT_RESULT_STORED
+    } else {
+        PUT_RESULT_FAILED
+    };
     stream
         .write_all(&frame)
         .map_err(|e| anyhow!("tcp write put_resp failed: {}", e))?;
+    stream.flush().ok();
+    Ok(())
+}
+
+/// Send an extended immutable PUT result. Only clients that initiated
+/// `MSG_PUT_IF_ABSENT_REQ` interpret `PUT_RESULT_EXISTS`.
+pub fn send_put_result(stream: &mut TcpStream, result: u8) -> Result<()> {
+    stream
+        .write_all(&[MSG_PUT_RESP, result])
+        .map_err(|e| anyhow!("tcp write put result failed: {}", e))?;
     stream.flush().ok();
     Ok(())
 }
