@@ -88,6 +88,11 @@ pub struct RdmaClient {
     stream: TcpStream,
 }
 
+// SAFETY: A client is exclusively accessed through `&mut self`; libibverbs
+// QPs and their owning resources may be used from a different thread, and
+// TcpStream is Send. This lets callers pool established QPs across workers.
+unsafe impl Send for RdmaClient {}
+
 /// A registered, caller-owned host buffer.
 ///
 /// The buffer must remain registered for the full RDMA operation. The lifetime
