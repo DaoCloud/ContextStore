@@ -15,11 +15,10 @@ use crate::router::{ObjectKey, ShardRouter};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use prost::bytes::{Bytes, BytesMut};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 use twox_hash::xxh3::hash64;
 
 pub struct StorageTier {
@@ -484,11 +483,40 @@ impl StorageTier {
         total: usize,
         meta: BlockMeta,
     ) -> Result<()> {
+        self.put_from_ptr_with_options(key, ptr, total, meta, false)
+            .map(|_| ())
+    }
+
+    /// RDMA PUT-if-absent variant. The metadata existence check and the
+    /// physical write are protected by the same per-key lock used by gRPC PUT.
+    /// A cross-node metadata race is resolved by Redis `SET NX`; loser files
+    /// are removed before returning `false`.
+    pub fn put_from_ptr_if_absent(
+        &self,
+        key: &ObjectKey,
+        ptr: *const u8,
+        total: usize,
+        meta: BlockMeta,
+    ) -> Result<bool> {
+        self.put_from_ptr_with_options(key, ptr, total, meta, true)
+    }
+
+    fn put_from_ptr_with_options(
+        &self,
+        key: &ObjectKey,
+        ptr: *const u8,
+        total: usize,
+        meta: BlockMeta,
+        if_not_exists: bool,
+    ) -> Result<bool> {
         if total == 0 {
             return Err(KVError::Internal("put_from_ptr: empty data".into()));
         }
         let write_lock = self.key_write_lock(key);
         let _guard = write_lock.lock();
+        if if_not_exists && self.metadata.get_block(&key.to_string_key())?.is_some() {
+            return Ok(false);
+        }
         // The RDMA PUT path only serves large values; small values never take this route. But as a
         // fallback: no stripe → single-file pwrite (via write_aligned_batch with one item).
         if !self.should_stripe(total) {
@@ -516,13 +544,23 @@ impl StorageTier {
             meta.size = total as u64;
             meta.device_id = device_id as u32;
             meta.striping = None;
-            self.metadata.put_block(&key.to_string_key(), &meta)?;
+            let committed = if if_not_exists {
+                self.metadata
+                    .put_block_if_absent(&key.to_string_key(), &meta)?
+            } else {
+                self.metadata.put_block(&key.to_string_key(), &meta)?;
+                true
+            };
+            if !committed {
+                let _ = self.executor.delete_file(&path);
+                return Ok(false);
+            }
             self.writes_total.fetch_add(1, Ordering::Relaxed);
             self.bytes_written
                 .fetch_add(total as u64, Ordering::Relaxed);
-            return Ok(());
+            return Ok(true);
         }
-        self.put_from_ptr_striped(key, ptr, total, meta)
+        self.put_from_ptr_striped(key, ptr, total, meta, if_not_exists)
     }
 
     /// Internal: put_from_ptr implementation for the striping path.
@@ -536,7 +574,8 @@ impl StorageTier {
         ptr: *const u8,
         total: usize,
         meta: BlockMeta,
-    ) -> Result<()> {
+        if_not_exists: bool,
+    ) -> Result<bool> {
         let mut meta = self.prepare_write_meta(key, meta, total as u64)?;
         let chunk_size = self.striping_chunk_size as usize;
         let n_stripes = total.div_ceil(chunk_size);
@@ -606,12 +645,26 @@ impl StorageTier {
             total_size: total as u64,
             chunk_locations: Vec::new(),
         });
-        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        let committed = if if_not_exists {
+            self.metadata
+                .put_block_if_absent(&key.to_string_key(), &meta)?
+        } else {
+            self.metadata.put_block(&key.to_string_key(), &meta)?;
+            true
+        };
+        if !committed {
+            if let Some(striping) = &meta.striping {
+                for path in &striping.chunk_paths {
+                    let _ = self.executor.delete_file(std::path::Path::new(path));
+                }
+            }
+            return Ok(false);
+        }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.striped_writes.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(total as u64, Ordering::Relaxed);
-        Ok(())
+        Ok(true)
     }
 
     pub fn delete(&self, key: &ObjectKey) -> Result<bool> {
@@ -1166,11 +1219,15 @@ impl StorageTier {
                 offset: 0,
                 length: 0,
             };
-            info!(
-                "IO_PATTERN key={} mode=single total={} request_count=1 offset=0 length=0 capacity={}",
-                str_key,
-                total,
-                capacity,
+            debug!(
+                target: "contextstore_server::storage_io",
+                event = "storage_io_plan",
+                operation = "read",
+                mode = "single",
+                key = %str_key,
+                total_bytes = total,
+                request_count = 1,
+                capacity_bytes = capacity,
             );
             let rx = self
                 .executor
@@ -1208,13 +1265,10 @@ impl StorageTier {
         let mut reqs: Vec<(IORequest, *mut u8, usize)> = Vec::with_capacity(n_stripes);
         // Record each stripe's (offset_in_value, len) for event push.
         let mut stripe_meta: Vec<(usize, usize)> = Vec::with_capacity(n_stripes);
-        let mut stripe_log: Vec<String> = Vec::with_capacity(n_stripes);
-        let mut device_summary: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
         for (i, p) in stripe.chunk_paths.iter().enumerate() {
             let stripe_offset = i * chunk_size;
             let stripe_end = ((i + 1) * chunk_size).min(total);
             let stripe_len = stripe_end - stripe_offset;
-            let device_id = stripe.chunk_devices.get(i).copied().unwrap_or(u32::MAX);
             let aligned_stripe = (stripe_len + 4095) & !4095;
             let stripe_ptr = unsafe { ptr.add(stripe_offset) };
             let stripe_cap = (capacity - stripe_offset).min((chunk_size + 4095) & !4095);
@@ -1234,44 +1288,20 @@ impl StorageTier {
                 stripe_cap,
             ));
             stripe_meta.push((stripe_offset, stripe_len));
-            let entry = device_summary.entry(device_id).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += stripe_len;
-            stripe_log.push(format!(
-                "{}:dev{}:off{}:len{}:{}",
-                i, device_id, stripe_offset, stripe_len, p,
-            ));
         }
-        let device_summary_log = device_summary
-            .iter()
-            .map(|(device_id, (count, bytes))| {
-                format!("dev{}:{}stripes:{}B", device_id, count, bytes)
-            })
-            .collect::<Vec<_>>()
-            .join(",");
         let min_stripe_len = stripe_meta.iter().map(|(_, len)| *len).min().unwrap_or(0);
         let max_stripe_len = stripe_meta.iter().map(|(_, len)| *len).max().unwrap_or(0);
-        info!(
-            concat!(
-                "IO_PATTERN key={} mode=striped total={} chunk_size={} n_stripes={} ",
-                "device_count={} min_stripe_len={} max_stripe_len={} device_summary=[{}]"
-            ),
-            str_key,
-            total,
-            chunk_size,
-            n_stripes,
-            device_summary.len(),
-            min_stripe_len,
-            max_stripe_len,
-            device_summary_log,
-        );
-        tracing::info!(
-            "STORAGE_GET_STREAM key={} total={} chunk_size={} n_stripes={} stripe_map=[{}]",
-            str_key,
-            total,
-            chunk_size,
-            n_stripes,
-            stripe_log.join(","),
+        debug!(
+            target: "contextstore_server::storage_io",
+            event = "storage_io_plan",
+            operation = "read",
+            mode = "striped",
+            key = %str_key,
+            total_bytes = total,
+            chunk_size_bytes = chunk_size,
+            request_count = n_stripes,
+            min_request_bytes = min_stripe_len,
+            max_request_bytes = max_stripe_len,
         );
 
         // Call executor's stream API to get an (idx, Result) event stream.

@@ -21,7 +21,8 @@ use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
     self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, MSG_GET_DESCRIPTOR_REQ,
-    MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_REQ,
+    MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_REQ, PUT_RESULT_EXISTS,
+    PUT_RESULT_FAILED, PUT_RESULT_STORED,
 };
 use crate::router::ObjectKey;
 use crate::KVServiceContext;
@@ -279,8 +280,8 @@ fn handle_client(
             return Ok(());
         }
         // ===== PUT data path =====
-        if tag == MSG_PUT_REQ {
-            handle_put(&mut stream, &kv_ctx, nic_idx)?;
+        if tag == MSG_PUT_REQ || tag == MSG_PUT_IF_ABSENT_REQ {
+            handle_put(&mut stream, &kv_ctx, nic_idx, tag == MSG_PUT_IF_ABSENT_REQ)?;
             continue;
         }
         if tag == MSG_GET_DESCRIPTOR_REQ {
@@ -1037,6 +1038,7 @@ fn handle_put(
     stream: &mut TcpStream,
     kv_ctx: &Arc<KVServiceContext>,
     nic_idx: usize,
+    if_not_exists: bool,
 ) -> Result<()> {
     let t_recv_start = std::time::Instant::now();
     let put_req = wire::recv_put_req_body(stream)?;
@@ -1158,19 +1160,28 @@ fn handle_put(
         compressed: false,
         striping: None,
     };
-    let put_result = kv_ctx
-        .storage
-        .put_from_ptr(&kv_key, extent.as_ptr(), size, meta);
+    let put_result = if if_not_exists {
+        kv_ctx
+            .storage
+            .put_from_ptr_if_absent(&kv_key, extent.as_ptr(), size, meta)
+    } else {
+        kv_ctx
+            .storage
+            .put_from_ptr(&kv_key, extent.as_ptr(), size, meta)
+            .map(|_| true)
+    };
     let t_disk_done = std::time::Instant::now();
 
     // Disk write failed → resp ok=false; extent drops, returning to slab.
-    let ok = match put_result {
-        Ok(()) => true,
+    let result_code = match put_result {
+        Ok(true) => PUT_RESULT_STORED,
+        Ok(false) => PUT_RESULT_EXISTS,
         Err(e) => {
             tracing::warn!("RDMA PUT pwrite failed key={}: {}", put_req.key, e);
-            false
+            PUT_RESULT_FAILED
         }
     };
+    let ok = result_code == PUT_RESULT_STORED;
 
     // ===== 4.5 Inject into L1 chunks_cache (slab-backed) =====
     // Lets subsequent GETs take the slab fast path (~11 GB/s) instead of the fallback
@@ -1212,7 +1223,11 @@ fn handle_put(
     }
 
     // ===== 5. Send final ok =====
-    wire::send_put_resp(stream, &PutRespMsg { ok })?;
+    if if_not_exists {
+        wire::send_put_result(stream, result_code)?;
+    } else {
+        wire::send_put_resp(stream, &PutRespMsg { ok })?;
+    }
     let t_resp_done = std::time::Instant::now();
 
     // PUT_PERF diagnostic (trace level, only emitted with RUST_LOG=contextstore_server::rdma=trace).

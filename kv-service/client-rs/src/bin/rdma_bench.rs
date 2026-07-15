@@ -63,7 +63,7 @@ struct QpInfo {
 }
 
 impl QpInfo {
-    fn to_bytes(&self) -> [u8; 24] {
+    fn to_bytes(self) -> [u8; 24] {
         let mut buf = [0u8; 24];
         buf[0..4].copy_from_slice(&self.qpn.to_le_bytes());
         buf[4..8].copy_from_slice(&self.psn.to_le_bytes());

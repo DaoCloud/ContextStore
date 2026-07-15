@@ -21,7 +21,9 @@
 //!   Could evolve to registered buffers (IORING_REGISTER_BUFFERS) to reduce overhead.
 //! - Filesystem paths only (no raw block-device io_uring NVMe passthrough).
 
-use super::{AlignedBuffer, IOExecutor, IORequest};
+use super::{
+    log_io_batch, log_io_error, AlignedBuffer, IOExecutor, IORequest, IoBatchStats, IoLogContext,
+};
 use crate::error::{KVError, Result};
 use crossbeam_channel as channel;
 use io_uring::{opcode, types, IoUring};
@@ -81,6 +83,8 @@ enum RingJob {
     /// coexists nicely with the NVMe-oF target SQ=16 (avoids the burst that tier_a's
     /// sync pwrite could trigger, causing controller reset).
     WriteAlignedBatch {
+        job_id: u64,
+        queued_at: std::time::Instant,
         reqs: Vec<(IORequest, PtrWrapper, usize)>,
         resp: channel::Sender<Vec<Result<()>>>,
     },
@@ -249,14 +253,52 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                 let r = do_write_vec_batch(&mut ring, &reqs);
                 let _ = resp.send(r);
             }
-            RingJob::WriteAlignedBatch { reqs, resp } => {
+            RingJob::WriteAlignedBatch {
+                job_id,
+                queued_at,
+                reqs,
+                resp,
+            } => {
+                let started = std::time::Instant::now();
+                let queue_wait_us = started.duration_since(queued_at).as_micros() as u64;
                 let n = reqs.len();
+                let requested_bytes: usize = reqs.iter().map(|request| request.2).sum();
                 let r = match IoUring::new(64) {
-                    Ok(mut wr) => do_write_aligned_batch(&mut wr, reqs),
+                    Ok(mut wr) => do_write_aligned_batch(&mut wr, &reqs),
                     Err(e) => (0..n)
                         .map(|_| Err(KVError::Internal(format!("write ring init: {}", e))))
                         .collect(),
                 };
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "write",
+                    mode: "aligned_batch",
+                    device_id: device_idx as i64,
+                    job_id,
+                };
+                let success_count = r.iter().filter(|result| result.is_ok()).count();
+                let completed_bytes = reqs
+                    .iter()
+                    .zip(&r)
+                    .filter_map(|(request, result)| result.is_ok().then_some(request.2))
+                    .sum();
+                for ((request, _, bytes), result) in reqs.iter().zip(&r) {
+                    if let Err(error) = result {
+                        log_io_error(context, request, *bytes, error);
+                    }
+                }
+                log_io_batch(
+                    context,
+                    IoBatchStats {
+                        request_count: n,
+                        success_count,
+                        failure_count: n.saturating_sub(success_count),
+                        requested_bytes,
+                        completed_bytes,
+                        queue_wait_us,
+                        duration_us: started.elapsed().as_micros() as u64,
+                    },
+                );
                 let _ = resp.send(r);
             }
             RingJob::ReadAlignedIntoPtrBatch {
@@ -265,22 +307,36 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                 reqs,
                 resp,
             } => {
-                let start = std::time::Instant::now();
-                let queue_wait_us = start.duration_since(queued_at).as_micros() as u64;
+                let started = std::time::Instant::now();
+                let queue_wait_us = started.duration_since(queued_at).as_micros() as u64;
                 let req_count = reqs.len();
                 let planned_bytes: usize = reqs.iter().map(|r| r.2).sum();
-                let r = do_read_aligned_into_ptr_batch(&mut ring, reqs);
-                let service_us = start.elapsed().as_micros() as u64;
+                let r = do_read_aligned_into_ptr_batch(&mut ring, &reqs);
                 let ok_bytes: usize = r.iter().filter_map(|x| x.as_ref().ok().copied()).sum();
-                tracing::info!(
-                    "TIERB_READ_PTR device={} job={} reqs={} planned_bytes={} ok_bytes={} queue_wait_us={} service_us={}",
-                    device_idx,
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "read",
+                    mode: "aligned_into_ptr_batch",
+                    device_id: device_idx as i64,
                     job_id,
-                    req_count,
-                    planned_bytes,
-                    ok_bytes,
-                    queue_wait_us,
-                    service_us,
+                };
+                let success_count = r.iter().filter(|result| result.is_ok()).count();
+                for ((request, _, capacity), result) in reqs.iter().zip(&r) {
+                    if let Err(error) = result {
+                        log_io_error(context, request, *capacity, error);
+                    }
+                }
+                log_io_batch(
+                    context,
+                    IoBatchStats {
+                        request_count: req_count,
+                        success_count,
+                        failure_count: req_count.saturating_sub(success_count),
+                        requested_bytes: planned_bytes,
+                        completed_bytes: ok_bytes,
+                        queue_wait_us,
+                        duration_us: started.elapsed().as_micros() as u64,
+                    },
                 );
                 let _ = resp.send(r);
             }
@@ -737,16 +793,9 @@ const MAX_AIO_CHUNK: usize = MAX_AIO_CHUNK_WRITE;
 /// - ptr is 4K-aligned (guaranteed by slab.alloc)
 fn do_write_aligned_batch(
     ring: &mut IoUring,
-    reqs: Vec<(IORequest, PtrWrapper, usize)>,
+    reqs: &[(IORequest, PtrWrapper, usize)],
 ) -> Vec<Result<()>> {
     let n = reqs.len();
-    tracing::warn!(
-        "do_write_aligned_batch: n={} paths={:?}",
-        n,
-        reqs.iter()
-            .map(|(r, _, l)| format!("{}({})", r.path.display(), l))
-            .collect::<Vec<_>>()
-    );
     let mut results: Vec<Result<()>> = (0..n).map(|_| Ok(())).collect();
     let mut files: Vec<Option<std::fs::File>> = (0..n).map(|_| None).collect();
     let mut tmp_paths: Vec<Option<PathBuf>> = (0..n).map(|_| None).collect();
@@ -879,7 +928,7 @@ fn do_write_aligned_batch(
     let ring_capacity = ring.params().sq_entries() as usize;
     let batch_size = ring_capacity.max(8) / 2; // at least 4, default 8 (depth=16)
 
-    let mut all_files: Vec<Option<&std::fs::File>> = (0..n).map(|i| files[i].as_ref()).collect();
+    let all_files: Vec<Option<&std::fs::File>> = (0..n).map(|i| files[i].as_ref()).collect();
 
     let mut sqe_idx = 0;
     while sqe_idx < all_sqes.len() {
@@ -1016,7 +1065,7 @@ fn do_write_aligned_batch(
 /// - actual file_size is returned via Vec<Result<usize>> so the caller can truncate
 fn do_read_aligned_into_ptr_batch(
     ring: &mut IoUring,
-    reqs: Vec<(IORequest, PtrWrapperMut, usize)>,
+    reqs: &[(IORequest, PtrWrapperMut, usize)],
 ) -> Vec<Result<usize>> {
     let n = reqs.len();
     let mut results: Vec<Result<usize>> = (0..n).map(|_| Ok(0)).collect();
@@ -1697,9 +1746,15 @@ impl IOExecutor for TierBExecutor {
             let reqs: Vec<(IORequest, PtrWrapper, usize)> =
                 group.into_iter().map(|(_, p)| p).collect();
             let worker = &self.devices[device_idx];
+            let job_id = self.job_seq.fetch_add(1, Ordering::Relaxed);
             if worker
                 .sender
-                .send(RingJob::WriteAlignedBatch { reqs, resp: tx })
+                .send(RingJob::WriteAlignedBatch {
+                    job_id,
+                    queued_at: std::time::Instant::now(),
+                    reqs,
+                    resp: tx,
+                })
                 .is_err()
             {
                 for i in &orig_indices {
