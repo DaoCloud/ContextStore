@@ -19,6 +19,7 @@ PROTO_DIR    := proto
 BUILD_TYPE   ?= release
 SERVER_FEATURES ?= io-uring,rdma,metrics
 CLIENT_RS_FEATURES ?= rdma
+CARGO_RELEASE_FLAG := $(if $(filter release,$(BUILD_TYPE)),--release,)
 
 # Path to the Python client package inside the root repo (post-merge)
 PY_PB_OUT := ../src/contextstore/kvservice_client/_pb
@@ -31,7 +32,7 @@ build: server client-rs rdma-ffi
 # ===== Server (Rust) =====
 server:
 	@echo "==> Building contextstore-server ($(BUILD_TYPE), features: $(SERVER_FEATURES))"
-	cd $(SERVER_DIR) && $(CARGO) build --$(BUILD_TYPE) --features $(SERVER_FEATURES)
+	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(SERVER_FEATURES)
 
 server-debug:
 	cd $(SERVER_DIR) && $(CARGO) build
@@ -43,18 +44,18 @@ run-server: server
 # ===== Rust client + bench =====
 client-rs:
 	@echo "==> Building contextstore-client-rs ($(BUILD_TYPE), features: $(CLIENT_RS_FEATURES))"
-	cd $(CLIENT_RS) && $(CARGO) build --$(BUILD_TYPE) --features $(CLIENT_RS_FEATURES)
+	cd $(CLIENT_RS) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(CLIENT_RS_FEATURES)
 
 # ===== RDMA FFI cdylib (consumed by Python via ctypes) =====
 rdma-ffi:
-	cd $(RDMA_FFI_DIR) && $(CARGO) build --$(BUILD_TYPE)
+	cd $(RDMA_FFI_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
 
 # ===== Protobuf =====
 proto: proto-rust proto-python
 
 proto-rust:
 	@echo "==> Generating Rust protobuf (triggered by build.rs)"
-	cd $(SERVER_DIR) && $(CARGO) build --$(BUILD_TYPE)
+	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
 
 proto-python:
 	@echo "==> Generating Python protobuf -> $(PY_PB_OUT)"
@@ -69,7 +70,7 @@ proto-python:
 test: test-server test-integration
 
 test-server:
-	cd $(SERVER_DIR) && $(CARGO) test --$(BUILD_TYPE)
+	cd $(SERVER_DIR) && $(CARGO) test $(CARGO_RELEASE_FLAG)
 
 # Python integration tests (require a running server)
 test-integration:
