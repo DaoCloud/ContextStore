@@ -90,12 +90,11 @@ pip install -e '.[test]'    # adds pytest / fakeredis
 ### 2. Build and run KVService (optional L3 tier)
 
 ```bash
-# Generate protobuf (Rust + Python), then build server / client-rs / rdma-ffi
-make -C kv-service proto
-make -C kv-service build
+# Build server / client-rs / rdma-ffi with the deployment feature set.
+make build
 
 # Start the server (listens on :50051)
-./kv-service/server/target/release/contextstore-server \
+./target/release/contextstore-server \
     --config kv-service/configs/server.toml
 ```
 
@@ -103,13 +102,12 @@ KVService reads one TOML config file and requires a reachable Redis metadata
 store. See [`kv-service/configs/README.md`](kv-service/configs/README.md) for
 the config file format and examples.
 
-Enable the RDMA data path:
+`make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
+metrics. Regenerate Python protobuf bindings only after changing the protocol:
 
 ```bash
-cd kv-service/server && cargo build --release --features rdma
+make proto
 ```
-
-Other opt-in Cargo features: `io-uring` (Tier B backend), `gds` (GPUDirect Storage), `metrics` (Prometheus `/metrics` endpoint).
 
 ### 3. Wire the Connector into vLLM
 
@@ -183,17 +181,17 @@ pytest tests/ -v
 ### Rust
 
 ```bash
-make -C kv-service build             # server + client-rs + rdma-ffi
-make -C kv-service test-server       # cargo test in the server crate
-make -C kv-service test-integration  # requires a running server
+make build            # server + client-rs + rdma-ffi
+make test-server      # cargo test in the server crate
+make test-integration # requires a running server
 ```
 
 ### Benchmarks
 
 ```bash
-./kv-service/server/target/release/cs-kvservice-bench --help
-./kv-service/client-rs/target/release/cs-bench --help
-./kv-service/client-rs/target/release/cs-rdma-bench --help    # needs --features rdma
+./target/release/cs-kvservice-bench --help
+./target/release/cs-bench --help
+./target/release/cs-rdma-bench --help
 python kv-service/benchmarks/run_benchmark.py --endpoint localhost:50051
 ```
 

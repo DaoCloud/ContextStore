@@ -13,7 +13,7 @@ ContextStore 是面向大模型推理的 KV Cache 分层共享存储平台，仓
   作为一个 pip 包发行 (`pip install -e .`)。
 - **Rust KVService** (`kv-service/`) — 独立分布式块存储服务，面向 JBOF/NVMe-oF 与 RDMA 场景，
   内部还包含 Rust client SDK (`client-rs/`) 和给 Python ctypes 用的 RDMA C ABI (`rdma-ffi/`)。
-  用 `make -C kv-service build` 独立构建。
+  用根目录的 `make build` 独立构建。
 
 另外还有：
 
@@ -113,7 +113,7 @@ vLLM Connector 有 Scheduler 侧和 Worker 侧，二者运行在不同进程/线
 - 构造模式：`pub fn new(config: &Config) -> anyhow::Result<Self>`
 - 格式化：`cargo fmt`；检查：`cargo clippy -- -D warnings`
 - 配置加载用 TOML（`configs/*.toml`）
-- Protobuf 定义在 `proto/` 目录，server 通过 `build.rs` 生成，Python client 通过 `make -C kv-service proto-python` 生成到 `src/contextstore/kvservice_client/_pb/`
+- Protobuf 定义在 `proto/` 目录，server 通过 `build.rs` 生成，Python client 通过 `make proto` 生成到 `src/contextstore/kvservice_client/_pb/`
 
 ---
 
@@ -129,8 +129,8 @@ vLLM Connector 有 Scheduler 侧和 Worker 侧，二者运行在不同进程/线
 ## 6. Git 与构建
 
 - Python 包构建：`pip install -e .`（从项目根目录，包含 Connector + KVService client）
-- KVService 构建：`make -C kv-service build`（server + client-rs + rdma-ffi）
-- 生成 protobuf：`make -C kv-service proto`（Rust 由 `build.rs` 触发；Python 输出到 `src/contextstore/kvservice_client/_pb/`）
+- KVService 构建：`make build`（server + client-rs + rdma-ffi）
+- 生成 protobuf：`make proto`（Rust 由 `build.rs` 触发；Python 输出到 `src/contextstore/kvservice_client/_pb/`）
 - 两侧测试独立：`pytest tests/` 与 `make -C kv-service test`
 - 依赖只在 `pyproject.toml` / `Cargo.toml` 声明；不要引入 `requirements/*.txt`
 - commit message 格式：简短英文动词开头（`add`/`fix`/`refactor`/`test`/`docs`）
@@ -177,4 +177,4 @@ vLLM Connector 有 Scheduler 侧和 Worker 侧，二者运行在不同进程/线
 4. [ ] 是否影响热路径（如果是，说明性能影响）
 5. [ ] 是否需要更新 `ContextStoreConfig`（新增配置项需有默认值）
 6. [ ] `pytest tests/ -v` 是否通过（改动 Python 侧后必须验证）
-7. [ ] `make -C kv-service build && make -C kv-service test-server` 是否通过（改动 Rust 侧后必须验证）
+7. [ ] `make build && make test-server` 是否通过（改动 Rust 侧后必须验证）

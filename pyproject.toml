@@ -25,7 +25,7 @@ dependencies = [
 # Back PrefixIndex with Redis (for cross-instance sharing)
 redis = ["redis>=5.0"]
 
-# Regenerate KVService protobuf (`make -C kv-service proto-python`)
+# Regenerate KVService protobuf (`make proto`)
 proto = ["grpcio-tools>=1.60"]
 
 # Run `pytest tests/`

@@ -25,8 +25,8 @@ control when they contain private infrastructure details.
 From the repository root:
 
 ```bash
-make -C kv-service build
-./kv-service/server/target/release/contextstore-server \
+make build
+./target/release/contextstore-server \
     --config kv-service/configs/server.toml
 ```
 
@@ -34,13 +34,13 @@ From the `kv-service/` directory:
 
 ```bash
 make build
-./server/target/release/contextstore-server --config configs/server.toml
+../target/release/contextstore-server --config configs/server.toml
 ```
 
 The log level can be set with `--log-level`:
 
 ```bash
-./server/target/release/contextstore-server \
+../target/release/contextstore-server \
     --config configs/server.toml \
     --log-level info
 ```

@@ -4,7 +4,7 @@
 # (src/contextstore/kvservice_client/) and is shipped by the root
 # pyproject.toml; it is no longer built as a separate wheel here.
 
-.PHONY: all build server server-debug run-server proto proto-rust proto-python \
+.PHONY: all build server server-debug run-server client-rs rdma-ffi proto proto-rust proto-python \
         test test-server test-integration bench fmt lint docker docker-push clean help
 
 # ===== Config =====
@@ -17,6 +17,8 @@ CLIENT_RS    := client-rs
 RDMA_FFI_DIR := rdma-ffi
 PROTO_DIR    := proto
 BUILD_TYPE   ?= release
+SERVER_FEATURES ?= io-uring,rdma,metrics
+CLIENT_RS_FEATURES ?= rdma
 
 # Path to the Python client package inside the root repo (post-merge)
 PY_PB_OUT := ../src/contextstore/kvservice_client/_pb
@@ -28,19 +30,20 @@ build: server client-rs rdma-ffi
 
 # ===== Server (Rust) =====
 server:
-	@echo "==> Building contextstore-server ($(BUILD_TYPE))"
-	cd $(SERVER_DIR) && $(CARGO) build --$(BUILD_TYPE)
+	@echo "==> Building contextstore-server ($(BUILD_TYPE), features: $(SERVER_FEATURES))"
+	cd $(SERVER_DIR) && $(CARGO) build --$(BUILD_TYPE) --features $(SERVER_FEATURES)
 
 server-debug:
 	cd $(SERVER_DIR) && $(CARGO) build
 
 run-server: server
-	./$(SERVER_DIR)/target/$(BUILD_TYPE)/contextstore-server \
+	../target/$(BUILD_TYPE)/contextstore-server \
 		--config configs/server.toml
 
 # ===== Rust client + bench =====
 client-rs:
-	cd $(CLIENT_RS) && $(CARGO) build --$(BUILD_TYPE)
+	@echo "==> Building contextstore-client-rs ($(BUILD_TYPE), features: $(CLIENT_RS_FEATURES))"
+	cd $(CLIENT_RS) && $(CARGO) build --$(BUILD_TYPE) --features $(CLIENT_RS_FEATURES)
 
 # ===== RDMA FFI cdylib (consumed by Python via ctypes) =====
 rdma-ffi:
@@ -105,7 +108,7 @@ clean:
 help:
 	@echo "ContextStore KV Service build targets:"
 	@echo ""
-	@echo "  make build         Build server + client-rs + rdma-ffi"
+	@echo "  make build         Build server + client-rs + rdma-ffi with deployment features"
 	@echo "  make server        Build only the Rust server"
 	@echo "  make client-rs     Build only the Rust client SDK + bench"
 	@echo "  make rdma-ffi      Build only the RDMA C ABI cdylib"
