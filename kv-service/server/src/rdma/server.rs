@@ -414,7 +414,7 @@ fn handle_client(
         };
         let t_serve_done = std::time::Instant::now();
 
-        if bytes_written > 0 {
+        if found {
             tracing::debug!(
                 target: "contextstore_server::storage_io",
                 event = "rdma_get_complete",
