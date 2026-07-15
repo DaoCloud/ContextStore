@@ -85,17 +85,18 @@ git clone git@github.com:DaoCloud/ContextStore.git
 cd ContextStore
 pip install -e .            # Connector + KVService client
 pip install -e '.[test]'    # adds pytest / fakeredis
+# Only needed after editing kv-service/proto/kv_service.proto.
+pip install -e '.[proto]'   # adds grpcio-tools for `make proto`
 ```
 
 ### 2. Build and run KVService (optional L3 tier)
 
 ```bash
-# Generate protobuf (Rust + Python), then build server / client-rs / rdma-ffi
-make -C kv-service proto
-make -C kv-service build
+# Build server / client-rs / rdma-ffi with the deployment feature set.
+make build
 
 # Start the server (listens on :50051)
-./kv-service/server/target/release/contextstore-server \
+./target/release/contextstore-server \
     --config kv-service/configs/server.toml
 ```
 
@@ -103,13 +104,14 @@ KVService reads one TOML config file and requires a reachable Redis metadata
 store. See [`kv-service/configs/README.md`](kv-service/configs/README.md) for
 the config file format and examples.
 
-Enable the RDMA data path:
+`make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
+metrics. It produces the server, Rust client SDK, and RDMA C ABI under
+`target/release/`. Regenerate Python protobuf bindings only after changing the
+protocol:
 
 ```bash
-cd kv-service/server && cargo build --release --features rdma
+make proto
 ```
-
-Other opt-in Cargo features: `io-uring` (Tier B backend), `gds` (GPUDirect Storage), `metrics` (Prometheus `/metrics` endpoint).
 
 ### 3. Wire the Connector into vLLM
 
@@ -164,6 +166,7 @@ ContextStore/
 ├── kv-service/             # Rust KV Service (server, client-rs, rdma-ffi, configs, deploy)
 ├── nixl-plugin/            # NIXL CONTEXTSTORE backend (C++ plugin + Rust FFI)
 ├── tests/                  # Python pytest suite (no GPU / Redis required)
+├── Makefile                 # Root build, test, and deployment entry points
 ├── pyproject.toml
 ├── CLAUDE.md               # Development conventions
 └── LICENSE
@@ -183,18 +186,33 @@ pytest tests/ -v
 ### Rust
 
 ```bash
-make -C kv-service build             # server + client-rs + rdma-ffi
-make -C kv-service test-server       # cargo test in the server crate
-make -C kv-service test-integration  # requires a running server
+make build                     # server + client-rs + rdma-ffi, deployment features enabled
+make server                    # build only contextstore-server
+make client-rs                 # build only the Rust client SDK
+make rdma-ffi                  # build only the Python ctypes C ABI library
+make test-server               # Rust server tests
+make test-integration          # requires a running server
+make fmt                       # format Rust code
+make lint                      # run Rust clippy checks
 ```
+
+`make build BUILD_TYPE=debug` builds the same artifacts with Cargo's debug
+profile. `make proto`, `make proto-rust`, and `make proto-python` regenerate
+protocol bindings; the Python targets require `grpcio-tools`.
 
 ### Benchmarks
 
 ```bash
-./kv-service/server/target/release/cs-kvservice-bench --help
-./kv-service/client-rs/target/release/cs-bench --help
-./kv-service/client-rs/target/release/cs-rdma-bench --help    # needs --features rdma
+./target/release/cs-kvservice-bench --help
+./target/release/cs-bench --help
+./target/release/cs-rdma-bench --help
 python kv-service/benchmarks/run_benchmark.py --endpoint localhost:50051
+```
+
+Run the Python benchmark wrapper through the root Makefile with:
+
+```bash
+make bench
 ```
 
 ---
@@ -202,10 +220,12 @@ python kv-service/benchmarks/run_benchmark.py --endpoint localhost:50051
 ## Deployment shapes
 
 - **Local dev** — `contextstore-server --config kv-service/configs/server-test.toml`, backed by a local NVMe directory.
-- **Docker / Compose** — `kv-service/deploy/docker/{Dockerfile,docker-compose.yml}`; build context is the repository root.
+- **Docker / Compose** — run `make docker` to build the image, then use
+  `kv-service/deploy/docker/docker-compose.yml`; the Docker build includes the
+  RDMA, `io-uring`, and metrics feature set.
 - **Kubernetes** — `kv-service/deploy/k8s/statefulset.yaml`.
 - **Systemd** — `kv-service/deploy/systemd/contextstore-server.service`.
-- **JBOF over NVMe-oF** — `kv-service/configs/server-nvmeof.toml` plus the SPDK target and NVMe-oF initiator helpers in `kv-service/deploy/jbof/`. Pair with `--features rdma` for the pre-registered-slab, zero-memcpy RDMA WRITE data path.
+- **JBOF over NVMe-oF** — `kv-service/configs/server-nvmeof.toml` plus the SPDK target and NVMe-oF initiator helpers in `kv-service/deploy/jbof/`. `make build` includes the pre-registered-slab, zero-memcpy RDMA WRITE data path.
 
 See [`kv-service/configs/README.md`](kv-service/configs/README.md) for config
 fields and [`kv-service/deploy/README.md`](kv-service/deploy/README.md) for the

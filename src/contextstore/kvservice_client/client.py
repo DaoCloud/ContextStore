@@ -74,7 +74,7 @@ try:
 except ImportError:  # pragma: no cover
     raise ImportError(
         "generated protobuf code not found. Run first: "
-        "make proto-python (under the kv-service/ directory)"
+        "make proto (from the repository root)"
     )
 
 

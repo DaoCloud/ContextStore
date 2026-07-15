@@ -9,6 +9,7 @@ FROM rust:1.75-bookworm AS rust-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
     libclang-dev \
+    libibverbs-dev \
     pkg-config \
     cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -18,13 +19,15 @@ COPY kv-service/server/ ./server/
 COPY kv-service/proto/  ./proto/
 
 WORKDIR /build/server
-RUN cargo build --release
+RUN cargo build --release --features io-uring,rdma,metrics
 
 # ===== Stage 2: Runtime =====
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libibverbs1 \
+    ibverbs-providers \
     libssl3 \
     nvme-cli \
     && rm -rf /var/lib/apt/lists/*

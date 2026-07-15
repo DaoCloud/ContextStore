@@ -29,8 +29,8 @@ All commands below assume the working directory is the repository root.
 ## Shape 1 — Local dev (single host)
 
 ```bash
-make -C kv-service build
-./kv-service/server/target/release/contextstore-server \
+make build
+./target/release/contextstore-server \
     --config kv-service/configs/server-test.toml
 ```
 
