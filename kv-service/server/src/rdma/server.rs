@@ -414,6 +414,18 @@ fn handle_client(
         };
         let t_serve_done = std::time::Instant::now();
 
+        if found {
+            tracing::debug!(
+                target: "contextstore_server::storage_io",
+                event = "rdma_get_complete",
+                status = "ok",
+                source = if slab_hit { "memory_tier" } else { "storage_tier" },
+                bytes = bytes_written,
+                chunks = num_chunks,
+                force_disk_read,
+            );
+        }
+
         // ===== 5. Send response =====
         wire::send_get_resp(
             &mut stream,
