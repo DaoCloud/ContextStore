@@ -486,10 +486,9 @@ mod enabled {
         fn render_metrics_exports_contextstore_counters() {
             let tmp = TempDir::new().unwrap();
             let ctx = KVServiceContext::new(make_test_config(&tmp)).unwrap();
-            let key = crate::router::KVKey {
-                model_id: "m".to_string(),
-                prefix_hash: "abcdef".to_string(),
-                layer_name: "layer_0".to_string(),
+            let key = crate::router::ObjectKey {
+                namespace: "metrics-test".to_string(),
+                object_key: "abcdef".to_string(),
             };
             let meta = crate::metadata::BlockMeta {
                 device_id: 0,

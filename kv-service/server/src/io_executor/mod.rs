@@ -7,8 +7,8 @@
 //!
 //! Phase 1 only implements Tier A.
 
-mod tier_a;
 mod aligned_buffer;
+mod tier_a;
 
 pub use aligned_buffer::AlignedBuffer;
 
@@ -21,6 +21,7 @@ mod tier_c;
 use crate::config::Config;
 use crate::error::Result;
 use prost::bytes::{Bytes, BytesMut};
+use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,6 +33,88 @@ pub struct IORequest {
     pub path: std::path::PathBuf,
     pub offset: u64,
     pub length: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IoLogContext<'a> {
+    pub executor: &'a str,
+    pub operation: &'a str,
+    pub mode: &'a str,
+    pub device_id: i64,
+    pub job_id: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IoBatchStats {
+    pub request_count: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub requested_bytes: usize,
+    pub completed_bytes: usize,
+    pub queue_wait_us: u64,
+    pub duration_us: u64,
+}
+
+pub(crate) fn log_io_batch(context: IoLogContext<'_>, stats: IoBatchStats) {
+    if stats.failure_count == 0 {
+        tracing::debug!(
+            target: "contextstore_server::storage_io",
+            event = "storage_io_complete",
+            status = "ok",
+            executor = context.executor,
+            operation = context.operation,
+            mode = context.mode,
+            device_id = context.device_id,
+            job_id = context.job_id,
+            request_count = stats.request_count,
+            success_count = stats.success_count,
+            failure_count = stats.failure_count,
+            requested_bytes = stats.requested_bytes,
+            completed_bytes = stats.completed_bytes,
+            queue_wait_us = stats.queue_wait_us,
+            duration_us = stats.duration_us,
+        );
+    } else {
+        tracing::warn!(
+            target: "contextstore_server::storage_io",
+            event = "storage_io_complete",
+            status = "partial_failure",
+            executor = context.executor,
+            operation = context.operation,
+            mode = context.mode,
+            device_id = context.device_id,
+            job_id = context.job_id,
+            request_count = stats.request_count,
+            success_count = stats.success_count,
+            failure_count = stats.failure_count,
+            requested_bytes = stats.requested_bytes,
+            completed_bytes = stats.completed_bytes,
+            queue_wait_us = stats.queue_wait_us,
+            duration_us = stats.duration_us,
+        );
+    }
+}
+
+pub(crate) fn log_io_error(
+    context: IoLogContext<'_>,
+    request: &IORequest,
+    bytes: usize,
+    error: &impl Display,
+) {
+    tracing::warn!(
+        target: "contextstore_server::storage_io",
+        event = "storage_io_error",
+        status = "error",
+        executor = context.executor,
+        operation = context.operation,
+        mode = context.mode,
+        device_id = context.device_id,
+        job_id = context.job_id,
+        path = %request.path.display(),
+        offset = request.offset,
+        bytes,
+        error = %error,
+    );
 }
 
 /// Abstract I/O executor.
@@ -229,7 +312,9 @@ pub trait IOExecutor: Send + Sync {
 /// Create the appropriate executor based on config.
 pub fn create_executor(config: &Config) -> Result<Arc<dyn IOExecutor>> {
     match config.io_executor.kind.as_str() {
-        "tier_a" => Ok(Arc::new(TierAExecutor::new(config.io_executor.thread_pool_size))),
+        "tier_a" => Ok(Arc::new(TierAExecutor::new(
+            config.io_executor.thread_pool_size,
+        ))),
         #[cfg(all(feature = "io-uring", target_os = "linux"))]
         "tier_b" => {
             let mut exec = tier_b::TierBExecutor::new(

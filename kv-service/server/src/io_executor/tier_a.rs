@@ -4,7 +4,9 @@
 //! On Linux, ReadAligned uses O_DIRECT to bypass the page cache and read NVMe-oF
 //! directly (3.3 → 6+ GB/s).
 
-use super::{AlignedBuffer, IOExecutor, IORequest};
+use super::{
+    log_io_batch, log_io_error, AlignedBuffer, IOExecutor, IORequest, IoBatchStats, IoLogContext,
+};
 use crate::error::{KVError, Result};
 use crossbeam_channel as channel;
 use prost::bytes::Bytes;
@@ -93,11 +95,35 @@ impl TierAExecutor {
                     Ok(Job::Write { req, data, resp }) => {
                         let _ = resp.send(write_file_impl(&req, &data));
                     }
-                    Ok(Job::WriteVec { req, segments, resp }) => {
+                    Ok(Job::WriteVec {
+                        req,
+                        segments,
+                        resp,
+                    }) => {
                         let _ = resp.send(write_vec_impl(&req, &segments));
                     }
-                    Ok(Job::WriteAligned { req, ptr, len, resp }) => {
-                        let _ = resp.send(write_aligned_impl(&req, ptr.0, len));
+                    Ok(Job::WriteAligned {
+                        req,
+                        ptr,
+                        len,
+                        resp,
+                    }) => {
+                        let result = write_aligned_impl(&req, ptr.0, len);
+                        if let Err(error) = &result {
+                            log_io_error(
+                                IoLogContext {
+                                    executor: "tier_a",
+                                    operation: "write",
+                                    mode: "aligned_batch",
+                                    device_id: -1,
+                                    job_id: 0,
+                                },
+                                &req,
+                                len,
+                                error,
+                            );
+                        }
+                        let _ = resp.send(result);
                     }
                     Ok(Job::ReadAligned { path, resp }) => {
                         let _ = resp.send(read_aligned_impl(&path));
@@ -322,17 +348,14 @@ fn write_aligned_impl(req: &IORequest, ptr: *const u8, len: usize) -> Result<()>
         Ok(f) => {
             // Main body: aligned_down bytes pwritten directly from caller's ptr (zero memcpy).
             if aligned_down > 0 {
-                let main_slice =
-                    unsafe { std::slice::from_raw_parts(ptr, aligned_down) };
+                let main_slice = unsafe { std::slice::from_raw_parts(ptr, aligned_down) };
                 let mut written = 0;
                 while written < aligned_down {
                     let n = f
                         .write_at(&main_slice[written..], written as u64)
                         .map_err(KVError::Io)?;
                     if n == 0 {
-                        return Err(KVError::Internal(
-                            "O_DIRECT pwrite returned 0".into(),
-                        ));
+                        return Err(KVError::Internal("O_DIRECT pwrite returned 0".into()));
                     }
                     written += n;
                 }
@@ -349,23 +372,15 @@ fn write_aligned_impl(req: &IORequest, ptr: *const u8, len: usize) -> Result<()>
                 TAIL_BUF.with(|cell| -> Result<()> {
                     let mut buf = cell.borrow_mut();
                     unsafe {
-                        std::ptr::write_bytes(
-                            buf.as_mut_ptr(),
-                            0,
-                            DIRECT_IO_ALIGN,
-                        );
+                        std::ptr::write_bytes(buf.as_mut_ptr(), 0, DIRECT_IO_ALIGN);
                         std::ptr::copy_nonoverlapping(
                             ptr.add(aligned_down),
                             buf.as_mut_ptr(),
                             tail,
                         );
                     }
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(
-                            buf.as_mut_ptr(),
-                            DIRECT_IO_ALIGN,
-                        )
-                    };
+                    let slice =
+                        unsafe { std::slice::from_raw_parts(buf.as_mut_ptr(), DIRECT_IO_ALIGN) };
                     let mut written = 0;
                     while written < DIRECT_IO_ALIGN {
                         let n = f
@@ -685,10 +700,10 @@ impl IOExecutor for TierAExecutor {
     /// O_DIRECT batched write — pwrites directly from caller-pinned 4K-aligned memory,
     /// **zero memcpy**. 8 stripes run concurrently across 8 workers, each with its own
     /// pwrite syscall. See trait::write_aligned_batch for usage.
-    fn write_aligned_batch(
-        &self,
-        requests: Vec<(IORequest, *const u8, usize)>,
-    ) -> Vec<Result<()>> {
+    fn write_aligned_batch(&self, requests: Vec<(IORequest, *const u8, usize)>) -> Vec<Result<()>> {
+        let started = std::time::Instant::now();
+        let request_count = requests.len();
+        let requested_bytes: usize = requests.iter().map(|request| request.2).sum();
         let mut recvs = Vec::with_capacity(requests.len());
         for (req, ptr, len) in requests {
             let (tx, rx) = channel::bounded(1);
@@ -702,25 +717,56 @@ impl IOExecutor for TierAExecutor {
                 })
                 .is_err()
             {
-                recvs.push(None);
+                recvs.push((len, None));
                 continue;
             }
-            recvs.push(Some(rx));
+            recvs.push((len, Some(rx)));
         }
-        recvs
+        let mut completed_bytes = 0usize;
+        let results: Vec<Result<()>> = recvs
             .into_iter()
-            .map(|opt| match opt {
-                Some(rx) => rx
-                    .recv()
-                    .map_err(|_| KVError::Internal("worker response failed".to_string()))?,
-                None => Err(KVError::Internal("executor closed".to_string())),
+            .map(|(bytes, opt)| {
+                let result = match opt {
+                    Some(rx) => rx
+                        .recv()
+                        .map_err(|_| KVError::Internal("worker response failed".to_string()))
+                        .and_then(|result| result),
+                    None => Err(KVError::Internal("executor closed".to_string())),
+                };
+                if result.is_ok() {
+                    completed_bytes += bytes;
+                }
+                result
             })
-            .collect()
+            .collect();
+        let success_count = results.iter().filter(|result| result.is_ok()).count();
+        log_io_batch(
+            IoLogContext {
+                executor: "tier_a",
+                operation: "write",
+                mode: "aligned_batch",
+                device_id: -1,
+                job_id: 0,
+            },
+            IoBatchStats {
+                request_count,
+                success_count,
+                failure_count: request_count.saturating_sub(success_count),
+                requested_bytes,
+                completed_bytes,
+                queue_wait_us: 0,
+                duration_us: started.elapsed().as_micros() as u64,
+            },
+        );
+        results
     }
 
     /// O_DIRECT batched read: 8 segments run in parallel, each with its own aligned buffer +
     /// pread O_DIRECT, returning zero-copy Bytes. See trait::read_aligned_batch for usage.
     fn read_aligned_batch(&self, requests: &[IORequest]) -> Vec<Result<Bytes>> {
+        let started = std::time::Instant::now();
+        let request_count = requests.len();
+        let requested_bytes: usize = requests.iter().map(|request| request.length).sum();
         let mut recvs = Vec::with_capacity(requests.len());
         for req in requests {
             let (tx, rx) = channel::bounded(1);
@@ -737,7 +783,7 @@ impl IOExecutor for TierAExecutor {
             }
             recvs.push(Some(rx));
         }
-        recvs
+        let results: Vec<Result<Bytes>> = recvs
             .into_iter()
             .map(|opt| match opt {
                 Some(rx) => rx
@@ -745,7 +791,31 @@ impl IOExecutor for TierAExecutor {
                     .map_err(|_| KVError::Internal("worker response failed".to_string()))?,
                 None => Err(KVError::Internal("executor closed".to_string())),
             })
-            .collect()
+            .collect();
+        let success_count = results.iter().filter(|result| result.is_ok()).count();
+        let completed_bytes = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().map(Bytes::len))
+            .sum();
+        log_io_batch(
+            IoLogContext {
+                executor: "tier_a",
+                operation: "read",
+                mode: "aligned_batch",
+                device_id: -1,
+                job_id: 0,
+            },
+            IoBatchStats {
+                request_count,
+                success_count,
+                failure_count: request_count.saturating_sub(success_count),
+                requested_bytes,
+                completed_bytes,
+                queue_wait_us: 0,
+                duration_us: started.elapsed().as_micros() as u64,
+            },
+        );
+        results
     }
 }
 
@@ -771,7 +841,8 @@ mod tests {
         let mut reqs = Vec::new();
         for i in 0..16 {
             let p = tmp.path().join(format!("f{}.bin", i));
-            exec.write_file(&p, format!("data-{}", i).as_bytes()).unwrap();
+            exec.write_file(&p, format!("data-{}", i).as_bytes())
+                .unwrap();
             reqs.push(IORequest {
                 path: p,
                 offset: 0,
