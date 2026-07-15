@@ -22,7 +22,8 @@
 //! - Filesystem paths only (no raw block-device io_uring NVMe passthrough).
 
 use super::{
-    log_io_batch, log_io_error, AlignedBuffer, IOExecutor, IORequest, IoBatchStats, IoLogContext,
+    log_io_batch, log_io_error, log_io_request, AlignedBuffer, IOExecutor, IORequest, IoBatchStats,
+    IoLogContext,
 };
 use crate::error::{KVError, Result};
 use crossbeam_channel as channel;
@@ -231,26 +232,99 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
         match job {
             RingJob::SingleRead { req, resp } => {
                 let r = do_read_one(&mut ring, &req);
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "read",
+                    mode: "single",
+                    device_id: device_idx as i64,
+                    job_id: 0,
+                };
+                log_completed_io_batch(
+                    context,
+                    std::iter::once(&req),
+                    std::slice::from_ref(&r),
+                    |_, bytes| bytes.len(),
+                );
                 let _ = resp.send(r);
             }
             RingJob::SingleWrite { path, data, resp } => {
-                let r = do_write_one(&mut ring, &path, &data);
+                let request = IORequest {
+                    path,
+                    offset: 0,
+                    length: data.len(),
+                };
+                let r = do_write_one(&mut ring, &request.path, &data);
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "write",
+                    mode: "single",
+                    device_id: device_idx as i64,
+                    job_id: 0,
+                };
+                log_completed_io_batch(
+                    context,
+                    std::iter::once(&request),
+                    std::slice::from_ref(&r),
+                    |request, _| request.length,
+                );
                 let _ = resp.send(r);
             }
             RingJob::ReadBatch { reqs, resp } => {
                 let r = do_read_batch(&mut ring, &reqs);
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "read",
+                    mode: "batch",
+                    device_id: device_idx as i64,
+                    job_id: 0,
+                };
+                log_completed_io_batch(context, reqs.iter(), &r, |_, bytes| bytes.len());
                 let _ = resp.send(r);
             }
             RingJob::ReadAlignedBatch { reqs, resp } => {
                 let r = do_read_aligned_batch(&mut ring, &reqs);
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "read",
+                    mode: "aligned_batch",
+                    device_id: device_idx as i64,
+                    job_id: 0,
+                };
+                log_completed_io_batch(context, reqs.iter(), &r, |_, bytes| bytes.len());
                 let _ = resp.send(r);
             }
             RingJob::WriteBatch { reqs, resp } => {
                 let r = do_write_batch(&mut ring, &reqs);
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "write",
+                    mode: "batch",
+                    device_id: device_idx as i64,
+                    job_id: 0,
+                };
+                log_completed_io_batch(
+                    context,
+                    reqs.iter().map(|(request, _)| request),
+                    &r,
+                    |request, _| request.length,
+                );
                 let _ = resp.send(r);
             }
             RingJob::WriteVecBatch { reqs, resp } => {
                 let r = do_write_vec_batch(&mut ring, &reqs);
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "write",
+                    mode: "vectored_batch",
+                    device_id: device_idx as i64,
+                    job_id: 0,
+                };
+                log_completed_io_batch(
+                    context,
+                    reqs.iter().map(|(request, _)| request),
+                    &r,
+                    |request, _| request.length,
+                );
                 let _ = resp.send(r);
             }
             RingJob::WriteAlignedBatch {
@@ -283,8 +357,9 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                     .filter_map(|(request, result)| result.is_ok().then_some(request.2))
                     .sum();
                 for ((request, _, bytes), result) in reqs.iter().zip(&r) {
-                    if let Err(error) = result {
-                        log_io_error(context, request, *bytes, error);
+                    match result {
+                        Ok(()) => log_io_request(context, request, *bytes, *bytes),
+                        Err(error) => log_io_error(context, request, *bytes, error),
                     }
                 }
                 log_io_batch(
@@ -322,8 +397,11 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                 };
                 let success_count = r.iter().filter(|result| result.is_ok()).count();
                 for ((request, _, capacity), result) in reqs.iter().zip(&r) {
-                    if let Err(error) = result {
-                        log_io_error(context, request, *capacity, error);
+                    match result {
+                        Ok(bytes_read) => {
+                            log_io_request(context, request, *bytes_read, *bytes_read)
+                        }
+                        Err(error) => log_io_error(context, request, *capacity, error),
                     }
                 }
                 log_io_batch(
@@ -341,6 +419,28 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                 let _ = resp.send(r);
             }
             RingJob::Shutdown => break,
+        }
+    }
+}
+
+fn log_completed_io_batch<'a, T>(
+    context: IoLogContext<'_>,
+    requests: impl IntoIterator<Item = &'a IORequest>,
+    results: &[Result<T>],
+    completed_bytes: impl Fn(&IORequest, &T) -> usize,
+) {
+    for (request, result) in requests.into_iter().zip(results) {
+        match result {
+            Ok(value) => {
+                let completed = completed_bytes(request, value);
+                let requested = if context.operation == "read" && request.length == 0 {
+                    completed
+                } else {
+                    request.length
+                };
+                log_io_request(context, request, requested, completed);
+            }
+            Err(error) => log_io_error(context, request, request.length, error),
         }
     }
 }

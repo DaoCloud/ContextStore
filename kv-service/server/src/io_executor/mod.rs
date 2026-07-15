@@ -95,6 +95,38 @@ pub(crate) fn log_io_batch(context: IoLogContext<'_>, stats: IoBatchStats) {
     }
 }
 
+/// Emit one debug event for a completed physical I/O request.
+///
+/// Batch summaries are useful for throughput analysis, while this event preserves the exact
+/// file path and offset needed to reconstruct a placement and I/O pattern during diagnosis.
+/// The explicit enabled check keeps path formatting out of the normal info-level data path.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub(crate) fn log_io_request(
+    context: IoLogContext<'_>,
+    request: &IORequest,
+    requested_bytes: usize,
+    completed_bytes: usize,
+) {
+    if !tracing::enabled!(target: "contextstore_server::storage_io", tracing::Level::DEBUG) {
+        return;
+    }
+
+    tracing::debug!(
+        target: "contextstore_server::storage_io",
+        event = "storage_io_request",
+        status = "ok",
+        executor = context.executor,
+        operation = context.operation,
+        mode = context.mode,
+        device_id = context.device_id,
+        job_id = context.job_id,
+        path = %request.path.display(),
+        offset = request.offset,
+        requested_bytes,
+        completed_bytes,
+    );
+}
+
 pub(crate) fn log_io_error(
     context: IoLogContext<'_>,
     request: &IORequest,
