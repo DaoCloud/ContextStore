@@ -378,6 +378,7 @@ class KVClient:
     def _read_placement_chunk_bytes(
         self,
         descriptor: ObjectDescriptor,
+        placement: PlacementDescriptor,
         chunk: PlacementChunk,
         fallback_endpoint: str,
     ) -> tuple[int, bytes]:
@@ -387,6 +388,7 @@ class KVClient:
             pb.ReadPlacementChunkRequest(
                 descriptor=self._to_pb_descriptor(descriptor),
                 chunk=self._to_pb_chunk(chunk),
+                placement=self._to_pb_placement(placement),
             ),
             timeout=self.timeout,
         )
@@ -406,6 +408,7 @@ class KVClient:
             self._chunk_executor.submit(
                 self._read_placement_chunk_bytes,
                 descriptor,
+                placement,
                 chunk,
                 placement.primary_grpc_endpoint,
             )

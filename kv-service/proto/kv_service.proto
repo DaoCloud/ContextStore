@@ -89,7 +89,7 @@ message PlacementChunk {
 
 message PlacementDescriptor {
   ObjectKey key = 1;
-  uint64 placement_epoch = 2;    // Current cluster placement-rule version; fixed to 1 in phase one
+  uint64 placement_epoch = 2;    // Current cluster placement-rule/topology version
   string placement_policy_id = 3;
   string layout_hash = 4;        // Actual-placement digest, used by clients for cache validation / observability
   string primary_node_id = 5;
@@ -190,6 +190,7 @@ message PutPlacementChunkResponse {
 message ReadPlacementChunkRequest {
   ObjectDescriptor descriptor = 1;
   PlacementChunk chunk = 2;
+  PlacementDescriptor placement = 3; // Optional; enables stale-placement validation on direct chunk reads
 }
 
 message DeletePlacementChunkRequest {
