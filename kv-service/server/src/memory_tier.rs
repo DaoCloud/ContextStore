@@ -93,6 +93,17 @@ impl MemoryTier {
             && actual.size == expected.size
     }
 
+    fn purge_expired_l1_entry(
+        &self,
+        key: &ObjectKey,
+        str_key: &str,
+        meta: &BlockMeta,
+    ) -> Result<()> {
+        self.invalidate_l1_entry(str_key);
+        self.storage.delete_if_expired(key, meta)?;
+        Ok(())
+    }
+
     /// Read an object with pre-validated metadata. Only returns the cache when the L1 version identity
     /// fully matches.
     pub fn get_with_meta(
@@ -104,6 +115,12 @@ impl MemoryTier {
         {
             let mut cache = self.cache.lock();
             if let Some(entry) = cache.get(&str_key) {
+                if entry.meta.is_expired() {
+                    let meta = entry.meta.clone();
+                    drop(cache);
+                    self.purge_expired_l1_entry(key, &str_key, &meta)?;
+                    return Ok(None);
+                }
                 if Self::meta_identity_matches(&entry.meta, expected) {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(Some((entry.data.clone(), entry.meta.clone())));
@@ -132,6 +149,12 @@ impl MemoryTier {
         {
             let mut cache = self.chunks_cache.lock();
             if let Some(entry) = cache.get(&str_key) {
+                if entry.meta.is_expired() {
+                    let meta = entry.meta.clone();
+                    drop(cache);
+                    self.purge_expired_l1_entry(key, &str_key, &meta)?;
+                    return Ok(None);
+                }
                 if Self::meta_identity_matches(&entry.meta, expected) {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     let segments = entry.segments.iter().cloned().collect();
@@ -162,6 +185,12 @@ impl MemoryTier {
         {
             let mut cache = self.chunks_cache.lock();
             if let Some(entry) = cache.get(&str_key) {
+                if entry.meta.is_expired() {
+                    let meta = entry.meta.clone();
+                    drop(cache);
+                    self.purge_expired_l1_entry(key, &str_key, &meta)?;
+                    return Ok(None);
+                }
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 // Each Bytes::clone is an Arc::clone; underlying data is not copied.
                 let segments = entry.segments.iter().cloned().collect();
@@ -187,6 +216,12 @@ impl MemoryTier {
         {
             let mut cache = self.cache.lock();
             if let Some(entry) = cache.get(&str_key) {
+                if entry.meta.is_expired() {
+                    let meta = entry.meta.clone();
+                    drop(cache);
+                    self.purge_expired_l1_entry(key, &str_key, &meta)?;
+                    return Ok(None);
+                }
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 // Bytes::clone is just an Arc refcount bump; underlying data is not copied.
                 return Ok(Some((entry.data.clone(), entry.meta.clone())));
@@ -299,11 +334,29 @@ impl MemoryTier {
 
     pub fn exists(&self, key: &ObjectKey) -> Result<bool> {
         let str_key = key.to_string_key();
-        if self.cache.lock().contains(&str_key) {
-            return Ok(true);
+        {
+            let mut cache = self.cache.lock();
+            if let Some(entry) = cache.get(&str_key) {
+                if entry.meta.is_expired() {
+                    let meta = entry.meta.clone();
+                    drop(cache);
+                    self.purge_expired_l1_entry(key, &str_key, &meta)?;
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
         }
-        if self.chunks_cache.lock().contains(&str_key) {
-            return Ok(true);
+        {
+            let mut cache = self.chunks_cache.lock();
+            if let Some(entry) = cache.get(&str_key) {
+                if entry.meta.is_expired() {
+                    let meta = entry.meta.clone();
+                    drop(cache);
+                    self.purge_expired_l1_entry(key, &str_key, &meta)?;
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
         }
         self.storage.exists(key)
     }
@@ -340,17 +393,31 @@ impl MemoryTier {
         let mut results: Vec<Option<Result<Option<(Bytes, BlockMeta)>>>> =
             (0..keys.len()).map(|_| None).collect();
         let mut to_fetch: Vec<(usize, ObjectKey)> = Vec::new();
+        let mut expired: Vec<(ObjectKey, String, BlockMeta)> = Vec::new();
 
         {
             let mut cache = self.cache.lock();
             for (i, k) in keys.iter().enumerate() {
                 let sk = k.to_string_key();
                 if let Some(e) = cache.get(&sk) {
+                    if e.meta.is_expired() {
+                        expired.push((k.clone(), sk, e.meta.clone()));
+                        results[i] = Some(Ok(None));
+                        continue;
+                    }
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     results[i] = Some(Ok(Some((e.data.clone(), e.meta.clone()))));
                 } else {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     to_fetch.push((i, k.clone()));
+                }
+            }
+        }
+        for (key, str_key, meta) in expired {
+            self.invalidate_l1_entry(&str_key);
+            if let Err(e) = self.storage.delete_if_expired(&key, &meta) {
+                if let Some((idx, _)) = keys.iter().enumerate().find(|(_, k)| **k == key) {
+                    results[idx] = Some(Err(e));
                 }
             }
         }
@@ -546,6 +613,13 @@ impl MemoryTier {
         let str_key = key.to_string_key();
         let mut cache = self.chunks_cache.lock();
         let entry = cache.get(&str_key)?; // LRU touch
+        if entry.meta.is_expired() {
+            let meta = entry.meta.clone();
+            drop(cache);
+            self.invalidate_l1_entry(&str_key);
+            let _ = self.storage.delete_if_expired(key, &meta);
+            return None;
+        }
         let arc = entry.slab.clone()?; // None → heap-backed; caller falls back to per-chunk.
         self.hits.fetch_add(1, Ordering::Relaxed);
         Some(SlabPlacement {
@@ -700,6 +774,13 @@ mod tests {
         }
     }
 
+    fn expired_meta() -> BlockMeta {
+        let mut meta = mk_meta();
+        meta.created_at = chrono::Utc::now().timestamp() - 10;
+        meta.ttl_seconds = 1;
+        meta
+    }
+
     fn make_tier(dir: &std::path::Path) -> MemoryTier {
         let mut cfg = Config::default();
         cfg.storage.devices = vec![dir.join("nvme0")];
@@ -732,6 +813,54 @@ mod tests {
         let (h, m, _, _) = tier.stats();
         assert_eq!(h, 1);
         assert_eq!(m, 0);
+    }
+
+    #[test]
+    fn expired_single_cache_entry_is_not_returned() {
+        let tmp = TempDir::new().unwrap();
+        let tier = make_tier(tmp.path());
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/single".into(),
+        };
+
+        tier.put(&key, Bytes::from_static(b"expired"), expired_meta())
+            .unwrap();
+
+        assert!(tier.get(&key).unwrap().is_none());
+        assert!(!tier.exists(&key).unwrap());
+        assert!(tier
+            .storage
+            .metadata()
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn expired_chunks_cache_entry_is_not_returned() {
+        let tmp = TempDir::new().unwrap();
+        let tier = make_tier(tmp.path());
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/chunks".into(),
+        };
+
+        tier.put_chunks(
+            &key,
+            vec![Bytes::from_static(b"exp"), Bytes::from_static(b"ired")],
+            expired_meta(),
+        )
+        .unwrap();
+
+        assert!(tier.get_chunks(&key).unwrap().is_none());
+        assert!(!tier.exists(&key).unwrap());
+        assert!(tier
+            .storage
+            .metadata()
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

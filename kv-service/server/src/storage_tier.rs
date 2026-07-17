@@ -2270,6 +2270,13 @@ mod tests {
         }
     }
 
+    fn expired_meta() -> BlockMeta {
+        let mut meta = mk_meta();
+        meta.created_at = chrono::Utc::now().timestamp() - 10;
+        meta.ttl_seconds = 1;
+        meta
+    }
+
     fn flatten_segments(segments: &[Bytes]) -> Vec<u8> {
         segments
             .iter()
@@ -2476,6 +2483,92 @@ mod tests {
             .unwrap();
         let data = st.read_placement_chunk(&path, 9, None).unwrap().unwrap();
         assert_eq!(data.as_ref(), b"placement");
+    }
+
+    #[test]
+    fn expired_single_object_is_purged_on_get() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/single".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"expired"), expired_meta())
+            .unwrap();
+        let path = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap()
+            .file_path;
+        assert!(std::path::Path::new(&path).exists());
+
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn expired_striped_object_purges_all_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/striped".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"abcdefghijkl"), expired_meta())
+            .unwrap();
+        let paths = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap()
+            .striping
+            .unwrap()
+            .chunk_paths;
+        assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(paths.iter().all(|path| !std::path::Path::new(path).exists()));
+    }
+
+    #[test]
+    fn put_if_absent_can_replace_expired_object() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/if-absent".into(),
+        };
+
+        assert!(st
+            .put_if_absent(&key, Bytes::from_static(b"old"), expired_meta())
+            .unwrap());
+        assert!(st
+            .put_if_absent(&key, Bytes::from_static(b"new"), mk_meta())
+            .unwrap());
+        let (data, _) = st.get(&key).unwrap().unwrap();
+
+        assert_eq!(data.as_ref(), b"new");
     }
 
     #[test]
