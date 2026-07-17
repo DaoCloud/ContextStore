@@ -659,6 +659,10 @@ fn try_serve_get_via_slab(
         Some(m) => m,
         None => return Ok(None),
     };
+    if meta.is_expired() {
+        kv_ctx.storage.delete_if_expired(kv_key, &meta)?;
+        return Ok(None);
+    }
     try_serve_get_via_slab_with_meta(
         kv_ctx, qp, client_cq, kv_key, &meta, dst_addr, dst_rkey, max_size, nic_idx,
     )
@@ -942,6 +946,18 @@ fn handle_descriptor_get(
             return Ok(());
         }
     };
+    if active_meta.is_expired() {
+        kv_ctx.storage.delete_if_expired(&kv_key, &active_meta)?;
+        wire::send_get_resp(
+            stream,
+            &GetRespMsg {
+                found: false,
+                bytes_written: 0,
+                num_chunks: 0,
+            },
+        )?;
+        return Ok(());
+    }
     if !meta_matches_descriptor(&active_meta, &req) {
         wire::send_get_resp(
             stream,

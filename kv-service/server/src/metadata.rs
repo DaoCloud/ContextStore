@@ -87,6 +87,23 @@ pub struct BlockMeta {
     pub striping: Option<StripingInfo>,
 }
 
+impl BlockMeta {
+    /// Return true when the object has a positive TTL and its creation timestamp is past expiry.
+    pub fn is_expired_at(&self, now: i64) -> bool {
+        self.ttl_seconds > 0
+            && self
+                .created_at
+                .checked_add(self.ttl_seconds)
+                .map(|expires_at| expires_at <= now)
+                .unwrap_or(true)
+    }
+
+    /// Return true when the object is expired at the current wall-clock timestamp.
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(chrono::Utc::now().timestamp())
+    }
+}
+
 enum MetadataBackend {
     Redis(RedisMetadataBackend),
     #[cfg(test)]
@@ -492,5 +509,18 @@ mod tests {
         meta.object_generation = 10;
         svc.put_block("k1", &meta).unwrap();
         assert_eq!(svc.next_generation("k1").unwrap(), 11);
+    }
+
+    #[test]
+    fn block_meta_expiry_uses_created_at_and_positive_ttl() {
+        let mut meta = meta();
+        meta.created_at = 100;
+        meta.ttl_seconds = 10;
+
+        assert!(!meta.is_expired_at(109));
+        assert!(meta.is_expired_at(110));
+
+        meta.ttl_seconds = 0;
+        assert!(!meta.is_expired_at(1_000));
     }
 }
