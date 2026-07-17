@@ -147,6 +147,15 @@ impl MetadataService {
         }
     }
 
+    /// Delete metadata only when the stored value still matches the expected object metadata.
+    pub fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.delete_block_if_matches(key, expected),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.delete_block_if_matches(key, expected),
+        }
+    }
+
     pub fn exists_block(&self, key: &str) -> Result<bool> {
         match &self.backend {
             MetadataBackend::Redis(backend) => backend.exists_block(key),
@@ -160,6 +169,13 @@ impl MetadataService {
             MetadataBackend::Redis(backend) => backend.next_generation(key),
             #[cfg(test)]
             MetadataBackend::Memory(backend) => backend.next_generation(key),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_put_for_test(&self) {
+        if let MetadataBackend::Memory(backend) = &self.backend {
+            backend.fail_next_put();
         }
     }
 }
@@ -294,6 +310,31 @@ impl RedisMetadataBackend {
         })
     }
 
+    fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+        let redis_key = self.block_key(key);
+        let expected = Self::serialize(expected)?;
+        let script = SCRIPT.get_or_init(|| {
+            redis::Script::new(
+                r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                redis.call("DEL", KEYS[1])
+                return 1
+            end
+            return 0
+            "#,
+            )
+        });
+        let deleted =
+            self.run_with_reconnect("compare-and-delete block metadata", |connection| {
+                script
+                    .key(&redis_key)
+                    .arg(&expected)
+                    .invoke::<i32>(connection)
+            })?;
+        Ok(deleted == 1)
+    }
+
     fn exists_block(&self, key: &str) -> Result<bool> {
         let redis_key = self.block_key(key);
         self.run_with_reconnect("EXISTS block metadata", |connection| {
@@ -346,6 +387,7 @@ struct MemoryMetadataBackend {
 struct MemoryMetadataInner {
     blocks: HashMap<String, Vec<u8>>,
     generations: HashMap<String, u64>,
+    fail_next_puts: usize,
 }
 
 #[cfg(test)]
@@ -370,15 +412,21 @@ impl MemoryMetadataBackend {
     }
 
     fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
-        self.inner
-            .lock()
-            .blocks
-            .insert(key.to_string(), Self::serialize(meta)?);
+        let mut inner = self.inner.lock();
+        if inner.fail_next_puts > 0 {
+            inner.fail_next_puts -= 1;
+            return Err(KVError::Metadata("injected put failure".to_string()));
+        }
+        inner.blocks.insert(key.to_string(), Self::serialize(meta)?);
         Ok(())
     }
 
     fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
         let mut inner = self.inner.lock();
+        if inner.fail_next_puts > 0 {
+            inner.fail_next_puts -= 1;
+            return Err(KVError::Metadata("injected put failure".to_string()));
+        }
         if inner.blocks.contains_key(key) {
             return Ok(false);
         }
@@ -400,6 +448,16 @@ impl MemoryMetadataBackend {
         Ok(())
     }
 
+    fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let expected = Self::serialize(expected)?;
+        if inner.blocks.get(key) == Some(&expected) {
+            inner.blocks.remove(key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn exists_block(&self, key: &str) -> Result<bool> {
         Ok(self.inner.lock().blocks.contains_key(key))
     }
@@ -417,6 +475,10 @@ impl MemoryMetadataBackend {
         let next = current.max(old_generation) + 1;
         inner.generations.insert(key.to_string(), next);
         Ok(next)
+    }
+
+    fn fail_next_put(&self) {
+        self.inner.lock().fail_next_puts += 1;
     }
 }
 
@@ -480,6 +542,34 @@ mod tests {
 
         let got = svc.get_block("k1").unwrap().unwrap();
         assert_eq!(got.object_generation, 1);
+    }
+
+    #[test]
+    fn delete_block_if_matches_keeps_newer_metadata() {
+        let svc = MetadataService::new(&test_config("compare-delete")).unwrap();
+        let mut first = meta();
+        first.object_generation = 1;
+        let mut second = meta();
+        second.object_generation = 2;
+
+        svc.put_block("k1", &second).unwrap();
+
+        assert!(!svc.delete_block_if_matches("k1", &first).unwrap());
+        assert_eq!(svc.get_block("k1").unwrap().unwrap().object_generation, 2);
+        assert!(svc.delete_block_if_matches("k1", &second).unwrap());
+        assert!(svc.get_block("k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn injected_put_failure_is_one_shot() {
+        let svc = MetadataService::new(&test_config("inject-put")).unwrap();
+        let meta = meta();
+
+        svc.fail_next_put_for_test();
+        assert!(svc.put_block("k1", &meta).is_err());
+        svc.put_block("k1", &meta).unwrap();
+
+        assert!(svc.exists_block("k1").unwrap());
     }
 
     #[test]
