@@ -112,6 +112,53 @@ impl StorageTier {
         }
     }
 
+    fn meta_identity_matches(actual: &BlockMeta, expected: &BlockMeta) -> bool {
+        actual.object_handle == expected.object_handle
+            && actual.object_generation == expected.object_generation
+            && actual.layout_version == expected.layout_version
+            && actual.content_etag == expected.content_etag
+            && actual.size == expected.size
+    }
+
+    fn delete_files_for_meta(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<()> {
+        if let Some(stripe) = &meta.striping {
+            for path in &stripe.chunk_paths {
+                let _ = self.executor.delete_file(std::path::Path::new(path));
+            }
+        } else {
+            let path = self.meta_path_or_route(key, meta);
+            self.executor.delete_file(&path)?;
+        }
+        Ok(())
+    }
+
+    fn delete_expired_current_locked(&self, key: &ObjectKey, expected: &BlockMeta) -> Result<bool> {
+        let str_key = key.to_string_key();
+        let Some(current) = self.metadata.get_block(&str_key)? else {
+            return Ok(false);
+        };
+        if !current.is_expired() || !Self::meta_identity_matches(&current, expected) {
+            return Ok(false);
+        }
+        self.delete_files_for_meta(key, &current)?;
+        self.metadata.delete_block(&str_key)?;
+        Ok(true)
+    }
+
+    fn purge_if_expired(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
+        if !meta.is_expired() {
+            return Ok(false);
+        }
+        let write_lock = self.key_write_lock(key);
+        let _guard = write_lock.lock();
+        self.delete_expired_current_locked(key, meta)
+    }
+
+    /// Delete the object only when metadata still points to the same expired object identity.
+    pub fn delete_if_expired(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
+        self.purge_if_expired(key, meta)
+    }
+
     fn content_etag(key: &ObjectKey, generation: u64, size: u64, created_at: i64) -> String {
         let seed = format!(
             "{}|generation={}|size={}|created_at={}",
@@ -300,6 +347,9 @@ impl StorageTier {
             Some(m) => m,
             None => return Ok(None),
         };
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(None);
+        }
 
         // Striped path: read all chunks in parallel and concat.
         if let Some(stripe) = &meta.striping {
@@ -370,8 +420,11 @@ impl StorageTier {
         let write_lock = self.key_write_lock(key);
         let _guard = write_lock.lock();
 
-        if self.metadata.get_block(&key.to_string_key())?.is_some() {
-            return Ok(false);
+        if let Some(existing) = self.metadata.get_block(&key.to_string_key())? {
+            if !existing.is_expired() {
+                return Ok(false);
+            }
+            self.delete_expired_current_locked(key, &existing)?;
         }
         if self.should_stripe(data.len()) {
             let total = data.len();
@@ -449,8 +502,11 @@ impl StorageTier {
         }
         let write_lock = self.key_write_lock(key);
         let _guard = write_lock.lock();
-        if self.metadata.get_block(&key.to_string_key())?.is_some() {
-            return Ok(false);
+        if let Some(existing) = self.metadata.get_block(&key.to_string_key())? {
+            if !existing.is_expired() {
+                return Ok(false);
+            }
+            self.delete_expired_current_locked(key, &existing)?;
         }
         self.put_striped_chunks_impl(key, segments, total, meta, true)
     }
@@ -514,8 +570,13 @@ impl StorageTier {
         }
         let write_lock = self.key_write_lock(key);
         let _guard = write_lock.lock();
-        if if_not_exists && self.metadata.get_block(&key.to_string_key())?.is_some() {
-            return Ok(false);
+        if if_not_exists {
+            if let Some(existing) = self.metadata.get_block(&key.to_string_key())? {
+                if !existing.is_expired() {
+                    return Ok(false);
+                }
+                self.delete_expired_current_locked(key, &existing)?;
+            }
         }
         // The RDMA PUT path only serves large values; small values never take this route. But as a
         // fallback: no stripe → single-file pwrite (via write_aligned_batch with one item).
@@ -687,7 +748,14 @@ impl StorageTier {
     }
 
     pub fn exists(&self, key: &ObjectKey) -> Result<bool> {
-        self.metadata.exists_block(&key.to_string_key())
+        let str_key = key.to_string_key();
+        let Some(meta) = self.metadata.get_block(&str_key)? else {
+            return Ok(false);
+        };
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     // ===== GDS direct read/write (zero-copy) =====
@@ -704,6 +772,9 @@ impl StorageTier {
             Some(m) => m,
             None => return Ok(None),
         };
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(None);
+        }
         if meta.striping.is_some() {
             return Err(crate::error::KVError::InvalidArgument(
                 "GDS path does not support striped values yet (TODO: multi-chunk DMA)".into(),
@@ -976,6 +1047,9 @@ impl StorageTier {
         key: &ObjectKey,
         meta: &BlockMeta,
     ) -> Result<Option<(Bytes, BlockMeta)>> {
+        if self.purge_if_expired(key, meta)? {
+            return Ok(None);
+        }
         if let Some(stripe) = &meta.striping {
             let data = self.read_striped(key, stripe)?;
             self.reads_total.fetch_add(1, Ordering::Relaxed);
@@ -1002,6 +1076,9 @@ impl StorageTier {
         key: &ObjectKey,
         meta: &BlockMeta,
     ) -> Result<Option<(Vec<Bytes>, BlockMeta)>> {
+        if self.purge_if_expired(key, meta)? {
+            return Ok(None);
+        }
         if let Some(stripe) = &meta.striping {
             let segments = self.read_striped_chunks(key, stripe)?;
             let total: u64 = segments.iter().map(|s| s.len() as u64).sum();
@@ -1053,6 +1130,9 @@ impl StorageTier {
             Some(m) => m,
             None => return Ok(None),
         };
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(None);
+        }
 
         // Non-striped single file.
         let Some(stripe) = &meta.striping else {
@@ -1184,6 +1264,9 @@ impl StorageTier {
             Some(m) => m,
             None => return Ok(None),
         };
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(None);
+        }
         self.get_into_ptr_stream_with_meta(key, &meta, ptr, capacity)
     }
 
@@ -1206,6 +1289,9 @@ impl StorageTier {
     > {
         let str_key = key.to_string_key();
         let meta = meta.clone();
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(None);
+        }
         // Non-striped: fall back to the old get_into_ptr (single IO, sync read),
         // then wrap it in a single-event channel to keep a uniform interface.
         let Some(stripe) = &meta.striping else {
@@ -1342,6 +1428,9 @@ impl StorageTier {
             Some(m) => m,
             None => return Ok(None),
         };
+        if self.purge_if_expired(key, &meta)? {
+            return Ok(None);
+        }
 
         if let Some(stripe) = &meta.striping {
             let segments = self.read_striped_chunks(key, stripe)?;
@@ -1378,6 +1467,17 @@ impl StorageTier {
             let str_key = key.to_string_key();
             match self.metadata.get_block(&str_key) {
                 Ok(Some(meta)) => {
+                    match self.purge_if_expired(key, &meta) {
+                        Ok(true) => {
+                            results[idx] = Some(Ok(None));
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            results[idx] = Some(Err(e));
+                            continue;
+                        }
+                    }
                     if meta.striping.is_some() {
                         // striped: handled separately (internally already a parallel read_batch).
                         let stripe = meta.striping.as_ref().unwrap().clone();
@@ -1500,6 +1600,13 @@ mod tests {
         }
     }
 
+    fn expired_meta() -> BlockMeta {
+        let mut meta = mk_meta();
+        meta.created_at = chrono::Utc::now().timestamp() - 10;
+        meta.ttl_seconds = 1;
+        meta
+    }
+
     fn flatten_segments(segments: &[Bytes]) -> Vec<u8> {
         segments
             .iter()
@@ -1568,6 +1675,92 @@ mod tests {
         assert_eq!(meta.object_generation, first_meta.object_generation);
         assert_eq!(meta.content_etag, first_meta.content_etag);
         assert_eq!(meta.file_path, first_meta.file_path);
+    }
+
+    #[test]
+    fn expired_single_object_is_purged_on_get() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/single".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"expired"), expired_meta())
+            .unwrap();
+        let path = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap()
+            .file_path;
+        assert!(std::path::Path::new(&path).exists());
+
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn expired_striped_object_purges_all_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/striped".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"abcdefghijkl"), expired_meta())
+            .unwrap();
+        let paths = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap()
+            .striping
+            .unwrap()
+            .chunk_paths;
+        assert!(paths.iter().all(|p| std::path::Path::new(p).exists()));
+
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(paths.iter().all(|p| !std::path::Path::new(p).exists()));
+    }
+
+    #[test]
+    fn put_if_absent_can_replace_expired_object() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/if-absent".into(),
+        };
+
+        assert!(st
+            .put_if_absent(&key, Bytes::from_static(b"old"), expired_meta())
+            .unwrap());
+        assert!(st
+            .put_if_absent(&key, Bytes::from_static(b"new"), mk_meta())
+            .unwrap());
+        let (data, _) = st.get(&key).unwrap().unwrap();
+
+        assert_eq!(data.as_ref(), b"new");
     }
 
     #[test]
