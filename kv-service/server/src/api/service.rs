@@ -36,13 +36,22 @@ mod tests {
     use crate::metadata::{ChunkLocation, StripingInfo};
 
     fn ctx_with_nodes(nodes: Vec<ClusterNodeConfig>) -> KVServiceContext {
+        ctx_with_local_and_nodes("coordinator", "127.0.0.1:50051", nodes)
+    }
+
+    fn ctx_with_local_and_nodes(
+        node_id: &str,
+        grpc_advertise: &str,
+        nodes: Vec<ClusterNodeConfig>,
+    ) -> KVServiceContext {
         let mut cfg = crate::config::Config::default();
-        cfg.cluster.node_id = "coordinator".to_string();
-        cfg.cluster.grpc_advertise = "127.0.0.1:50051".to_string();
+        cfg.cluster.node_id = node_id.to_string();
+        cfg.cluster.grpc_advertise = grpc_advertise.to_string();
         cfg.cluster.data_nodes = nodes;
         cfg.metadata.redis_url = format!(
-            "memory://api-service-placement-{}",
-            cfg.cluster.data_nodes.len()
+            "memory://api-service-placement-{}-{}",
+            node_id,
+            cfg.cluster.data_nodes.len(),
         );
         KVServiceContext::new(cfg).unwrap()
     }
@@ -167,6 +176,18 @@ mod tests {
 
         assert_ne!(placement_a.placement_epoch, placement_b.placement_epoch);
         assert_ne!(placement_a.layout_hash, placement_b.layout_hash);
+    }
+
+    #[test]
+    fn placement_epoch_is_stable_across_local_nodes() {
+        let nodes = vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-b", "10.0.0.2:50051"),
+        ];
+        let ctx_a = ctx_with_local_and_nodes("node-a", "10.0.0.1:50051", nodes.clone());
+        let ctx_b = ctx_with_local_and_nodes("node-b", "10.0.0.2:50051", nodes);
+
+        assert_eq!(placement_epoch(&ctx_a), placement_epoch(&ctx_b));
     }
 
     #[test]
@@ -529,12 +550,14 @@ impl KVServiceImpl {
         descriptor: pb::ObjectDescriptor,
         placement: pb::PlacementDescriptor,
     ) -> Result<Vec<Bytes>, Status> {
+        let mut validation_placement = placement.clone();
+        validation_placement.chunks.clear();
         let mut tasks = Vec::with_capacity(placement.chunks.len());
         for chunk in &placement.chunks {
             tasks.push(Self::read_chunk_from_placement(
                 self.ctx.clone(),
                 descriptor.clone(),
-                placement.clone(),
+                validation_placement.clone(),
                 chunk.clone(),
             ));
         }
@@ -746,13 +769,9 @@ fn placement_policy_id(ctx: &KVServiceContext) -> String {
 }
 
 fn placement_epoch(ctx: &KVServiceContext) -> u64 {
-    let local = local_node(ctx);
     let mut seed = format!(
-        "policy={}|local={}:{}:{}|striping_threshold={}|striping_chunk_size={}|devices={}",
+        "policy={}|striping_threshold={}|striping_chunk_size={}|devices={}",
         placement_policy_id(ctx),
-        local.node_id,
-        local.grpc_endpoint,
-        local.rdma_endpoint,
         ctx.storage.striping_threshold(),
         ctx.storage.striping_chunk_size(),
         ctx.storage.router().num_devices()
