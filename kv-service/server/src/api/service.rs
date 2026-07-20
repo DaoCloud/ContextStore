@@ -351,16 +351,29 @@ impl KVServiceImpl {
         let metadata = self.ctx.metadata.clone();
         let str_key = key.to_string_key();
         let committed_meta = committed.clone();
-        let committed = tokio::task::spawn_blocking(move || {
+        let committed_result = tokio::task::spawn_blocking(move || {
             if if_absent {
                 metadata.put_block_if_absent(&str_key, &committed_meta)
             } else {
                 metadata.put_block(&str_key, &committed_meta).map(|_| true)
             }
         })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(Status::from)?;
+        .await;
+        let committed = match committed_result {
+            Ok(Ok(committed)) => committed,
+            Ok(Err(e)) => {
+                for chunk in rollback_chunks {
+                    let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+                }
+                return Err(Status::from(e));
+            }
+            Err(e) => {
+                for chunk in rollback_chunks {
+                    let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+                }
+                return Err(Status::internal(e.to_string()));
+            }
+        };
         if !committed {
             for chunk in rollback_chunks {
                 let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
@@ -996,7 +1009,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 self.ctx.memory.invalidate(&internal);
                 self.ctx
                     .metadata
-                    .delete_block(&internal.to_string_key())
+                    .delete_block_if_matches(&internal.to_string_key(), meta)
                     .map_err(Status::from)?;
                 return Ok(Response::new(pb::DeleteResponse { success: true }));
             }

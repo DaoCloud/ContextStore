@@ -112,6 +112,76 @@ impl StorageTier {
         }
     }
 
+    fn delete_paths_best_effort(&self, paths: &[PathBuf]) {
+        for path in paths {
+            let _ = self.executor.delete_file(path);
+        }
+    }
+
+    fn delete_files_for_meta(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<()> {
+        if let Some(stripe) = &meta.striping {
+            let mut last_err = None;
+            for path in &stripe.chunk_paths {
+                if let Err(e) = self.executor.delete_file(std::path::Path::new(path)) {
+                    last_err = Some(e);
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        } else {
+            let path = self.meta_path_or_route(key, meta);
+            self.executor.delete_file(&path)?;
+        }
+        Ok(())
+    }
+
+    fn delete_metadata_if_current(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
+        self.metadata
+            .delete_block_if_matches(&key.to_string_key(), meta)
+    }
+
+    fn commit_metadata_with_rollback(
+        &self,
+        key: &ObjectKey,
+        meta: &BlockMeta,
+        new_paths: &[PathBuf],
+        if_absent: bool,
+    ) -> Result<bool> {
+        let str_key = key.to_string_key();
+        let result = if if_absent {
+            self.metadata.put_block_if_absent(&str_key, meta)
+        } else {
+            self.metadata.put_block(&str_key, meta).map(|_| true)
+        };
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.delete_paths_best_effort(new_paths);
+                Ok(false)
+            }
+            Err(e) => {
+                self.delete_paths_best_effort(new_paths);
+                Err(e)
+            }
+        }
+    }
+
+    fn stripe_files_exist(&self, stripe: &StripingInfo) -> bool {
+        stripe
+            .chunk_paths
+            .iter()
+            .all(|path| self.executor.file_exists(std::path::Path::new(path)))
+    }
+
+    fn is_not_found_error(error: &KVError) -> bool {
+        match error {
+            KVError::NotFound(_) => true,
+            KVError::Io(err) => err.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+
     fn content_etag(key: &ObjectKey, generation: u64, size: u64, created_at: i64) -> String {
         let seed = format!(
             "{}|generation={}|size={}|created_at={}",
@@ -303,7 +373,14 @@ impl StorageTier {
 
         // Striped path: read all chunks in parallel and concat.
         if let Some(stripe) = &meta.striping {
-            let data = self.read_striped(key, stripe)?;
+            let data = match self.read_striped(key, stripe) {
+                Ok(data) => data,
+                Err(KVError::NotFound(_)) => {
+                    self.delete_metadata_if_current(key, &meta)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
             self.reads_total.fetch_add(1, Ordering::Relaxed);
             self.bytes_read
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -312,7 +389,7 @@ impl StorageTier {
 
         let path = self.meta_path_or_route(key, &meta);
         if !self.executor.file_exists(&path) {
-            self.metadata.delete_block(&str_key)?;
+            self.delete_metadata_if_current(key, &meta)?;
             return Ok(None);
         }
         debug!("L2 GET {} -> {}", str_key, path.display());
@@ -358,7 +435,7 @@ impl StorageTier {
         meta.size = nbytes as u64;
         meta.device_id = device_id as u32;
         meta.striping = None;
-        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        self.commit_metadata_with_rollback(key, &meta, std::slice::from_ref(&path), false)?;
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(nbytes as u64, Ordering::Relaxed);
@@ -395,11 +472,7 @@ impl StorageTier {
         meta.size = nbytes as u64;
         meta.device_id = device_id as u32;
         meta.striping = None;
-        if !self
-            .metadata
-            .put_block_if_absent(&key.to_string_key(), &meta)?
-        {
-            let _ = self.executor.delete_file(&path);
+        if !self.commit_metadata_with_rollback(key, &meta, std::slice::from_ref(&path), true)? {
             return Ok(false);
         }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
@@ -544,15 +617,13 @@ impl StorageTier {
             meta.size = total as u64;
             meta.device_id = device_id as u32;
             meta.striping = None;
-            let committed = if if_not_exists {
-                self.metadata
-                    .put_block_if_absent(&key.to_string_key(), &meta)?
-            } else {
-                self.metadata.put_block(&key.to_string_key(), &meta)?;
-                true
-            };
+            let committed = self.commit_metadata_with_rollback(
+                key,
+                &meta,
+                std::slice::from_ref(&path),
+                if_not_exists,
+            )?;
             if !committed {
-                let _ = self.executor.delete_file(&path);
                 return Ok(false);
             }
             self.writes_total.fetch_add(1, Ordering::Relaxed);
@@ -645,19 +716,20 @@ impl StorageTier {
             total_size: total as u64,
             chunk_locations: Vec::new(),
         });
-        let committed = if if_not_exists {
-            self.metadata
-                .put_block_if_absent(&key.to_string_key(), &meta)?
-        } else {
-            self.metadata.put_block(&key.to_string_key(), &meta)?;
-            true
-        };
+        let new_paths = meta
+            .striping
+            .as_ref()
+            .map(|stripe| {
+                stripe
+                    .chunk_paths
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let committed =
+            self.commit_metadata_with_rollback(key, &meta, &new_paths, if_not_exists)?;
         if !committed {
-            if let Some(striping) = &meta.striping {
-                for path in &striping.chunk_paths {
-                    let _ = self.executor.delete_file(std::path::Path::new(path));
-                }
-            }
             return Ok(false);
         }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
@@ -673,21 +745,31 @@ impl StorageTier {
         let existed = meta.is_some();
 
         if let Some(meta) = meta {
-            if let Some(stripe) = &meta.striping {
-                for path in &stripe.chunk_paths {
-                    let _ = self.executor.delete_file(std::path::Path::new(path));
-                }
-            } else {
-                let path = self.meta_path_or_route(key, &meta);
-                self.executor.delete_file(&path)?;
-            }
+            self.delete_files_for_meta(key, &meta)?;
+            self.delete_metadata_if_current(key, &meta)?;
+            return Ok(existed);
         }
         self.metadata.delete_block(&str_key)?;
         Ok(existed)
     }
 
     pub fn exists(&self, key: &ObjectKey) -> Result<bool> {
-        self.metadata.exists_block(&key.to_string_key())
+        let Some(meta) = self.metadata.get_block(&key.to_string_key())? else {
+            return Ok(false);
+        };
+        if let Some(stripe) = &meta.striping {
+            if self.stripe_files_exist(stripe) {
+                return Ok(true);
+            }
+            self.delete_metadata_if_current(key, &meta)?;
+            return Ok(false);
+        }
+        let path = self.meta_path_or_route(key, &meta);
+        if self.executor.file_exists(&path) {
+            return Ok(true);
+        }
+        self.delete_metadata_if_current(key, &meta)?;
+        Ok(false)
     }
 
     // ===== GDS direct read/write (zero-copy) =====
@@ -711,7 +793,7 @@ impl StorageTier {
         }
         let path = self.meta_path_or_route(key, &meta);
         if !self.executor.file_exists(&path) {
-            self.metadata.delete_block(&str_key)?;
+            self.delete_metadata_if_current(key, &meta)?;
             return Ok(None);
         }
         let size = meta.size as usize;
@@ -753,7 +835,7 @@ impl StorageTier {
         meta.size = n as u64;
         meta.file_path = path.to_string_lossy().to_string();
         meta.device_id = device_id as u32;
-        self.metadata.put_block(&key.to_string_key(), &meta)?;
+        self.commit_metadata_with_rollback(key, &meta, std::slice::from_ref(&path), false)?;
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written.fetch_add(n as u64, Ordering::Relaxed);
         Ok(())
@@ -897,19 +979,19 @@ impl StorageTier {
             total_size: total as u64,
             chunk_locations: Vec::new(),
         });
-        let committed = if if_absent {
-            self.metadata
-                .put_block_if_absent(&key.to_string_key(), &meta)?
-        } else {
-            self.metadata.put_block(&key.to_string_key(), &meta)?;
-            true
-        };
+        let new_paths = meta
+            .striping
+            .as_ref()
+            .map(|stripe| {
+                stripe
+                    .chunk_paths
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let committed = self.commit_metadata_with_rollback(key, &meta, &new_paths, if_absent)?;
         if !committed {
-            if let Some(stripe) = &meta.striping {
-                for path in &stripe.chunk_paths {
-                    let _ = self.executor.delete_file(std::path::Path::new(path));
-                }
-            }
             return Ok(false);
         }
         self.writes_total.fetch_add(1, Ordering::Relaxed);
@@ -956,8 +1038,13 @@ impl StorageTier {
         let results = self.executor.read_aligned_batch(&reqs);
         let mut out: Vec<Bytes> = Vec::with_capacity(results.len());
         for (i, r) in results.into_iter().enumerate() {
-            let chunk =
-                r.map_err(|e| KVError::Internal(format!("read striped chunk {}: {}", i, e)))?;
+            let chunk = r.map_err(|e| {
+                if Self::is_not_found_error(&e) {
+                    KVError::NotFound(format!("striped object missing chunk {}", i))
+                } else {
+                    KVError::Internal(format!("read striped chunk {}: {}", i, e))
+                }
+            })?;
             if let Some(device_id) = stripe.chunk_devices.get(i) {
                 self.record_device_read(*device_id as usize, chunk.len() as u64);
             }
@@ -977,7 +1064,14 @@ impl StorageTier {
         meta: &BlockMeta,
     ) -> Result<Option<(Bytes, BlockMeta)>> {
         if let Some(stripe) = &meta.striping {
-            let data = self.read_striped(key, stripe)?;
+            let data = match self.read_striped(key, stripe) {
+                Ok(data) => data,
+                Err(KVError::NotFound(_)) => {
+                    self.delete_metadata_if_current(key, meta)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
             self.reads_total.fetch_add(1, Ordering::Relaxed);
             self.bytes_read
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -986,6 +1080,7 @@ impl StorageTier {
 
         let path = self.meta_path_or_route(key, meta);
         if !self.executor.file_exists(&path) {
+            self.delete_metadata_if_current(key, meta)?;
             return Ok(None);
         }
         let data = self.executor.read_file(&path)?;
@@ -1003,7 +1098,14 @@ impl StorageTier {
         meta: &BlockMeta,
     ) -> Result<Option<(Vec<Bytes>, BlockMeta)>> {
         if let Some(stripe) = &meta.striping {
-            let segments = self.read_striped_chunks(key, stripe)?;
+            let segments = match self.read_striped_chunks(key, stripe) {
+                Ok(segments) => segments,
+                Err(KVError::NotFound(_)) => {
+                    self.delete_metadata_if_current(key, meta)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
             let total: u64 = segments.iter().map(|s| s.len() as u64).sum();
             self.reads_total.fetch_add(1, Ordering::Relaxed);
             self.bytes_read.fetch_add(total, Ordering::Relaxed);
@@ -1012,6 +1114,7 @@ impl StorageTier {
 
         let path = self.meta_path_or_route(key, meta);
         if !self.executor.file_exists(&path) {
+            self.delete_metadata_if_current(key, meta)?;
             return Ok(None);
         }
         let data = self.executor.read_file(&path)?;
@@ -1058,7 +1161,7 @@ impl StorageTier {
         let Some(stripe) = &meta.striping else {
             let path = self.meta_path_or_route(key, &meta);
             if !self.executor.file_exists(&path) {
-                self.metadata.delete_block(&str_key)?;
+                self.delete_metadata_if_current(key, &meta)?;
                 return Ok(None);
             }
             let req = IORequest {
@@ -1080,7 +1183,7 @@ impl StorageTier {
             return Ok(Some((bytes_read, meta)));
         };
 
-        // striped: read 8 segments in parallel into different offsets of ptr.
+        // striped: read segments in parallel into different offsets of ptr.
         let chunk_size = stripe.chunk_size as usize;
         let total = stripe.total_size as usize;
         if capacity < total {
@@ -1124,8 +1227,19 @@ impl StorageTier {
         let results = self.executor.read_aligned_into_ptr_batch(reqs);
         let mut total_read = 0usize;
         for (i, r) in results.into_iter().enumerate() {
-            let n =
-                r.map_err(|e| KVError::Internal(format!("read stripe {} into ptr: {}", i, e)))?;
+            let n = match r {
+                Ok(n) => n,
+                Err(e) if Self::is_not_found_error(&e) => {
+                    self.delete_metadata_if_current(key, &meta)?;
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(KVError::Internal(format!(
+                        "read stripe {} into ptr: {}",
+                        i, e
+                    )));
+                }
+            };
             if let Some(device_id) = stripe.chunk_devices.get(i) {
                 self.record_device_read(*device_id as usize, n as u64);
             }
@@ -1211,6 +1325,7 @@ impl StorageTier {
         let Some(stripe) = &meta.striping else {
             let path = self.meta_path_or_route(key, &meta);
             if !self.executor.file_exists(&path) {
+                self.delete_metadata_if_current(key, &meta)?;
                 return Ok(None);
             }
             let total = meta.size as usize;
@@ -1312,9 +1427,22 @@ impl StorageTier {
         let (tx_out, rx_out) = crossbeam_channel::unbounded();
         let device_read_bytes = self.device_read_bytes_total.clone();
         let chunk_devices = stripe.chunk_devices.clone();
+        let metadata = self.metadata.clone();
+        let cleanup_key = str_key.clone();
+        let cleanup_meta = meta.clone();
         std::thread::spawn(move || {
             while let Ok((idx, result)) = raw_rx.recv() {
                 if idx < stripe_meta.len() {
+                    let result = match result {
+                        Err(e) if StorageTier::is_not_found_error(&e) => {
+                            let _ = metadata.delete_block_if_matches(&cleanup_key, &cleanup_meta);
+                            Err(KVError::NotFound(format!(
+                                "striped object missing chunk {}",
+                                idx
+                            )))
+                        }
+                        other => other,
+                    };
                     if let Ok(n) = result.as_ref() {
                         if let Some(device_id) = chunk_devices.get(idx) {
                             if let Some(counter) = device_read_bytes.get(*device_id as usize) {
@@ -1344,7 +1472,14 @@ impl StorageTier {
         };
 
         if let Some(stripe) = &meta.striping {
-            let segments = self.read_striped_chunks(key, stripe)?;
+            let segments = match self.read_striped_chunks(key, stripe) {
+                Ok(segments) => segments,
+                Err(KVError::NotFound(_)) => {
+                    self.delete_metadata_if_current(key, &meta)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
             let total: u64 = segments.iter().map(|s| s.len() as u64).sum();
             self.reads_total.fetch_add(1, Ordering::Relaxed);
             self.bytes_read.fetch_add(total, Ordering::Relaxed);
@@ -1353,7 +1488,7 @@ impl StorageTier {
 
         let path = self.meta_path_or_route(key, &meta);
         if !self.executor.file_exists(&path) {
-            self.metadata.delete_block(&str_key)?;
+            self.delete_metadata_if_current(key, &meta)?;
             return Ok(None);
         }
         let data = self.executor.read_file(&path)?;
@@ -1388,11 +1523,26 @@ impl StorageTier {
                                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                                 results[idx] = Some(Ok(Some((Bytes::from(data), meta))));
                             }
+                            Err(KVError::NotFound(_)) => {
+                                if let Err(e) = self.delete_metadata_if_current(key, &meta) {
+                                    results[idx] = Some(Err(e));
+                                } else {
+                                    results[idx] = Some(Ok(None));
+                                }
+                            }
                             Err(e) => results[idx] = Some(Err(e)),
                         }
                         continue;
                     }
                     let path = self.meta_path_or_route(key, &meta);
+                    if !self.executor.file_exists(&path) {
+                        if let Err(e) = self.delete_metadata_if_current(key, &meta) {
+                            results[idx] = Some(Err(e));
+                        } else {
+                            results[idx] = Some(Ok(None));
+                        }
+                        continue;
+                    }
                     let device_id = self.meta_device_or_route(key, &meta);
                     io_reqs.push((
                         idx,
@@ -1507,6 +1657,24 @@ mod tests {
             .collect()
     }
 
+    fn regular_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if !root.exists() {
+            return files;
+        }
+        let entries = std::fs::read_dir(root).unwrap();
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(regular_files(&path));
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files
+    }
+
     #[test]
     fn put_get_delete_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -1568,6 +1736,117 @@ mod tests {
         assert_eq!(meta.object_generation, first_meta.object_generation);
         assert_eq!(meta.content_etag, first_meta.content_etag);
         assert_eq!(meta.file_path, first_meta.file_path);
+    }
+
+    #[test]
+    fn metadata_put_failure_rolls_back_single_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "failure/single".into(),
+        };
+
+        st.metadata.fail_next_put_for_test();
+        assert!(st
+            .put(&key, Bytes::from_static(b"uncommitted"), mk_meta())
+            .is_err());
+
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(regular_files(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn metadata_put_failure_rolls_back_striped_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "failure/striped".into(),
+        };
+
+        st.metadata.fail_next_put_for_test();
+        assert!(st
+            .put(&key, Bytes::from_static(b"abcdefghijkl"), mk_meta())
+            .is_err());
+
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(regular_files(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn missing_single_file_clears_current_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "missing/single".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"value"), mk_meta())
+            .unwrap();
+        let meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&meta.file_path).unwrap();
+
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(!st.exists(&key).unwrap());
+    }
+
+    #[test]
+    fn missing_striped_chunk_clears_current_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "missing/striped".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"abcdefghijkl"), mk_meta())
+            .unwrap();
+        let meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+        let missing_path = meta.striping.as_ref().unwrap().chunk_paths[0].clone();
+        std::fs::remove_file(missing_path).unwrap();
+
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(!st.exists(&key).unwrap());
     }
 
     #[test]
