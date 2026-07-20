@@ -313,13 +313,17 @@ impl RedisMetadataBackend {
     fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
         static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
         let redis_key = self.block_key(key);
-        let expected = Self::serialize(expected)?;
+        let expected_generation = expected.object_generation;
         let script = SCRIPT.get_or_init(|| {
             redis::Script::new(
                 r#"
-            if redis.call("GET", KEYS[1]) == ARGV[1] then
-                redis.call("DEL", KEYS[1])
-                return 1
+            local meta = redis.call("GET", KEYS[1])
+            if meta then
+                local ok, decoded = pcall(cjson.decode, meta)
+                if ok and type(decoded) == "table" and tonumber(decoded["object_generation"]) == tonumber(ARGV[1]) then
+                    redis.call("DEL", KEYS[1])
+                    return 1
+                end
             end
             return 0
             "#,
@@ -329,7 +333,7 @@ impl RedisMetadataBackend {
             self.run_with_reconnect("compare-and-delete block metadata", |connection| {
                 script
                     .key(&redis_key)
-                    .arg(&expected)
+                    .arg(expected_generation)
                     .invoke::<i32>(connection)
             })?;
         Ok(deleted == 1)
@@ -450,10 +454,12 @@ impl MemoryMetadataBackend {
 
     fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
         let mut inner = self.inner.lock();
-        let expected = Self::serialize(expected)?;
-        if inner.blocks.get(key) == Some(&expected) {
-            inner.blocks.remove(key);
-            return Ok(true);
+        if let Some(bytes) = inner.blocks.get(key) {
+            let stored = Self::deserialize(bytes)?;
+            if stored.object_generation == expected.object_generation {
+                inner.blocks.remove(key);
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -557,6 +563,20 @@ mod tests {
         assert!(!svc.delete_block_if_matches("k1", &first).unwrap());
         assert_eq!(svc.get_block("k1").unwrap().unwrap().object_generation, 2);
         assert!(svc.delete_block_if_matches("k1", &second).unwrap());
+        assert!(svc.get_block("k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_block_if_matches_uses_generation_identity() {
+        let svc = MetadataService::new(&test_config("compare-delete-generation")).unwrap();
+        let stored = meta();
+        let mut expected = meta();
+        expected.content_etag = "etag-from-older-binary".to_string();
+        expected.layout_version = 99;
+
+        svc.put_block("k1", &stored).unwrap();
+
+        assert!(svc.delete_block_if_matches("k1", &expected).unwrap());
         assert!(svc.get_block("k1").unwrap().is_none());
     }
 

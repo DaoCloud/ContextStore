@@ -358,15 +358,20 @@ impl KVServiceImpl {
                 metadata.put_block(&str_key, &committed_meta).map(|_| true)
             }
         })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .await;
         let committed = match committed_result {
-            Ok(committed) => committed,
-            Err(e) => {
+            Ok(Ok(committed)) => committed,
+            Ok(Err(e)) => {
                 for chunk in rollback_chunks {
                     let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
                 }
                 return Err(Status::from(e));
+            }
+            Err(e) => {
+                for chunk in rollback_chunks {
+                    let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+                }
+                return Err(Status::internal(e.to_string()));
             }
         };
         if !committed {

@@ -120,8 +120,14 @@ impl StorageTier {
 
     fn delete_files_for_meta(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<()> {
         if let Some(stripe) = &meta.striping {
+            let mut last_err = None;
             for path in &stripe.chunk_paths {
-                self.executor.delete_file(std::path::Path::new(path))?;
+                if let Err(e) = self.executor.delete_file(std::path::Path::new(path)) {
+                    last_err = Some(e);
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e);
             }
         } else {
             let path = self.meta_path_or_route(key, meta);
@@ -166,6 +172,14 @@ impl StorageTier {
             .chunk_paths
             .iter()
             .all(|path| self.executor.file_exists(std::path::Path::new(path)))
+    }
+
+    fn is_not_found_error(error: &KVError) -> bool {
+        match error {
+            KVError::NotFound(_) => true,
+            KVError::Io(err) => err.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
     }
 
     fn content_etag(key: &ObjectKey, generation: u64, size: u64, created_at: i64) -> String {
@@ -1009,11 +1023,6 @@ impl StorageTier {
     /// DataChunk** without concatenating a 480MB block anywhere (the old read_striped concat's
     /// ~600ms page-fault write has been eliminated).
     fn read_striped_chunks(&self, _key: &ObjectKey, stripe: &StripingInfo) -> Result<Vec<Bytes>> {
-        if !self.stripe_files_exist(stripe) {
-            return Err(KVError::NotFound(
-                "striped object has missing chunk file".to_string(),
-            ));
-        }
         let reqs: Vec<IORequest> = stripe
             .chunk_paths
             .iter()
@@ -1029,8 +1038,13 @@ impl StorageTier {
         let results = self.executor.read_aligned_batch(&reqs);
         let mut out: Vec<Bytes> = Vec::with_capacity(results.len());
         for (i, r) in results.into_iter().enumerate() {
-            let chunk =
-                r.map_err(|e| KVError::Internal(format!("read striped chunk {}: {}", i, e)))?;
+            let chunk = r.map_err(|e| {
+                if Self::is_not_found_error(&e) {
+                    KVError::NotFound(format!("striped object missing chunk {}", i))
+                } else {
+                    KVError::Internal(format!("read striped chunk {}: {}", i, e))
+                }
+            })?;
             if let Some(device_id) = stripe.chunk_devices.get(i) {
                 self.record_device_read(*device_id as usize, chunk.len() as u64);
             }
@@ -1169,11 +1183,7 @@ impl StorageTier {
             return Ok(Some((bytes_read, meta)));
         };
 
-        // striped: read 8 segments in parallel into different offsets of ptr.
-        if !self.stripe_files_exist(stripe) {
-            self.delete_metadata_if_current(key, &meta)?;
-            return Ok(None);
-        }
+        // striped: read segments in parallel into different offsets of ptr.
         let chunk_size = stripe.chunk_size as usize;
         let total = stripe.total_size as usize;
         if capacity < total {
@@ -1217,8 +1227,19 @@ impl StorageTier {
         let results = self.executor.read_aligned_into_ptr_batch(reqs);
         let mut total_read = 0usize;
         for (i, r) in results.into_iter().enumerate() {
-            let n =
-                r.map_err(|e| KVError::Internal(format!("read stripe {} into ptr: {}", i, e)))?;
+            let n = match r {
+                Ok(n) => n,
+                Err(e) if Self::is_not_found_error(&e) => {
+                    self.delete_metadata_if_current(key, &meta)?;
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(KVError::Internal(format!(
+                        "read stripe {} into ptr: {}",
+                        i, e
+                    )));
+                }
+            };
             if let Some(device_id) = stripe.chunk_devices.get(i) {
                 self.record_device_read(*device_id as usize, n as u64);
             }
@@ -1346,10 +1367,6 @@ impl StorageTier {
         };
 
         // striped: prepare N IORequests reading into N offsets of ptr.
-        if !self.stripe_files_exist(stripe) {
-            self.delete_metadata_if_current(key, &meta)?;
-            return Ok(None);
-        }
         let chunk_size = stripe.chunk_size as usize;
         let total = stripe.total_size as usize;
         if capacity < total {
@@ -1410,9 +1427,22 @@ impl StorageTier {
         let (tx_out, rx_out) = crossbeam_channel::unbounded();
         let device_read_bytes = self.device_read_bytes_total.clone();
         let chunk_devices = stripe.chunk_devices.clone();
+        let metadata = self.metadata.clone();
+        let cleanup_key = str_key.clone();
+        let cleanup_meta = meta.clone();
         std::thread::spawn(move || {
             while let Ok((idx, result)) = raw_rx.recv() {
                 if idx < stripe_meta.len() {
+                    let result = match result {
+                        Err(e) if StorageTier::is_not_found_error(&e) => {
+                            let _ = metadata.delete_block_if_matches(&cleanup_key, &cleanup_meta);
+                            Err(KVError::NotFound(format!(
+                                "striped object missing chunk {}",
+                                idx
+                            )))
+                        }
+                        other => other,
+                    };
                     if let Ok(n) = result.as_ref() {
                         if let Some(device_id) = chunk_devices.get(idx) {
                             if let Some(counter) = device_read_bytes.get(*device_id as usize) {
