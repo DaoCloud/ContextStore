@@ -35,6 +35,35 @@ mod tests {
     use super::*;
     use crate::metadata::{ChunkLocation, StripingInfo};
 
+    fn ctx_with_nodes(nodes: Vec<ClusterNodeConfig>) -> KVServiceContext {
+        ctx_with_local_and_nodes("coordinator", "127.0.0.1:50051", nodes)
+    }
+
+    fn ctx_with_local_and_nodes(
+        node_id: &str,
+        grpc_advertise: &str,
+        nodes: Vec<ClusterNodeConfig>,
+    ) -> KVServiceContext {
+        let mut cfg = crate::config::Config::default();
+        cfg.cluster.node_id = node_id.to_string();
+        cfg.cluster.grpc_advertise = grpc_advertise.to_string();
+        cfg.cluster.data_nodes = nodes;
+        cfg.metadata.redis_url = format!(
+            "memory://api-service-placement-{}-{}",
+            node_id,
+            cfg.cluster.data_nodes.len(),
+        );
+        KVServiceContext::new(cfg).unwrap()
+    }
+
+    fn data_node(id: &str, grpc: &str) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            node_id: id.to_string(),
+            grpc_endpoint: grpc.to_string(),
+            rdma_endpoint: String::new(),
+        }
+    }
+
     fn meta() -> BlockMeta {
         BlockMeta {
             device_id: 0,
@@ -128,6 +157,57 @@ mod tests {
         assert_eq!(placement.chunks.len(), 2);
         assert_eq!(placement.chunks[0].node_id, "node-a");
         assert_eq!(placement.chunks[1].grpc_endpoint, "10.0.0.2:50051");
+    }
+
+    #[test]
+    fn placement_epoch_changes_when_topology_changes() {
+        let ctx_a = ctx_with_nodes(vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-b", "10.0.0.2:50051"),
+        ]);
+        let ctx_b = ctx_with_nodes(vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-c", "10.0.0.3:50051"),
+        ]);
+
+        let meta = meta();
+        let placement_a = placement_from_meta(&ctx_a, &key(), &meta);
+        let placement_b = placement_from_meta(&ctx_b, &key(), &meta);
+
+        assert_ne!(placement_a.placement_epoch, placement_b.placement_epoch);
+        assert_ne!(placement_a.layout_hash, placement_b.layout_hash);
+    }
+
+    #[test]
+    fn placement_epoch_is_stable_across_local_nodes() {
+        let nodes = vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-b", "10.0.0.2:50051"),
+        ];
+        let ctx_a = ctx_with_local_and_nodes("node-a", "10.0.0.1:50051", nodes.clone());
+        let ctx_b = ctx_with_local_and_nodes("node-b", "10.0.0.2:50051", nodes);
+
+        assert_eq!(placement_epoch(&ctx_a), placement_epoch(&ctx_b));
+    }
+
+    #[test]
+    fn placement_validation_accepts_current_descriptor() {
+        let ctx = ctx_with_nodes(vec![data_node("node-a", "10.0.0.1:50051")]);
+        let meta = meta();
+        let placement = placement_from_meta(&ctx, &key(), &meta);
+
+        validate_placement_descriptor(&ctx, &key(), &meta, Some(&placement)).unwrap();
+    }
+
+    #[test]
+    fn placement_validation_rejects_stale_epoch() {
+        let ctx = ctx_with_nodes(vec![data_node("node-a", "10.0.0.1:50051")]);
+        let meta = meta();
+        let mut placement = placement_from_meta(&ctx, &key(), &meta);
+        placement.placement_epoch = placement.placement_epoch.wrapping_add(1);
+
+        let err = validate_placement_descriptor(&ctx, &key(), &meta, Some(&placement)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }
 
@@ -426,6 +506,7 @@ impl KVServiceImpl {
     async fn read_chunk_from_placement(
         ctx: Arc<KVServiceContext>,
         descriptor: pb::ObjectDescriptor,
+        placement: pb::PlacementDescriptor,
         chunk: pb::PlacementChunk,
     ) -> Result<(u32, Bytes), Status> {
         let node = DataNode {
@@ -458,6 +539,7 @@ impl KVServiceImpl {
             .read_placement_chunk(pb::ReadPlacementChunkRequest {
                 descriptor: Some(descriptor),
                 chunk: Some(chunk.clone()),
+                placement: Some(placement),
             })
             .await
             .map_err(|e| Status::unavailable(format!("read chunk from {}: {}", node.node_id, e)))?
@@ -481,12 +563,15 @@ impl KVServiceImpl {
         descriptor: pb::ObjectDescriptor,
         placement: pb::PlacementDescriptor,
     ) -> Result<Vec<Bytes>, Status> {
+        let mut validation_placement = placement.clone();
+        validation_placement.chunks.clear();
         let mut tasks = Vec::with_capacity(placement.chunks.len());
-        for chunk in placement.chunks {
+        for chunk in &placement.chunks {
             tasks.push(Self::read_chunk_from_placement(
                 self.ctx.clone(),
                 descriptor.clone(),
-                chunk,
+                validation_placement.clone(),
+                chunk.clone(),
             ));
         }
         let mut indexed = Vec::with_capacity(tasks.len());
@@ -692,6 +777,27 @@ fn select_data_node(ctx: &KVServiceContext, key: &InternalKey, stripe_index: usi
     nodes[(base + stripe_index) % nodes.len()].clone()
 }
 
+fn placement_policy_id(ctx: &KVServiceContext) -> String {
+    format!("{}_v1", ctx.config.router.strategy)
+}
+
+fn placement_epoch(ctx: &KVServiceContext) -> u64 {
+    let mut seed = format!(
+        "policy={}|striping_threshold={}|striping_chunk_size={}|devices={}",
+        placement_policy_id(ctx),
+        ctx.storage.striping_threshold(),
+        ctx.storage.striping_chunk_size(),
+        ctx.storage.router().num_devices()
+    );
+    for (idx, node) in configured_data_nodes(ctx).iter().enumerate() {
+        seed.push_str(&format!(
+            "|node{}={}:{}:{}",
+            idx, node.node_id, node.grpc_endpoint, node.rdma_endpoint
+        ));
+    }
+    hash64(seed.as_bytes()).max(1)
+}
+
 fn chunk_location_to_pb(key: &InternalKey, loc: &ChunkLocation) -> pb::PlacementChunk {
     let _ = key;
     pb::PlacementChunk {
@@ -755,7 +861,8 @@ fn placement_from_meta(
     meta: &BlockMeta,
 ) -> pb::PlacementDescriptor {
     let local = local_node(ctx);
-    let placement_policy_id = format!("{}_v1", ctx.config.router.strategy);
+    let placement_epoch = placement_epoch(ctx);
+    let placement_policy_id = placement_policy_id(ctx);
 
     let chunks = match &meta.striping {
         Some(stripe) if stripe.chunk_locations.len() == stripe.chunk_paths.len() => stripe
@@ -798,10 +905,11 @@ fn placement_from_meta(
     };
 
     let mut hash_seed = format!(
-        "{}|g{}|l{}|{}|{}",
+        "{}|g{}|l{}|epoch{}|{}|{}",
         key.to_string_key(),
         meta.object_generation,
         meta.layout_version,
+        placement_epoch,
         placement_policy_id,
         chunks.len()
     );
@@ -814,7 +922,7 @@ fn placement_from_meta(
 
     pb::PlacementDescriptor {
         key: Some(internal_key_to_pb(key)),
-        placement_epoch: 1,
+        placement_epoch,
         placement_policy_id,
         layout_hash: format!("{:016x}", hash64(hash_seed.as_bytes())),
         primary_node_id: local.node_id,
@@ -840,6 +948,32 @@ fn validate_descriptor(desc: &pb::ObjectDescriptor, meta: &BlockMeta) -> Result<
         || desc.object_handle != meta.object_handle
     {
         return Err(Status::failed_precondition("stale descriptor"));
+    }
+    Ok(())
+}
+
+fn validate_placement_descriptor(
+    ctx: &KVServiceContext,
+    key: &InternalKey,
+    meta: &BlockMeta,
+    placement: Option<&pb::PlacementDescriptor>,
+) -> Result<(), Status> {
+    let Some(placement) = placement else {
+        return Ok(());
+    };
+    let Some(placement_key) = placement.key.as_ref() else {
+        return Err(Status::invalid_argument("placement descriptor missing key"));
+    };
+    if pb_key_to_internal(placement_key) != *key {
+        return Err(Status::failed_precondition("stale placement descriptor"));
+    }
+
+    let expected = placement_from_meta(ctx, key, meta);
+    if placement.placement_epoch != expected.placement_epoch
+        || placement.placement_policy_id != expected.placement_policy_id
+        || placement.layout_hash != expected.layout_hash
+    {
+        return Err(Status::failed_precondition("stale placement descriptor"));
     }
     Ok(())
 }
@@ -1083,6 +1217,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let start = Instant::now();
         let result = async {
             let req = req.into_inner();
+            let requested_placement = req.placement;
             let descriptor = req
                 .descriptor
                 .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
@@ -1105,6 +1240,12 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 }));
             };
             validate_descriptor(&descriptor, &active_meta)?;
+            validate_placement_descriptor(
+                &self.ctx,
+                &internal,
+                &active_meta,
+                requested_placement.as_ref(),
+            )?;
             let placement = placement_from_meta(&self.ctx, &internal, &active_meta);
             if self.placement_has_remote_chunks(&placement) {
                 let chunks = self
@@ -1217,6 +1358,18 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             .descriptor
             .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
         let internal = key_from_descriptor(&descriptor)?;
+        if let Some(placement) = req.placement.as_ref() {
+            let str_key = internal.to_string_key();
+            let meta_ctx = self.ctx.clone();
+            let active_meta =
+                tokio::task::spawn_blocking(move || meta_ctx.metadata.get_block(&str_key))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(Status::from)?
+                    .ok_or_else(|| Status::not_found("key not found"))?;
+            validate_descriptor(&descriptor, &active_meta)?;
+            validate_placement_descriptor(&self.ctx, &internal, &active_meta, Some(placement))?;
+        }
         let chunk = req
             .chunk
             .ok_or_else(|| Status::invalid_argument("missing placement chunk"))?;
@@ -1467,6 +1620,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let start = Instant::now();
         let result = async {
             let req = req.into_inner();
+            let requested_placement = req.placement;
             let descriptor = req
                 .descriptor
                 .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
@@ -1481,6 +1635,12 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .map_err(Status::from)?;
             let active_meta = active_meta.ok_or_else(|| Status::not_found("key not found"))?;
             validate_descriptor(&descriptor, &active_meta)?;
+            validate_placement_descriptor(
+                &self.ctx,
+                &internal,
+                &active_meta,
+                requested_placement.as_ref(),
+            )?;
             let fresh_descriptor = descriptor_from_meta(&internal, &active_meta);
             let fresh_placement = placement_from_meta(&self.ctx, &internal, &active_meta);
             if self.placement_has_remote_chunks(&fresh_placement) {
