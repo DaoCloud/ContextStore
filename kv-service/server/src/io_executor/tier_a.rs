@@ -17,6 +17,8 @@ use std::thread;
 /// Inlined as a constant to avoid depending on libc (CLAUDE.md: don't modify Cargo.toml deps).
 #[cfg(target_os = "linux")]
 const O_DIRECT_FLAG: i32 = 0o40000;
+#[cfg(not(target_os = "linux"))]
+const O_DIRECT_FLAG: i32 = 0;
 
 /// Alignment required by O_DIRECT (Linux standard page size = filesystem block size = NVMe physical sector).
 pub const DIRECT_IO_ALIGN: usize = 4096;

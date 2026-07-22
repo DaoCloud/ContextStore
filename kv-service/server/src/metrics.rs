@@ -5,8 +5,9 @@
 //! Exported metrics:
 //! - L1 cache hits/misses/evictions/size
 //! - L2 reads/writes/bytes/striped_writes
-//! - Per-device capacity and utilization
-//! - gRPC request counters
+//! - Per-device capacity, I/O, and utilization
+//! - Redis metadata operations
+//! - RDMA transfer and connection state
 //!
 //! The HTTP exporter listens on its own port (default 9090) and is started by main.rs.
 
@@ -23,13 +24,11 @@ mod enabled {
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Request, Response, Server, StatusCode};
     use prometheus::{
-        Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-        Registry, TextEncoder,
+        Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+        IntGaugeVec, Opts, Registry, TextEncoder,
     };
     use std::convert::Infallible;
-    use std::fs;
     use std::net::SocketAddr;
-    use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use tracing::info;
@@ -41,7 +40,14 @@ mod enabled {
         pub kvservice_build_info: GaugeVec,
         pub kvservice_request_total: IntCounterVec,
         pub kvservice_request_duration_seconds: HistogramVec,
-        pub kvservice_disk_read_duration_seconds: HistogramVec,
+        pub kvservice_storage_io_total: IntCounterVec,
+        pub kvservice_storage_io_bytes_total: IntCounterVec,
+        pub kvservice_storage_io_duration_seconds: HistogramVec,
+        pub kvservice_storage_io_inflight: IntGaugeVec,
+        pub kvservice_storage_io_errors_total: IntCounterVec,
+        pub kvservice_metadata_operations_total: IntCounterVec,
+        pub kvservice_metadata_operation_duration_seconds: HistogramVec,
+        pub kvservice_metadata_reconnect_total: IntCounter,
         pub kvservice_rdma_transfer_duration_seconds: HistogramVec,
         pub kvservice_cache_hit_total: IntCounterVec,
         pub kvservice_force_disk_read_total: IntCounter,
@@ -49,7 +55,7 @@ mod enabled {
         pub kvservice_nvme_read_bytes_total: IntCounterVec,
         pub kvservice_rdma_bytes_total: IntCounterVec,
         pub kvservice_rdma_errors_total: IntCounterVec,
-        pub kvservice_rdma_connection_state: GaugeVec,
+        pub kvservice_rdma_connections: IntGaugeVec,
 
         pub l1_hits: IntCounter,
         pub l1_misses: IntCounter,
@@ -63,7 +69,6 @@ mod enabled {
         pub l2_striped_writes: IntCounter,
 
         pub device_used_bytes: GaugeVec,
-        pub grpc_requests: IntCounterVec,
     }
 
     impl Default for Metrics {
@@ -104,13 +109,67 @@ mod enabled {
                 &["op"],
             )
             .unwrap();
-            let kvservice_disk_read_duration_seconds = HistogramVec::new(
+            let kvservice_storage_io_total = IntCounterVec::new(
+                Opts::new(
+                    "kvservice_storage_io_total",
+                    "Physical storage I/O operations",
+                ),
+                &["operation", "device", "executor", "mode", "status"],
+            )
+            .unwrap();
+            let kvservice_storage_io_bytes_total = IntCounterVec::new(
+                Opts::new(
+                    "kvservice_storage_io_bytes_total",
+                    "Physical storage I/O bytes",
+                ),
+                &["operation", "device", "executor", "mode"],
+            )
+            .unwrap();
+            let kvservice_storage_io_duration_seconds = HistogramVec::new(
                 HistogramOpts::new(
-                    "kvservice_disk_read_duration_seconds",
-                    "KVService disk read duration",
+                    "kvservice_storage_io_duration_seconds",
+                    "Physical storage I/O duration",
                 )
                 .buckets(duration_buckets()),
-                &["device"],
+                &["operation", "device", "executor", "mode"],
+            )
+            .unwrap();
+            let kvservice_storage_io_inflight = IntGaugeVec::new(
+                Opts::new(
+                    "kvservice_storage_io_inflight",
+                    "In-flight physical storage I/O",
+                ),
+                &["operation", "device", "executor", "mode"],
+            )
+            .unwrap();
+            let kvservice_storage_io_errors_total = IntCounterVec::new(
+                Opts::new(
+                    "kvservice_storage_io_errors_total",
+                    "Physical storage I/O errors",
+                ),
+                &["operation", "device", "executor", "mode", "reason"],
+            )
+            .unwrap();
+            let kvservice_metadata_operations_total = IntCounterVec::new(
+                Opts::new(
+                    "kvservice_metadata_operations_total",
+                    "Redis metadata operations",
+                ),
+                &["operation", "status"],
+            )
+            .unwrap();
+            let kvservice_metadata_operation_duration_seconds = HistogramVec::new(
+                HistogramOpts::new(
+                    "kvservice_metadata_operation_duration_seconds",
+                    "Redis metadata operation duration",
+                )
+                .buckets(duration_buckets()),
+                &["operation"],
+            )
+            .unwrap();
+            let kvservice_metadata_reconnect_total = IntCounter::new(
+                "kvservice_metadata_reconnect_total",
+                "Redis metadata reconnect attempts",
             )
             .unwrap();
             let kvservice_rdma_transfer_duration_seconds = HistogramVec::new(
@@ -155,12 +214,12 @@ mod enabled {
                 &["nic", "type"],
             )
             .unwrap();
-            let kvservice_rdma_connection_state = GaugeVec::new(
+            let kvservice_rdma_connections = IntGaugeVec::new(
                 Opts::new(
-                    "kvservice_rdma_connection_state",
-                    "KVService RDMA connection state",
+                    "kvservice_rdma_connections",
+                    "Active KVService RDMA client connections",
                 ),
-                &["peer"],
+                &["nic"],
             )
             .unwrap();
 
@@ -182,19 +241,29 @@ mod enabled {
                 &["device"],
             )
             .unwrap();
-            let grpc_requests = IntCounterVec::new(
-                Opts::new("grpc_requests_total", "gRPC request count"),
-                &["method", "status"],
-            )
-            .unwrap();
-
             r.register(Box::new(kvservice_up.clone())).unwrap();
             r.register(Box::new(kvservice_build_info.clone())).unwrap();
             r.register(Box::new(kvservice_request_total.clone()))
                 .unwrap();
             r.register(Box::new(kvservice_request_duration_seconds.clone()))
                 .unwrap();
-            r.register(Box::new(kvservice_disk_read_duration_seconds.clone()))
+            r.register(Box::new(kvservice_storage_io_total.clone()))
+                .unwrap();
+            r.register(Box::new(kvservice_storage_io_bytes_total.clone()))
+                .unwrap();
+            r.register(Box::new(kvservice_storage_io_duration_seconds.clone()))
+                .unwrap();
+            r.register(Box::new(kvservice_storage_io_inflight.clone()))
+                .unwrap();
+            r.register(Box::new(kvservice_storage_io_errors_total.clone()))
+                .unwrap();
+            r.register(Box::new(kvservice_metadata_operations_total.clone()))
+                .unwrap();
+            r.register(Box::new(
+                kvservice_metadata_operation_duration_seconds.clone(),
+            ))
+            .unwrap();
+            r.register(Box::new(kvservice_metadata_reconnect_total.clone()))
                 .unwrap();
             r.register(Box::new(kvservice_rdma_transfer_duration_seconds.clone()))
                 .unwrap();
@@ -210,7 +279,7 @@ mod enabled {
                 .unwrap();
             r.register(Box::new(kvservice_rdma_errors_total.clone()))
                 .unwrap();
-            r.register(Box::new(kvservice_rdma_connection_state.clone()))
+            r.register(Box::new(kvservice_rdma_connections.clone()))
                 .unwrap();
             r.register(Box::new(l1_hits.clone())).unwrap();
             r.register(Box::new(l1_misses.clone())).unwrap();
@@ -222,15 +291,20 @@ mod enabled {
             r.register(Box::new(l2_bytes_written.clone())).unwrap();
             r.register(Box::new(l2_striped_writes.clone())).unwrap();
             r.register(Box::new(device_used_bytes.clone())).unwrap();
-            r.register(Box::new(grpc_requests.clone())).unwrap();
-
             Self {
                 registry: r,
                 kvservice_up,
                 kvservice_build_info,
                 kvservice_request_total,
                 kvservice_request_duration_seconds,
-                kvservice_disk_read_duration_seconds,
+                kvservice_storage_io_total,
+                kvservice_storage_io_bytes_total,
+                kvservice_storage_io_duration_seconds,
+                kvservice_storage_io_inflight,
+                kvservice_storage_io_errors_total,
+                kvservice_metadata_operations_total,
+                kvservice_metadata_operation_duration_seconds,
+                kvservice_metadata_reconnect_total,
                 kvservice_rdma_transfer_duration_seconds,
                 kvservice_cache_hit_total,
                 kvservice_force_disk_read_total,
@@ -238,7 +312,7 @@ mod enabled {
                 kvservice_nvme_read_bytes_total,
                 kvservice_rdma_bytes_total,
                 kvservice_rdma_errors_total,
-                kvservice_rdma_connection_state,
+                kvservice_rdma_connections,
                 l1_hits,
                 l1_misses,
                 l1_evictions,
@@ -249,7 +323,6 @@ mod enabled {
                 l2_bytes_written,
                 l2_striped_writes,
                 device_used_bytes,
-                grpc_requests,
             }
         }
 
@@ -283,7 +356,7 @@ mod enabled {
             self.l2_striped_writes
                 .inc_by(st.striped_writes.load(Ordering::Relaxed));
 
-            for (i, dev) in ctx.router.devices().iter().enumerate() {
+            for (i, _) in ctx.router.devices().iter().enumerate() {
                 let device = format!("nvme{}", i);
                 let read_bytes = ctx.storage.device_read_bytes(i);
                 let read_counter = self
@@ -291,8 +364,7 @@ mod enabled {
                     .with_label_values(&[&device]);
                 read_counter.reset();
                 read_counter.inc_by(read_bytes);
-                let data_dir = dev.join(&ctx.config.storage.data_subdir).join("data");
-                let used_bytes = dir_size_bytes(&data_dir);
+                let used_bytes = ctx.storage.device_used_bytes(i);
                 self.device_used_bytes
                     .with_label_values(&[&device])
                     .set(used_bytes as f64);
@@ -308,10 +380,74 @@ mod enabled {
                 .observe(duration_seconds);
         }
 
-        pub fn record_disk_read_duration(&self, device: &str, duration_seconds: f64) {
-            self.kvservice_disk_read_duration_seconds
-                .with_label_values(&[device])
+        pub fn storage_io_started(
+            &self,
+            operation: &str,
+            device: &str,
+            executor: &str,
+            mode: &str,
+        ) {
+            self.kvservice_storage_io_inflight
+                .with_label_values(&[operation, device, executor, mode])
+                .inc();
+        }
+
+        pub fn record_storage_io(
+            &self,
+            operation: &str,
+            device: &str,
+            executor: &str,
+            mode: &str,
+            status: &str,
+            bytes: u64,
+            duration_seconds: f64,
+        ) {
+            let labels = &[operation, device, executor, mode];
+            self.kvservice_storage_io_inflight
+                .with_label_values(labels)
+                .dec();
+            self.kvservice_storage_io_total
+                .with_label_values(&[operation, device, executor, mode, status])
+                .inc();
+            self.kvservice_storage_io_duration_seconds
+                .with_label_values(labels)
                 .observe(duration_seconds);
+            if status == "ok" && bytes > 0 {
+                self.kvservice_storage_io_bytes_total
+                    .with_label_values(labels)
+                    .inc_by(bytes);
+            }
+        }
+
+        pub fn record_storage_io_error(
+            &self,
+            operation: &str,
+            device: &str,
+            executor: &str,
+            mode: &str,
+            reason: &str,
+        ) {
+            self.kvservice_storage_io_errors_total
+                .with_label_values(&[operation, device, executor, mode, reason])
+                .inc();
+        }
+
+        pub fn record_metadata_operation(
+            &self,
+            operation: &str,
+            status: &str,
+            duration_seconds: f64,
+        ) {
+            self.kvservice_metadata_operations_total
+                .with_label_values(&[operation, status])
+                .inc();
+            self.kvservice_metadata_operation_duration_seconds
+                .with_label_values(&[operation])
+                .observe(duration_seconds);
+        }
+
+        pub fn record_metadata_reconnect(&self) {
+            self.kvservice_metadata_reconnect_total.inc();
         }
 
         pub fn record_cache_hit(&self, tier: &str) {
@@ -353,10 +489,10 @@ mod enabled {
                 .inc();
         }
 
-        pub fn set_rdma_connection_state(&self, peer: &str, connected: bool) {
-            self.kvservice_rdma_connection_state
-                .with_label_values(&[peer])
-                .set(if connected { 1.0 } else { 0.0 });
+        pub fn change_rdma_connections(&self, nic: &str, delta: i64) {
+            self.kvservice_rdma_connections
+                .with_label_values(&[nic])
+                .add(delta);
         }
     }
 
@@ -421,28 +557,6 @@ mod enabled {
         }
     }
 
-    fn dir_size_bytes(path: &Path) -> u64 {
-        let entries = match fs::read_dir(path) {
-            Ok(entries) => entries,
-            Err(_) => return 0,
-        };
-
-        let mut total = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() {
-                total += dir_size_bytes(&path);
-            } else if file_type.is_file() {
-                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
-            }
-        }
-        total
-    }
-
     fn duration_buckets() -> Vec<f64> {
         vec![
             0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
@@ -472,6 +586,7 @@ mod enabled {
         use crate::config::Config;
         use crate::KVServiceContext;
         use prost::bytes::Bytes;
+        use std::sync::Arc;
         use tempfile::TempDir;
 
         fn make_test_config(tmp: &TempDir) -> Config {
@@ -485,7 +600,10 @@ mod enabled {
         #[test]
         fn render_metrics_exports_contextstore_counters() {
             let tmp = TempDir::new().unwrap();
-            let ctx = KVServiceContext::new(make_test_config(&tmp)).unwrap();
+            let metrics = Arc::new(Metrics::new());
+            let ctx =
+                KVServiceContext::new_with_metrics(make_test_config(&tmp), Some(metrics.clone()))
+                    .unwrap();
             let key = crate::router::ObjectKey {
                 namespace: "metrics-test".to_string(),
                 object_key: "abcdef".to_string(),
@@ -511,8 +629,10 @@ mod enabled {
                 .put(&key, Bytes::from_static(b"abc"), meta)
                 .unwrap();
             ctx.memory.get(&key).unwrap();
+            metrics.record_metadata_operation("get_block", "ok", 0.001);
+            metrics.record_metadata_reconnect();
+            metrics.change_rdma_connections("nic0", 1);
 
-            let metrics = Metrics::new();
             let body = render_metrics(&ctx, &metrics).unwrap();
             let text = String::from_utf8(body).unwrap();
 
@@ -523,6 +643,17 @@ mod enabled {
             assert!(text.contains("kvservice_up 1"));
             assert!(text.contains("kvservice_cache_hit_total{tier=\"l1\"} 1"));
             assert!(text.contains("kvservice_nvme_read_bytes_total{device=\"nvme0\"} 0"));
+            assert!(text.contains(
+                "kvservice_storage_io_total{device=\"nvme0\",executor=\"tier_a\",mode=\"buffered\",operation=\"write\",status=\"ok\"} 1"
+            ));
+            assert!(text.contains(
+                "kvservice_storage_io_bytes_total{device=\"nvme0\",executor=\"tier_a\",mode=\"buffered\",operation=\"write\"} 3"
+            ));
+            assert!(text.contains(
+                "kvservice_metadata_operations_total{operation=\"get_block\",status=\"ok\"} 1"
+            ));
+            assert!(text.contains("kvservice_metadata_reconnect_total 1"));
+            assert!(text.contains("kvservice_rdma_connections{nic=\"nic0\"} 1"));
         }
     }
 }
@@ -547,7 +678,42 @@ mod disabled {
         }
         pub fn refresh(&self, _ctx: &KVServiceContext) {}
         pub fn record_request(&self, _op: &str, _status: &str, _duration_seconds: f64) {}
-        pub fn record_disk_read_duration(&self, _device: &str, _duration_seconds: f64) {}
+        pub fn storage_io_started(
+            &self,
+            _operation: &str,
+            _device: &str,
+            _executor: &str,
+            _mode: &str,
+        ) {
+        }
+        pub fn record_storage_io(
+            &self,
+            _operation: &str,
+            _device: &str,
+            _executor: &str,
+            _mode: &str,
+            _status: &str,
+            _bytes: u64,
+            _duration_seconds: f64,
+        ) {
+        }
+        pub fn record_storage_io_error(
+            &self,
+            _operation: &str,
+            _device: &str,
+            _executor: &str,
+            _mode: &str,
+            _reason: &str,
+        ) {
+        }
+        pub fn record_metadata_operation(
+            &self,
+            _operation: &str,
+            _status: &str,
+            _duration_seconds: f64,
+        ) {
+        }
+        pub fn record_metadata_reconnect(&self) {}
         pub fn record_cache_hit(&self, _tier: &str) {}
         pub fn record_force_disk_read(&self) {}
         pub fn record_fallback(&self, _from: &str, _to: &str, _reason: &str) {}
@@ -560,7 +726,7 @@ mod disabled {
         ) {
         }
         pub fn record_rdma_error(&self, _nic: &str, _error_type: &str) {}
-        pub fn set_rdma_connection_state(&self, _peer: &str, _connected: bool) {}
+        pub fn change_rdma_connections(&self, _nic: &str, _delta: i64) {}
     }
 
     pub async fn serve_metrics(

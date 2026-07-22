@@ -11,13 +11,15 @@ use crate::config::Config;
 use crate::error::{KVError, Result};
 use crate::io_executor::{create_executor, IOExecutor, IORequest};
 use crate::metadata::{BlockMeta, MetadataService, StripingInfo};
+use crate::metrics::Metrics;
 use crate::router::{ObjectKey, ShardRouter};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use prost::bytes::{Bytes, BytesMut};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 use twox_hash::xxh3::hash64;
 
@@ -28,6 +30,8 @@ pub struct StorageTier {
     write_locks: DashMap<String, Arc<Mutex<()>>>,
     striping_threshold: u64,
     striping_chunk_size: u64,
+    executor_name: String,
+    metrics: Option<Arc<Metrics>>,
 
     // ===== Stats (exported to Prometheus) =====
     pub reads_total: AtomicU64,
@@ -36,17 +40,28 @@ pub struct StorageTier {
     pub bytes_written: AtomicU64,
     pub striped_writes: AtomicU64,
     pub device_read_bytes_total: Arc<Vec<AtomicU64>>,
+    pub device_used_bytes_total: Arc<Vec<AtomicU64>>,
 }
 
 impl StorageTier {
     pub fn new(config: &Config, router: Arc<ShardRouter>) -> Result<Self> {
+        Self::new_with_metrics(config, router, None)
+    }
+
+    pub fn new_with_metrics(
+        config: &Config,
+        router: Arc<ShardRouter>,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Result<Self> {
         let executor = create_executor(config)?;
-        let metadata = Arc::new(MetadataService::new(config)?);
+        let metadata = Arc::new(MetadataService::new_with_metrics(config, metrics.clone())?);
         let num_devices = router.num_devices();
         // Create the root directory for each device.
+        let mut device_used_bytes_total = Vec::with_capacity(num_devices);
         for device in router.devices() {
             let root = device.join(&config.storage.data_subdir).join("data");
             std::fs::create_dir_all(&root).ok();
+            device_used_bytes_total.push(AtomicU64::new(directory_size_bytes(&root)));
         }
         Ok(Self {
             router,
@@ -55,6 +70,8 @@ impl StorageTier {
             write_locks: DashMap::new(),
             striping_threshold: config.storage.striping_threshold,
             striping_chunk_size: config.storage.striping_chunk_size.max(1),
+            executor_name: config.io_executor.kind.clone(),
+            metrics,
             reads_total: AtomicU64::new(0),
             writes_total: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
@@ -63,6 +80,7 @@ impl StorageTier {
             device_read_bytes_total: Arc::new(
                 (0..num_devices).map(|_| AtomicU64::new(0)).collect(),
             ),
+            device_used_bytes_total: Arc::new(device_used_bytes_total),
         })
     }
 
@@ -89,10 +107,166 @@ impl StorageTier {
             .unwrap_or(0)
     }
 
+    pub fn device_used_bytes(&self, device_id: usize) -> u64 {
+        self.device_used_bytes_total
+            .get(device_id)
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     fn record_device_read(&self, device_id: usize, bytes: u64) {
         if let Some(counter) = self.device_read_bytes_total.get(device_id) {
             counter.fetch_add(bytes, Ordering::Relaxed);
         }
+    }
+
+    fn record_device_write(&self, device_id: usize, bytes: u64) {
+        if let Some(counter) = self.device_used_bytes_total.get(device_id) {
+            counter.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn record_device_delete(&self, device_id: usize, bytes: u64) {
+        if let Some(counter) = self.device_used_bytes_total.get(device_id) {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+        }
+    }
+
+    fn observe_io<T>(
+        &self,
+        operation: &'static str,
+        device_id: usize,
+        mode: &'static str,
+        bytes: u64,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(metrics) = &self.metrics else {
+            return work();
+        };
+        let device = format!("nvme{}", device_id);
+        metrics.storage_io_started(operation, &device, &self.executor_name, mode);
+        let started = Instant::now();
+        let result = work();
+        let status = if result.is_ok() { "ok" } else { "error" };
+        metrics.record_storage_io(
+            operation,
+            &device,
+            &self.executor_name,
+            mode,
+            status,
+            bytes,
+            started.elapsed().as_secs_f64(),
+        );
+        if result.is_err() {
+            metrics.record_storage_io_error(
+                operation,
+                &device,
+                &self.executor_name,
+                mode,
+                "io_error",
+            );
+        }
+        result
+    }
+
+    fn write_file_on_device(&self, device_id: usize, path: &Path, data: &[u8]) -> Result<()> {
+        let bytes = data.len() as u64;
+        let result = self.observe_io("write", device_id, "buffered", bytes, || {
+            self.executor.write_file(path, data)
+        });
+        if result.is_ok() {
+            self.record_device_write(device_id, bytes);
+        }
+        result
+    }
+
+    fn read_file_on_device(&self, device_id: usize, path: &Path) -> Result<Vec<u8>> {
+        let result = self.observe_io("read", device_id, "buffered", 0, || {
+            self.executor.read_file(path)
+        });
+        if let Ok(data) = &result {
+            if let Some(metrics) = &self.metrics {
+                let device = format!("nvme{}", device_id);
+                metrics
+                    .kvservice_storage_io_bytes_total
+                    .with_label_values(&["read", &device, &self.executor_name, "buffered"])
+                    .inc_by(data.len() as u64);
+            }
+        }
+        result
+    }
+
+    fn delete_file_on_device(&self, device_id: usize, path: &Path) -> Result<()> {
+        let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        let result = self.observe_io("delete", device_id, "buffered", bytes, || {
+            self.executor.delete_file(path)
+        });
+        if result.is_ok() {
+            self.record_device_delete(device_id, bytes);
+        }
+        result
+    }
+
+    fn observe_io_batch<T>(
+        &self,
+        operation: &'static str,
+        mode: &'static str,
+        device_ids: &[usize],
+        bytes: &[u64],
+        work: impl FnOnce() -> Vec<Result<T>>,
+    ) -> Vec<Result<T>> {
+        let Some(metrics) = &self.metrics else {
+            return work();
+        };
+        let devices: Vec<String> = device_ids
+            .iter()
+            .map(|device_id| format!("nvme{}", device_id))
+            .collect();
+        for device in &devices {
+            metrics.storage_io_started(operation, device, &self.executor_name, mode);
+        }
+        let started = Instant::now();
+        let results = work();
+        let duration_seconds = started.elapsed().as_secs_f64();
+        for (index, result) in results.iter().enumerate() {
+            let device = devices.get(index).map(String::as_str).unwrap_or("unknown");
+            let status = if result.is_ok() { "ok" } else { "error" };
+            metrics.record_storage_io(
+                operation,
+                device,
+                &self.executor_name,
+                mode,
+                status,
+                if result.is_ok() {
+                    bytes.get(index).copied().unwrap_or(0)
+                } else {
+                    0
+                },
+                duration_seconds,
+            );
+            if result.is_err() {
+                metrics.record_storage_io_error(
+                    operation,
+                    device,
+                    &self.executor_name,
+                    mode,
+                    "io_error",
+                );
+            }
+        }
+        results
+    }
+
+    fn device_id_for_path(&self, path: &Path) -> Option<usize> {
+        self.router
+            .devices()
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| path.starts_with(device))
+            .max_by_key(|(_, device)| device.components().count())
+            .map(|(device_id, _)| device_id)
     }
 
     fn meta_path_or_route(&self, key: &ObjectKey, meta: &BlockMeta) -> PathBuf {
@@ -114,15 +288,25 @@ impl StorageTier {
 
     fn delete_paths_best_effort(&self, paths: &[PathBuf]) {
         for path in paths {
-            let _ = self.executor.delete_file(path);
+            if let Some(device_id) = self.device_id_for_path(path) {
+                let _ = self.delete_file_on_device(device_id, path);
+            } else {
+                let _ = self.executor.delete_file(path);
+            }
         }
     }
 
     fn delete_files_for_meta(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<()> {
         if let Some(stripe) = &meta.striping {
             let mut last_err = None;
-            for path in &stripe.chunk_paths {
-                if let Err(e) = self.executor.delete_file(std::path::Path::new(path)) {
+            for (index, path) in stripe.chunk_paths.iter().enumerate() {
+                let device_id = stripe
+                    .chunk_devices
+                    .get(index)
+                    .copied()
+                    .map(|device_id| device_id as usize)
+                    .unwrap_or_else(|| self.device_id_for_path(Path::new(path)).unwrap_or(0));
+                if let Err(e) = self.delete_file_on_device(device_id, Path::new(path)) {
                     last_err = Some(e);
                 }
             }
@@ -131,7 +315,7 @@ impl StorageTier {
             }
         } else {
             let path = self.meta_path_or_route(key, meta);
-            self.executor.delete_file(&path)?;
+            self.delete_file_on_device(self.meta_device_or_route(key, meta), &path)?;
         }
         Ok(())
     }
@@ -277,7 +461,7 @@ impl StorageTier {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        self.executor.write_file(&path, &data)?;
+        self.write_file_on_device(device_id, &path, &data)?;
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -330,7 +514,8 @@ impl StorageTier {
         if !self.executor.file_exists(&path) {
             return Ok(None);
         }
-        let data = self.executor.read_file(&path)?;
+        let device_id = self.device_id_for_path(&path).unwrap_or(0);
+        let data = self.read_file_on_device(device_id, &path)?;
         if expected_len > 0 && data.len() as u64 != expected_len {
             return Err(KVError::Internal(format!(
                 "placement chunk length mismatch: expected {} got {} ({})",
@@ -351,7 +536,8 @@ impl StorageTier {
         let path = PathBuf::from(storage_handle);
         self.ensure_managed_path(&path)?;
         let existed = self.executor.file_exists(&path);
-        self.executor.delete_file(&path)?;
+        let device_id = self.device_id_for_path(&path).unwrap_or(0);
+        self.delete_file_on_device(device_id, &path)?;
         Ok(existed)
     }
 
@@ -393,7 +579,7 @@ impl StorageTier {
             return Ok(None);
         }
         debug!("L2 GET {} -> {}", str_key, path.display());
-        let data = self.executor.read_file(&path)?;
+        let data = self.read_file_on_device(self.meta_device_or_route(key, &meta), &path)?;
         self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_read
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -430,7 +616,7 @@ impl StorageTier {
         );
         let nbytes = data.len();
         // Non-striping single path: write_file takes &[u8]; data is only borrowed here, no copy.
-        self.executor.write_file(&path, &data)?;
+        self.write_file_on_device(device_id, &path, &data)?;
         meta.file_path = path.to_string_lossy().to_string();
         meta.size = nbytes as u64;
         meta.device_id = device_id as u32;
@@ -467,7 +653,7 @@ impl StorageTier {
             std::fs::create_dir_all(parent).ok();
         }
         let nbytes = data.len();
-        self.executor.write_file(&path, &data)?;
+        self.write_file_on_device(device_id, &path, &data)?;
         meta.file_path = path.to_string_lossy().to_string();
         meta.size = nbytes as u64;
         meta.device_id = device_id as u32;
@@ -609,10 +795,14 @@ impl StorageTier {
                 offset: 0,
                 length: total,
             };
-            let results = self.executor.write_aligned_batch(vec![(req, ptr, total)]);
+            let results =
+                self.observe_io_batch("write", "o_direct", &[device_id], &[total as u64], || {
+                    self.executor.write_aligned_batch(vec![(req, ptr, total)])
+                });
             results.into_iter().next().unwrap_or_else(|| {
                 Err(KVError::Internal("write_aligned_batch empty result".into()))
             })?;
+            self.record_device_write(device_id, total as u64);
             meta.file_path = path.to_string_lossy().to_string();
             meta.size = total as u64;
             meta.device_id = device_id as u32;
@@ -695,7 +885,20 @@ impl StorageTier {
             total
         );
 
-        let results = self.executor.write_aligned_batch(io_items);
+        let device_ids = chunk_devices
+            .iter()
+            .map(|id| *id as usize)
+            .collect::<Vec<_>>();
+        let write_bytes = io_items
+            .iter()
+            .map(|(request, _, length)| {
+                debug_assert_eq!(request.length, *length);
+                *length as u64
+            })
+            .collect::<Vec<_>>();
+        let results = self.observe_io_batch("write", "o_direct", &device_ids, &write_bytes, || {
+            self.executor.write_aligned_batch(io_items)
+        });
         for (i, r) in results.into_iter().enumerate() {
             if let Err(e) = r {
                 // Roll back the stripe files already written.
@@ -704,6 +907,7 @@ impl StorageTier {
                 }
                 return Err(e);
             }
+            self.record_device_write(device_ids[i], write_bytes[i]);
         }
 
         meta.size = total as u64;
@@ -958,7 +1162,17 @@ impl StorageTier {
             total
         );
 
-        let results = self.executor.write_batch_vectored(io_items);
+        let device_ids = chunk_devices
+            .iter()
+            .map(|id| *id as usize)
+            .collect::<Vec<_>>();
+        let write_bytes = io_items
+            .iter()
+            .map(|(request, _)| request.length as u64)
+            .collect::<Vec<_>>();
+        let results = self.observe_io_batch("write", "vectored", &device_ids, &write_bytes, || {
+            self.executor.write_batch_vectored(io_items)
+        });
         for (i, r) in results.into_iter().enumerate() {
             if let Err(e) = r {
                 // Roll back the stripe files already written.
@@ -967,6 +1181,7 @@ impl StorageTier {
                 }
                 return Err(e);
             }
+            self.record_device_write(device_ids[i], write_bytes[i]);
         }
 
         meta.size = total as u64;
@@ -1035,7 +1250,26 @@ impl StorageTier {
 
         // O_DIRECT takes read_aligned_batch (tier_a override); buffered fallback takes the trait
         // default.
-        let results = self.executor.read_aligned_batch(&reqs);
+        let device_ids = stripe
+            .chunk_devices
+            .iter()
+            .map(|device_id| *device_id as usize)
+            .collect::<Vec<_>>();
+        let read_bytes = stripe
+            .chunk_paths
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let offset = index as u64 * stripe.chunk_size;
+                stripe
+                    .total_size
+                    .saturating_sub(offset)
+                    .min(stripe.chunk_size)
+            })
+            .collect::<Vec<_>>();
+        let results = self.observe_io_batch("read", "o_direct", &device_ids, &read_bytes, || {
+            self.executor.read_aligned_batch(&reqs)
+        });
         let mut out: Vec<Bytes> = Vec::with_capacity(results.len());
         for (i, r) in results.into_iter().enumerate() {
             let chunk = r.map_err(|e| {
@@ -1083,7 +1317,7 @@ impl StorageTier {
             self.delete_metadata_if_current(key, meta)?;
             return Ok(None);
         }
-        let data = self.executor.read_file(&path)?;
+        let data = self.read_file_on_device(self.meta_device_or_route(key, meta), &path)?;
         self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_read
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1117,7 +1351,7 @@ impl StorageTier {
             self.delete_metadata_if_current(key, meta)?;
             return Ok(None);
         }
-        let data = self.executor.read_file(&path)?;
+        let data = self.read_file_on_device(self.meta_device_or_route(key, meta), &path)?;
         self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_read
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1169,9 +1403,12 @@ impl StorageTier {
                 offset: 0,
                 length: 0,
             };
-            let results = self
-                .executor
-                .read_aligned_into_ptr_batch(vec![(req, ptr, capacity)]);
+            let device_id = self.meta_device_or_route(key, &meta);
+            let results =
+                self.observe_io_batch("read", "o_direct", &[device_id], &[meta.size], || {
+                    self.executor
+                        .read_aligned_into_ptr_batch(vec![(req, ptr, capacity)])
+                });
             let bytes_read = results
                 .into_iter()
                 .next()
@@ -1224,7 +1461,26 @@ impl StorageTier {
         }
 
         // Read 8 offsets of ptr in parallel (tier_b groups by device across different rings).
-        let results = self.executor.read_aligned_into_ptr_batch(reqs);
+        let device_ids = stripe
+            .chunk_devices
+            .iter()
+            .map(|device_id| *device_id as usize)
+            .collect::<Vec<_>>();
+        let read_bytes = stripe
+            .chunk_paths
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let offset = index as u64 * stripe.chunk_size;
+                stripe
+                    .total_size
+                    .saturating_sub(offset)
+                    .min(stripe.chunk_size)
+            })
+            .collect::<Vec<_>>();
+        let results = self.observe_io_batch("read", "o_direct", &device_ids, &read_bytes, || {
+            self.executor.read_aligned_into_ptr_batch(reqs)
+        });
         let mut total_read = 0usize;
         for (i, r) in results.into_iter().enumerate() {
             let n = match r {
@@ -1491,7 +1747,7 @@ impl StorageTier {
             self.delete_metadata_if_current(key, &meta)?;
             return Ok(None);
         }
-        let data = self.executor.read_file(&path)?;
+        let data = self.read_file_on_device(self.meta_device_or_route(key, &meta), &path)?;
         self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_read
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1578,7 +1834,17 @@ impl StorageTier {
                 length: r.length,
             })
             .collect();
-        let read_results = self.executor.read_batch(&reqs);
+        let device_ids = io_reqs
+            .iter()
+            .map(|(_, _, _, device_id)| *device_id)
+            .collect::<Vec<_>>();
+        let read_bytes = io_reqs
+            .iter()
+            .map(|(_, _, meta, _)| meta.size)
+            .collect::<Vec<_>>();
+        let read_results = self.observe_io_batch("read", "batch", &device_ids, &read_bytes, || {
+            self.executor.read_batch(&reqs)
+        });
 
         // 4. Fill results back in.
         for ((idx, _, meta, device_id), data_res) in
@@ -1610,6 +1876,25 @@ impl StorageTier {
             .map(|(key, data, meta)| self.put(&key, data, meta))
             .collect()
     }
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => directory_size_bytes(&path),
+                Ok(file_type) if file_type.is_file() => {
+                    entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                }
+                _ => 0,
+            }
+        })
+        .sum()
 }
 
 #[cfg(test)]
