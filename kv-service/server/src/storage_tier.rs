@@ -31,6 +31,7 @@ pub struct StorageTier {
     striping_threshold: u64,
     striping_chunk_size: u64,
     executor_name: String,
+    device_labels: Vec<String>,
     metrics: Option<Arc<Metrics>>,
 
     // ===== Stats (exported to Prometheus) =====
@@ -71,6 +72,9 @@ impl StorageTier {
             striping_threshold: config.storage.striping_threshold,
             striping_chunk_size: config.storage.striping_chunk_size.max(1),
             executor_name: config.io_executor.kind.clone(),
+            device_labels: (0..num_devices)
+                .map(|device_id| format!("nvme{}", device_id))
+                .collect(),
             metrics,
             reads_total: AtomicU64::new(0),
             writes_total: AtomicU64::new(0),
@@ -134,6 +138,17 @@ impl StorageTier {
         }
     }
 
+    fn device_label(&self, device_id: usize) -> &str {
+        self.device_labels
+            .get(device_id)
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    }
+
+    fn file_size(path: &Path) -> u64 {
+        std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    }
+
     fn observe_io<T>(
         &self,
         operation: &'static str,
@@ -145,14 +160,14 @@ impl StorageTier {
         let Some(metrics) = &self.metrics else {
             return work();
         };
-        let device = format!("nvme{}", device_id);
-        metrics.storage_io_started(operation, &device, &self.executor_name, mode);
+        let device = self.device_label(device_id);
+        metrics.storage_io_started(operation, device, &self.executor_name, mode);
         let started = Instant::now();
         let result = work();
         let status = if result.is_ok() { "ok" } else { "error" };
         metrics.record_storage_io(
             operation,
-            &device,
+            device,
             &self.executor_name,
             mode,
             status,
@@ -162,7 +177,7 @@ impl StorageTier {
         if result.is_err() {
             metrics.record_storage_io_error(
                 operation,
-                &device,
+                device,
                 &self.executor_name,
                 mode,
                 "io_error",
@@ -177,7 +192,7 @@ impl StorageTier {
             self.executor.write_file(path, data)
         });
         if result.is_ok() {
-            self.record_device_write(device_id, bytes);
+            self.record_device_write(device_id, Self::file_size(path));
         }
         result
     }
@@ -188,18 +203,20 @@ impl StorageTier {
         });
         if let Ok(data) = &result {
             if let Some(metrics) = &self.metrics {
-                let device = format!("nvme{}", device_id);
-                metrics
-                    .kvservice_storage_io_bytes_total
-                    .with_label_values(&["read", &device, &self.executor_name, "buffered"])
-                    .inc_by(data.len() as u64);
+                metrics.record_storage_io_bytes(
+                    "read",
+                    self.device_label(device_id),
+                    &self.executor_name,
+                    "buffered",
+                    data.len() as u64,
+                );
             }
         }
         result
     }
 
     fn delete_file_on_device(&self, device_id: usize, path: &Path) -> Result<()> {
-        let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        let bytes = Self::file_size(path);
         let result = self.observe_io("delete", device_id, "buffered", bytes, || {
             self.executor.delete_file(path)
         });
@@ -220,39 +237,49 @@ impl StorageTier {
         let Some(metrics) = &self.metrics else {
             return work();
         };
-        let devices: Vec<String> = device_ids
-            .iter()
-            .map(|device_id| format!("nvme{}", device_id))
-            .collect();
-        for device in &devices {
-            metrics.storage_io_started(operation, device, &self.executor_name, mode);
+        for device_id in device_ids {
+            metrics.storage_io_started(
+                operation,
+                self.device_label(*device_id),
+                &self.executor_name,
+                mode,
+            );
         }
         let started = Instant::now();
         let results = work();
         let duration_seconds = started.elapsed().as_secs_f64();
-        for (index, result) in results.iter().enumerate() {
-            let device = devices.get(index).map(String::as_str).unwrap_or("unknown");
-            let status = if result.is_ok() { "ok" } else { "error" };
+        for (index, device_id) in device_ids.iter().enumerate() {
+            let device = self.device_label(*device_id);
+            let result = results.get(index);
+            let status = match result {
+                Some(Ok(_)) => "ok",
+                Some(Err(_)) => "error",
+                None => "incomplete",
+            };
             metrics.record_storage_io(
                 operation,
                 device,
                 &self.executor_name,
                 mode,
                 status,
-                if result.is_ok() {
+                if matches!(result, Some(Ok(_))) {
                     bytes.get(index).copied().unwrap_or(0)
                 } else {
                     0
                 },
                 duration_seconds,
             );
-            if result.is_err() {
+            if !matches!(result, Some(Ok(_))) {
                 metrics.record_storage_io_error(
                     operation,
                     device,
                     &self.executor_name,
                     mode,
-                    "io_error",
+                    if result.is_some() {
+                        "io_error"
+                    } else {
+                        "incomplete_result"
+                    },
                 );
             }
         }
@@ -305,7 +332,13 @@ impl StorageTier {
                     .get(index)
                     .copied()
                     .map(|device_id| device_id as usize)
-                    .unwrap_or_else(|| self.device_id_for_path(Path::new(path)).unwrap_or(0));
+                    .or_else(|| self.device_id_for_path(Path::new(path)))
+                    .ok_or_else(|| {
+                        KVError::InvalidArgument(format!(
+                            "unable to identify storage device for {}",
+                            path
+                        ))
+                    })?;
                 if let Err(e) = self.delete_file_on_device(device_id, Path::new(path)) {
                     last_err = Some(e);
                 }
@@ -514,7 +547,12 @@ impl StorageTier {
         if !self.executor.file_exists(&path) {
             return Ok(None);
         }
-        let device_id = self.device_id_for_path(&path).unwrap_or(0);
+        let device_id = self.device_id_for_path(&path).ok_or_else(|| {
+            KVError::InvalidArgument(format!(
+                "unable to identify storage device for {}",
+                path.display()
+            ))
+        })?;
         let data = self.read_file_on_device(device_id, &path)?;
         if expected_len > 0 && data.len() as u64 != expected_len {
             return Err(KVError::Internal(format!(
@@ -536,7 +574,12 @@ impl StorageTier {
         let path = PathBuf::from(storage_handle);
         self.ensure_managed_path(&path)?;
         let existed = self.executor.file_exists(&path);
-        let device_id = self.device_id_for_path(&path).unwrap_or(0);
+        let device_id = self.device_id_for_path(&path).ok_or_else(|| {
+            KVError::InvalidArgument(format!(
+                "unable to identify storage device for {}",
+                path.display()
+            ))
+        })?;
         self.delete_file_on_device(device_id, &path)?;
         Ok(existed)
     }
@@ -802,7 +845,7 @@ impl StorageTier {
             results.into_iter().next().unwrap_or_else(|| {
                 Err(KVError::Internal("write_aligned_batch empty result".into()))
             })?;
-            self.record_device_write(device_id, total as u64);
+            self.record_device_write(device_id, Self::file_size(&path));
             meta.file_path = path.to_string_lossy().to_string();
             meta.size = total as u64;
             meta.device_id = device_id as u32;
@@ -907,7 +950,7 @@ impl StorageTier {
                 }
                 return Err(e);
             }
-            self.record_device_write(device_ids[i], write_bytes[i]);
+            self.record_device_write(device_ids[i], Self::file_size(Path::new(&chunk_paths[i])));
         }
 
         meta.size = total as u64;
@@ -1181,7 +1224,7 @@ impl StorageTier {
                 }
                 return Err(e);
             }
-            self.record_device_write(device_ids[i], write_bytes[i]);
+            self.record_device_write(device_ids[i], Self::file_size(Path::new(&chunk_paths[i])));
         }
 
         meta.size = total as u64;

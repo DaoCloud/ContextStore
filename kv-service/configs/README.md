@@ -196,7 +196,10 @@ Key metrics for performance tuning include:
 - `kvservice_storage_io_total`, `kvservice_storage_io_bytes_total`,
   `kvservice_storage_io_duration_seconds`, and
   `kvservice_storage_io_inflight` for per-device I/O throughput, latency, and
-  concurrency.
+  concurrency. For `mode="batch"`, `vectored`, and `o_direct` striped I/O,
+  the duration is the wall-clock submission-to-completion time of the parallel
+  batch and is emitted for each participating device; it is not a per-device
+  device-service-time measurement.
 - `kvservice_metadata_operations_total`,
   `kvservice_metadata_operation_duration_seconds`, and
   `kvservice_metadata_reconnect_total` for Redis metadata pressure.

@@ -392,6 +392,7 @@ mod enabled {
                 .inc();
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub fn record_storage_io(
             &self,
             operation: &str,
@@ -430,6 +431,21 @@ mod enabled {
             self.kvservice_storage_io_errors_total
                 .with_label_values(&[operation, device, executor, mode, reason])
                 .inc();
+        }
+
+        pub fn record_storage_io_bytes(
+            &self,
+            operation: &str,
+            device: &str,
+            executor: &str,
+            mode: &str,
+            bytes: u64,
+        ) {
+            if bytes > 0 {
+                self.kvservice_storage_io_bytes_total
+                    .with_label_values(&[operation, device, executor, mode])
+                    .inc_by(bytes);
+            }
         }
 
         pub fn record_metadata_operation(
@@ -704,6 +720,15 @@ mod disabled {
             _executor: &str,
             _mode: &str,
             _reason: &str,
+        ) {
+        }
+        pub fn record_storage_io_bytes(
+            &self,
+            _operation: &str,
+            _device: &str,
+            _executor: &str,
+            _mode: &str,
+            _bytes: u64,
         ) {
         }
         pub fn record_metadata_operation(
