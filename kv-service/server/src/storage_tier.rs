@@ -327,18 +327,19 @@ impl StorageTier {
         if let Some(stripe) = &meta.striping {
             let mut last_err = None;
             for (index, path) in stripe.chunk_paths.iter().enumerate() {
-                let device_id = stripe
+                let Some(device_id) = stripe
                     .chunk_devices
                     .get(index)
                     .copied()
                     .map(|device_id| device_id as usize)
                     .or_else(|| self.device_id_for_path(Path::new(path)))
-                    .ok_or_else(|| {
-                        KVError::InvalidArgument(format!(
-                            "unable to identify storage device for {}",
-                            path
-                        ))
-                    })?;
+                else {
+                    last_err = Some(KVError::InvalidArgument(format!(
+                        "unable to identify storage device for {}",
+                        path
+                    )));
+                    continue;
+                };
                 if let Err(e) = self.delete_file_on_device(device_id, Path::new(path)) {
                     last_err = Some(e);
                 }
@@ -2088,6 +2089,34 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(regular_files(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn striped_delete_continues_after_unroutable_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "cleanup/striped".into(),
+        };
+        let valid_path = cfg.storage.devices[1].join("remaining-chunk.bin");
+        std::fs::write(&valid_path, b"chunk").unwrap();
+        let mut meta = mk_meta();
+        meta.striping = Some(StripingInfo {
+            chunk_size: 4,
+            chunk_devices: Vec::new(),
+            chunk_paths: vec![
+                "/unmanaged/missing-chunk.bin".to_string(),
+                valid_path.display().to_string(),
+            ],
+            total_size: 5,
+            chunk_locations: Vec::new(),
+        });
+
+        assert!(st.delete_files_for_meta(&key, &meta).is_err());
+        assert!(!valid_path.exists());
     }
 
     #[test]
