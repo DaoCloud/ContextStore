@@ -184,6 +184,35 @@ rdma_endpoint = "10.0.0.12:50053"
 If `metrics.enabled = true` but the binary was not built with `--features
 metrics`, the server still starts and logs a warning.
 
+The exporter uses only low-cardinality labels. Storage I/O metrics are grouped
+by `operation`, `device`, `executor`, `mode`, and `status`; Redis metadata
+metrics are grouped by operation and status; RDMA metrics are grouped by NIC.
+Object keys, file paths, request IDs, and namespaces are intentionally not
+Prometheus labels. Use `contextstore_server::storage_io` debug logs when an
+individual path must be inspected.
+
+Key metrics for performance tuning include:
+
+- `kvservice_storage_io_total`, `kvservice_storage_io_bytes_total`,
+  `kvservice_storage_io_duration_seconds`, and
+  `kvservice_storage_io_inflight` for per-device I/O throughput, latency, and
+  concurrency. `mode` identifies the logical storage path; `aligned` may use
+  O_DIRECT or a buffered fallback depending on executor and filesystem support.
+  For `mode="batch"`, `vectored`, and `aligned` striped I/O,
+  the duration is the wall-clock submission-to-completion time of the parallel
+  batch and is emitted for each participating device; it is not a per-device
+  device-service-time measurement.
+- `kvservice_metadata_operations_total`,
+  `kvservice_metadata_operation_duration_seconds`, and
+  `kvservice_metadata_reconnect_total` for Redis metadata pressure.
+- `device_used_bytes` for per-device capacity. It is initialized once at
+  startup and updated as ContextStore writes or deletes files; scraping the
+  exporter does not walk the data directory.
+- `kvservice_rdma_bytes_total`,
+  `kvservice_rdma_transfer_duration_seconds`,
+  `kvservice_rdma_errors_total`, and `kvservice_rdma_connections` for the
+  RDMA data path.
+
 ### `[gds]`
 
 This section is optional and only has an effect when the server is built with
