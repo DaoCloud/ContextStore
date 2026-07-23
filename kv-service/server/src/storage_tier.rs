@@ -62,7 +62,11 @@ impl StorageTier {
         for device in router.devices() {
             let root = device.join(&config.storage.data_subdir).join("data");
             std::fs::create_dir_all(&root).ok();
-            device_used_bytes_total.push(AtomicU64::new(directory_size_bytes(&root)));
+            let used_bytes = metrics
+                .as_ref()
+                .map(|_| directory_size_bytes(&root))
+                .unwrap_or(0);
+            device_used_bytes_total.push(AtomicU64::new(used_bytes));
         }
         Ok(Self {
             router,
@@ -840,7 +844,7 @@ impl StorageTier {
                 length: total,
             };
             let results =
-                self.observe_io_batch("write", "o_direct", &[device_id], &[total as u64], || {
+                self.observe_io_batch("write", "aligned", &[device_id], &[total as u64], || {
                     self.executor.write_aligned_batch(vec![(req, ptr, total)])
                 });
             results.into_iter().next().unwrap_or_else(|| {
@@ -940,7 +944,7 @@ impl StorageTier {
                 *length as u64
             })
             .collect::<Vec<_>>();
-        let results = self.observe_io_batch("write", "o_direct", &device_ids, &write_bytes, || {
+        let results = self.observe_io_batch("write", "aligned", &device_ids, &write_bytes, || {
             self.executor.write_aligned_batch(io_items)
         });
         for (i, r) in results.into_iter().enumerate() {
@@ -1045,10 +1049,22 @@ impl StorageTier {
             return Ok(None);
         }
         let size = meta.size as usize;
-        let n = self.executor.read_to_gpu(&path, 0, gpu_buf, size)?;
+        let device_id = self.meta_device_or_route(key, &meta);
+        let n = self.observe_io("read", device_id, "gds", 0, || {
+            self.executor.read_to_gpu(&path, 0, gpu_buf, size)
+        })?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_storage_io_bytes(
+                "read",
+                self.device_label(device_id),
+                &self.executor_name,
+                "gds",
+                n as u64,
+            );
+        }
         self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
-        self.record_device_read(self.meta_device_or_route(key, &meta), n as u64);
+        self.record_device_read(device_id, n as u64);
         Ok(Some((n, meta)))
     }
 
@@ -1079,13 +1095,25 @@ impl StorageTier {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let n = self.executor.write_from_gpu(&path, 0, gpu_buf, size)?;
+        let n = self.observe_io("write", device_id, "gds", 0, || {
+            self.executor.write_from_gpu(&path, 0, gpu_buf, size)
+        })?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_storage_io_bytes(
+                "write",
+                self.device_label(device_id),
+                &self.executor_name,
+                "gds",
+                n as u64,
+            );
+        }
         meta.size = n as u64;
         meta.file_path = path.to_string_lossy().to_string();
         meta.device_id = device_id as u32;
         self.commit_metadata_with_rollback(key, &meta, std::slice::from_ref(&path), false)?;
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written.fetch_add(n as u64, Ordering::Relaxed);
+        self.record_device_write(device_id, Self::file_size(&path));
         Ok(())
     }
 
@@ -1311,7 +1339,7 @@ impl StorageTier {
                     .min(stripe.chunk_size)
             })
             .collect::<Vec<_>>();
-        let results = self.observe_io_batch("read", "o_direct", &device_ids, &read_bytes, || {
+        let results = self.observe_io_batch("read", "aligned", &device_ids, &read_bytes, || {
             self.executor.read_aligned_batch(&reqs)
         });
         let mut out: Vec<Bytes> = Vec::with_capacity(results.len());
@@ -1449,7 +1477,7 @@ impl StorageTier {
             };
             let device_id = self.meta_device_or_route(key, &meta);
             let results =
-                self.observe_io_batch("read", "o_direct", &[device_id], &[meta.size], || {
+                self.observe_io_batch("read", "aligned", &[device_id], &[meta.size], || {
                     self.executor
                         .read_aligned_into_ptr_batch(vec![(req, ptr, capacity)])
                 });
@@ -1522,7 +1550,7 @@ impl StorageTier {
                     .min(stripe.chunk_size)
             })
             .collect::<Vec<_>>();
-        let results = self.observe_io_batch("read", "o_direct", &device_ids, &read_bytes, || {
+        let results = self.observe_io_batch("read", "aligned", &device_ids, &read_bytes, || {
             self.executor.read_aligned_into_ptr_batch(reqs)
         });
         let mut total_read = 0usize;
@@ -2002,6 +2030,23 @@ mod tests {
         }
         files.sort();
         files
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    #[test]
+    fn disabled_metrics_skip_startup_capacity_scan() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let data_dir = cfg.storage.devices[0]
+            .join(&cfg.storage.data_subdir)
+            .join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("existing.bin"), b"existing").unwrap();
+
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+
+        assert_eq!(st.device_used_bytes(0), 0);
     }
 
     #[test]
