@@ -596,6 +596,9 @@ class _WorkerImpl:
         # _pinned_buf is kept for backward compat (LOAD path still uses a single
         # buffer); STORE uses _pinned_pool.
         self._pinned_buf: torch.Tensor | None = None  # LOAD path single reusable buffer
+        # Shared-filesystem GDS staging allocation. It is GPU-resident and registered
+        # once with cuFile, so LOAD avoids both host copies and per-request GPU allocs.
+        self._gds_staging: torch.Tensor | None = None
         import queue
         self._pinned_pool: queue.Queue[torch.Tensor] = queue.Queue()
         # Default 1: matches the single-buffer behavior and keeps total pinned
@@ -664,6 +667,11 @@ class _WorkerImpl:
                 # still grows on demand; this is only warmup preallocation.)
                 est_bytes = min(est_bytes, 2 * 1024 * 1024 * 1024)
                 self._ensure_pinned(est_bytes)
+                gds_prewarm_bytes = min(
+                    est_bytes,
+                    max(self._cs_config.shared_gds_staging_max_mb, 1) * 1024 * 1024,
+                )
+                self._prewarm_shared_gds_buffer(gds_prewarm_bytes, sample.device)
                 # Warm the stream: a tiny copy triggers lazy init.
                 if self._copy_stream is not None:
                     with torch.cuda.stream(self._copy_stream):
@@ -719,6 +727,26 @@ class _WorkerImpl:
             )
         except Exception as e:
             logger.warning("CS worker LOAD RDMA pre-warm failed: %s", e)
+
+    def _prewarm_shared_gds_buffer(self, size: int, device: torch.device) -> None:
+        """Allocate and register the GDS staging buffer outside the first LOAD."""
+        storage = self._engine.storage
+        if not (
+            hasattr(storage, "supports_shared_gds")
+            and hasattr(storage, "prepare_shared_gds_buffer")
+            and storage.supports_shared_gds()
+        ):
+            return
+        staging = self._ensure_gds_staging(size, device)
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        storage.prepare_shared_gds_buffer(staging.data_ptr(), staging.numel(), device_index)
+
+    def _ensure_gds_staging(self, size: int, device: torch.device) -> torch.Tensor:
+        current = self._gds_staging
+        if current is not None and current.device == device and current.numel() >= size:
+            return current
+        self._gds_staging = torch.empty(size, dtype=torch.uint8, device=device)
+        return self._gds_staging
 
     def bind_connector_metadata(self, meta: KVConnectorMetadata) -> None:
         perf_enabled = _perf_log_enabled()
@@ -1386,6 +1414,16 @@ class _WorkerImpl:
         t_start = time.perf_counter()
         layer_name = self._make_layer_name(spec)
 
+        # ===== Shared-filesystem GDS fast path =====
+        storage = self._engine.storage
+        if (
+            hasattr(storage, "supports_shared_gds")
+            and storage.supports_shared_gds()
+            and hasattr(storage, "get_chunks_to_gpu")
+        ):
+            if self._load_blocks_from_shared_gds(spec, layer_name):
+                return
+
         # ===== Zero-copy fast path =====
         storage = self._engine.storage
         # DEBUG: log the path selection once via logger.warning (file writes can silently
@@ -1611,6 +1649,62 @@ class _WorkerImpl:
             (t_h2d - t_get) * 1000, (t_h2d - t_start) * 1000,
         )
         return True
+
+    def _load_blocks_from_shared_gds(self, spec: _Spec, layer_name: str) -> bool:
+        """Load a combined value through local cuFile into reusable GPU staging memory."""
+        n_blocks = len(spec.gpu_block_ids)
+        if n_blocks == 0 or not self._layer_names:
+            return False
+        per_layer_sizes, _offsets, total_bytes = self._spec_byte_layout(n_blocks)
+        if total_bytes == 0:
+            return False
+        sample = self._kv_caches[self._layer_names[0]]
+        if not sample.is_cuda:
+            return False
+        staging = self._ensure_gds_staging(total_bytes, sample.device)
+        device_index = (
+            sample.device.index if sample.device.index is not None else torch.cuda.current_device()
+        )
+        storage = self._engine.storage
+        try:
+            transferred = storage.get_chunks_to_gpu(
+                spec.prefix_key,
+                layer_name,
+                staging.data_ptr(),
+                staging.numel(),
+                total_bytes,
+                device_index,
+            )
+            if transferred != total_bytes:
+                return False
+
+            idx = torch.tensor(spec.gpu_block_ids, dtype=torch.long, device=sample.device)
+            stream = self._copy_stream
+            ctx = (
+                torch.cuda.stream(stream)
+                if stream is not None
+                else torch.cuda.stream(torch.cuda.current_stream())
+            )
+            with ctx:
+                offset = 0
+                for vllm_layer_name, segment_size in zip(self._layer_names, per_layer_sizes):
+                    target = self._kv_caches[vllm_layer_name]
+                    if target.dim() >= 4 and target.shape[0] == 2:
+                        shape = [2, n_blocks, *target.shape[2:]]
+                    else:
+                        shape = [n_blocks, *target.shape[1:]]
+                    source = staging[offset : offset + segment_size].view(target.dtype).view(shape)
+                    if target.dim() >= 4 and target.shape[0] == 2:
+                        target.index_copy_(1, idx, source)
+                    else:
+                        target.index_copy_(0, idx, source)
+                    offset += segment_size
+            if stream is not None:
+                stream.synchronize()
+            return True
+        except Exception as exc:
+            logger.warning("shared GDS load failed: %s", exc)
+            return False
 
     def _zero_fill_gpu_blocks(self, spec: _Spec) -> None:
         """Zero out every layer's KV block corresponding to spec.gpu_block_ids.

@@ -92,7 +92,7 @@ pip install -e '.[proto]'   # adds grpcio-tools for `make proto`
 ### 2. Build and run KVService (optional L3 tier)
 
 ```bash
-# Build server / client-rs / rdma-ffi with the deployment feature set.
+# Build server / client-rs / rdma-ffi / gds-ffi with the deployment feature set.
 make build
 
 # Start the server (listens on :50051)
@@ -105,7 +105,7 @@ store. See [`kv-service/configs/README.md`](kv-service/configs/README.md) for
 the config file format and examples.
 
 `make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
-metrics. It produces the server, Rust client SDK, and RDMA C ABI under
+metrics. It produces the server, Rust client SDK, RDMA C ABI, and local GDS C ABI under
 `target/release/`. Regenerate Python protobuf bindings only after changing the
 protocol:
 
@@ -135,6 +135,44 @@ Pass a `--kv-transfer-config` to vLLM v1:
 ```
 
 All keys map directly to fields on `ContextStoreConfig` (`src/contextstore/core/config.py`). Multi-endpoint HA is enabled by passing `kv_service_endpoints: ["host1:50051", "host2:50051"]` instead of a single endpoint.
+
+### Shared filesystem GDS read path
+
+The optional shared GDS path runs **in the GPU worker process**, not in a remote
+KVService. It is for a GDS-enabled shared filesystem such as a supported Lustre,
+WekaFS, or GPFS deployment mounted on every GPU node. KVService remains the
+metadata and write authority; the worker performs a metadata-only placement lookup
+and then uses cuFile to read the versioned file directly into a reusable GPU staging
+buffer. Any unavailable library, invalid placement, unsupported filesystem, or I/O
+failure falls back to the existing gRPC/RDMA read path.
+
+```json
+{
+  "kv_connector_extra_config": {
+    "kv_service_endpoint": "metadata-node:50051",
+    "shared_gds_enabled": true,
+    "shared_gds_server_root": "/srv/contextstore-data",
+    "shared_gds_mount_root": "/mnt/lustre/contextstore-data",
+    "shared_gds_min_bytes": 1048576,
+    "shared_gds_file_cache_capacity": 128,
+    "shared_gds_buffer_cache_capacity": 2,
+    "shared_gds_staging_max_mb": 1024
+  }
+}
+```
+
+`shared_gds_server_root` is the root recorded by KVService placement metadata and
+`shared_gds_mount_root` is the corresponding path visible on GPU nodes. The client
+only accepts handles below the configured server root before mapping them to the
+local mount. Build `gds-ffi` with `make build`; set `CONTEXTSTORE_GDS_FFI_PATH`
+when the library is not located at `target/release/libcontextstore_gds_ffi.so`.
+This requires `libcufile`, `nvidia-fs`, and a filesystem/vendor configuration that
+actually supports GDS. Plain NFS and container overlay mounts generally use the
+normal fallback path.
+
+The initial implementation is enabled for a single `kv_service_endpoint`. HA
+multi-endpoint deployments continue to use their existing RDMA/gRPC paths until
+the GDS registration cache is made process-wide across routed child backends.
 
 ### 4. Or wire into Dynamo
 

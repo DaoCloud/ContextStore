@@ -73,6 +73,19 @@ class ContextStoreConfig:
     # cache-hit LOAD forward into the vLLM startup phase.
     rdma_prewarm_load_region: bool = True
 
+    # ===== Shared filesystem GDS (optional) =====
+    # GDS runs in the GPU worker process. The KVService remains the metadata and
+    # write authority while the worker reads a versioned placement through its local
+    # mount of the same Lustre/WekaFS/GPFS namespace.
+    shared_gds_enabled: bool = False
+    shared_gds_server_root: str = ""
+    shared_gds_mount_root: str = ""
+    shared_gds_min_bytes: int = 1024 * 1024
+    shared_gds_file_cache_capacity: int = 128
+    shared_gds_buffer_cache_capacity: int = 2
+    shared_gds_staging_max_mb: int = 1024
+    shared_gds_library_path: str = ""
+
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any]) -> ContextStoreConfig:
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}

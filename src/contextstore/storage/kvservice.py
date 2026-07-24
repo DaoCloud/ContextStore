@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from contextstore.storage.base import BlockMeta, StorageBackend
@@ -71,6 +72,16 @@ class KVServiceBackend(StorageBackend):
         rdma_gid_index: int = 3,
         rdma_buf_size_mb: int = 512,  # per-RDMA-client buffer (sized for the max possible KV)
         rdma_fallback_to_grpc: bool = True,
+        # ===== Shared filesystem GDS (optional, GPU-worker local) =====
+        # The KVService data path stays authoritative for writes. Reads can bypass gRPC
+        # when every GPU worker mounts the same GDS-enabled filesystem as the data node.
+        shared_gds_enabled: bool = False,
+        shared_gds_server_root: str = "",
+        shared_gds_mount_root: str = "",
+        shared_gds_min_bytes: int = 1024 * 1024,
+        shared_gds_file_cache_capacity: int = 128,
+        shared_gds_buffer_cache_capacity: int = 2,
+        shared_gds_library_path: str = "",
     ) -> None:
         # Lazy import: avoid a hard dependency on grpcio for deployments that don't enable KVService
         from contextstore.kvservice_client import KVClient
@@ -81,6 +92,19 @@ class KVServiceBackend(StorageBackend):
         self._parallel = max(parallel_channels, 1)
         # RDMA configuration
         self._rdma_enabled = rdma_enabled
+        self._shared_gds_enabled = shared_gds_enabled
+        self._shared_gds_server_root = (
+            Path(os.path.abspath(shared_gds_server_root)) if shared_gds_server_root else None
+        )
+        self._shared_gds_mount_root = (
+            Path(os.path.abspath(shared_gds_mount_root)) if shared_gds_mount_root else None
+        )
+        self._shared_gds_min_bytes = max(shared_gds_min_bytes, 0)
+        self._shared_gds_file_cache_capacity = max(shared_gds_file_cache_capacity, 1)
+        self._shared_gds_buffer_cache_capacity = max(shared_gds_buffer_cache_capacity, 1)
+        self._shared_gds_library_path = shared_gds_library_path
+        self._shared_gds_client: Any | None = None
+        self._shared_gds_lock = threading.Lock()
         # Multi-NIC support: rdma_server_addr and rdma_device accept comma-separated lists,
         # e.g. server="127.0.0.1:50053,127.0.0.1:50054" device="mlx5_0,mlx5_1".
         # The two lists must have equal length (one endpoint + one device per NIC). A single
@@ -184,6 +208,97 @@ class KVServiceBackend(StorageBackend):
 
     def _rdma_string_key(self, key: str, layer_name: str) -> str:
         return self._object_key(key, layer_name).to_string()
+
+    # ===== Shared filesystem GDS (GPU-worker local data path) =====
+
+    def _get_or_create_shared_gds_client(self) -> Any | None:
+        if not self._shared_gds_enabled:
+            return None
+        if self._shared_gds_server_root is None or self._shared_gds_mount_root is None:
+            return None
+        if self._shared_gds_client is not None:
+            return self._shared_gds_client
+        with self._shared_gds_lock:
+            if self._shared_gds_client is not None:
+                return self._shared_gds_client
+            try:
+                from contextstore.storage.gds_client import LocalGdsClient
+
+                self._shared_gds_client = LocalGdsClient(
+                    library_path=self._shared_gds_library_path,
+                    file_cache_capacity=self._shared_gds_file_cache_capacity,
+                    buffer_cache_capacity=self._shared_gds_buffer_cache_capacity,
+                )
+            except Exception as exc:
+                logger.warning("shared GDS client initialization failed: %s", exc)
+                self._shared_gds_enabled = False
+                return None
+        return self._shared_gds_client
+
+    def supports_shared_gds(self) -> bool:
+        """Return whether this worker can use the shared-filesystem GDS read path."""
+        return self._get_or_create_shared_gds_client() is not None
+
+    def prepare_shared_gds_buffer(self, gpu_ptr: int, gpu_capacity: int, gpu_device: int) -> None:
+        """Register a reusable GPU staging allocation before request processing begins."""
+        client = self._get_or_create_shared_gds_client()
+        if client is None:
+            return
+        client.prepare_buffer(gpu_ptr, gpu_capacity, gpu_device)
+
+    def _shared_gds_path(self, storage_handle: str) -> Path:
+        if self._shared_gds_server_root is None or self._shared_gds_mount_root is None:
+            raise RuntimeError("shared GDS roots are not configured")
+        server_root = self._shared_gds_server_root
+        source = Path(os.path.abspath(storage_handle))
+        try:
+            relative = source.relative_to(server_root)
+        except ValueError as exc:
+            raise RuntimeError("placement storage_handle is outside shared GDS server root") from exc
+        return self._shared_gds_mount_root / relative
+
+    def get_chunks_to_gpu(
+        self,
+        key: str,
+        layer_name: str,
+        gpu_ptr: int,
+        gpu_capacity: int,
+        expected_bytes: int,
+        gpu_device: int,
+    ) -> int | None:
+        """Read the current shared-filesystem placement directly into CUDA memory.
+
+        A fresh metadata-only lookup preserves descriptor/placement validation while
+        avoiding a value-bearing RPC. `None` means callers should use the normal
+        transport path; this method never exposes an untrusted server path directly.
+        """
+        if expected_bytes < self._shared_gds_min_bytes or expected_bytes > gpu_capacity:
+            return None
+        client = self._get_or_create_shared_gds_client()
+        if client is None:
+            return None
+        try:
+            lookup = self._client.lookup_object_with_placement(self._object_key(key, layer_name))
+            if lookup is None or lookup.placement is None:
+                return 0
+            if lookup.descriptor.size != expected_bytes:
+                return None
+            chunks = sorted(lookup.placement.chunks, key=lambda chunk: chunk.offset)
+            if not chunks:
+                return 0
+            cursor = 0
+            segments: list[tuple[Path, int, int]] = []
+            for chunk in chunks:
+                if chunk.offset != cursor or chunk.length <= 0:
+                    return None
+                cursor += chunk.length
+                segments.append((self._shared_gds_path(chunk.storage_handle), chunk.offset, chunk.length))
+            if cursor != expected_bytes:
+                return None
+            return client.read_into(gpu_ptr, gpu_capacity, gpu_device, segments)
+        except Exception as exc:
+            logger.warning("shared GDS read failed for key=%s layer=%s: %s", key, layer_name, exc)
+            return None
 
     def _get_or_create_rdma_client_pool(self):
         """Lazily create N RDMA clients per worker process (each with its own buffer + QP)

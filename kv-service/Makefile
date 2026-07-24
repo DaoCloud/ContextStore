@@ -4,7 +4,7 @@
 # (src/contextstore/kvservice_client/) and is shipped by the root
 # pyproject.toml; it is no longer built as a separate wheel here.
 
-.PHONY: all build server server-debug run-server client-rs rdma-ffi proto proto-rust proto-python \
+.PHONY: all build server server-debug run-server client-rs rdma-ffi gds-ffi proto proto-rust proto-python \
         test test-server test-integration bench fmt lint docker docker-push clean help
 
 # ===== Config =====
@@ -15,6 +15,7 @@ DOCKER ?= docker
 SERVER_DIR   := server
 CLIENT_RS    := client-rs
 RDMA_FFI_DIR := rdma-ffi
+GDS_FFI_DIR := gds-ffi
 PROTO_DIR    := proto
 BUILD_TYPE   ?= release
 SERVER_FEATURES ?= io-uring,rdma,metrics
@@ -27,7 +28,7 @@ PY_PB_OUT := ../src/contextstore/kvservice_client/_pb
 # ===== Top-level targets =====
 all: build
 
-build: server client-rs rdma-ffi
+build: server client-rs rdma-ffi gds-ffi
 
 # ===== Server (Rust) =====
 server:
@@ -49,6 +50,10 @@ client-rs:
 # ===== RDMA FFI cdylib (consumed by Python via ctypes) =====
 rdma-ffi:
 	cd $(RDMA_FFI_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
+
+# ===== Local GDS C ABI cdylib (consumed by Python ctypes on GPU workers) =====
+gds-ffi:
+	cd $(GDS_FFI_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
 
 # ===== Protobuf =====
 proto: proto-rust proto-python
@@ -84,11 +89,13 @@ fmt:
 	cd $(SERVER_DIR)   && $(CARGO) fmt
 	cd $(CLIENT_RS)    && $(CARGO) fmt
 	cd $(RDMA_FFI_DIR) && $(CARGO) fmt
+	cd $(GDS_FFI_DIR)  && $(CARGO) fmt
 
 lint:
 	cd $(SERVER_DIR)   && $(CARGO) clippy -- -D warnings
 	cd $(CLIENT_RS)    && $(CARGO) clippy -- -D warnings
 	cd $(RDMA_FFI_DIR) && $(CARGO) clippy -- -D warnings
+	cd $(GDS_FFI_DIR)  && $(CARGO) clippy -- -D warnings
 
 # ===== Packaging =====
 docker:
@@ -103,6 +110,7 @@ clean:
 	cd $(SERVER_DIR)   && $(CARGO) clean
 	cd $(CLIENT_RS)    && $(CARGO) clean
 	cd $(RDMA_FFI_DIR) && $(CARGO) clean
+	cd $(GDS_FFI_DIR)  && $(CARGO) clean
 	rm -rf $(PY_PB_OUT)/*_pb2.py $(PY_PB_OUT)/*_pb2_grpc.py $(PY_PB_OUT)/*.pyi
 	find . -type d -name __pycache__ -exec rm -rf {} +
 
@@ -112,6 +120,7 @@ help:
 	@echo "  make build         Build server + client-rs + rdma-ffi with deployment features"
 	@echo "  make server        Build only the Rust server"
 	@echo "  make client-rs     Build only the Rust client SDK + bench"
+	@echo "  make gds-ffi       Build the local GDS C ABI client for GPU workers"
 	@echo "  make rdma-ffi      Build only the RDMA C ABI cdylib"
 	@echo "  make proto         Regenerate protobuf code (Rust + Python)"
 	@echo "  make test          Rust unit tests + Python integration tests"

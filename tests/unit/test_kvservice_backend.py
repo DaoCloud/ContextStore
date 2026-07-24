@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from contextstore.storage.kvservice import KVServiceBackend
@@ -146,6 +148,40 @@ class _FakeRdmaBufferClient(_FakeRdmaClient):
         return self.data[:length]
 
 
+class _FakePlacementChunk:
+    def __init__(self, storage_handle: str, offset: int, length: int) -> None:
+        self.storage_handle = storage_handle
+        self.offset = offset
+        self.length = length
+
+
+class _FakePlacement:
+    def __init__(self, chunks: list[_FakePlacementChunk]) -> None:
+        self.chunks = chunks
+
+
+class _FakeLookup:
+    def __init__(self, size: int, chunks: list[_FakePlacementChunk]) -> None:
+        self.descriptor = _FakeDescriptor("shared", size=size)
+        self.placement = _FakePlacement(chunks)
+
+
+class _FakeSharedGds:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.calls: list[tuple[int, int, int, list[tuple[object, int, int]]]] = []
+
+    def read_into(
+        self,
+        ptr: int,
+        size: int,
+        device: int,
+        segments: list[tuple[object, int, int]],
+    ) -> int:
+        self.calls.append((ptr, size, device, segments))
+        return self.result
+
+
 def _make_backend(client: _FakeClient) -> KVServiceBackend:
     backend = object.__new__(KVServiceBackend)
     backend._rdma_enabled = True
@@ -208,6 +244,24 @@ def _make_descriptor_rdma_backend(
             backend._model_id,
             KVServiceBackend._encode_object_key(key, layer_name),
         )
+    )
+    return backend
+
+
+def _make_shared_gds_backend(lookup: _FakeLookup | None, client: _FakeSharedGds) -> KVServiceBackend:
+    backend = object.__new__(KVServiceBackend)
+    backend._model_id = "test-model"
+    backend._shared_gds_enabled = True
+    backend._shared_gds_server_root = Path("/server/data")
+    backend._shared_gds_mount_root = Path("/lustre/contextstore")
+    backend._shared_gds_min_bytes = 1
+    backend._shared_gds_client = client
+    backend._shared_gds_lock = threading.Lock()
+    backend._client = types.SimpleNamespace(
+        lookup_object_with_placement=lambda key: lookup,
+    )
+    backend._object_key = lambda key, layer: _FakeObjectKey(  # type: ignore[method-assign]
+        "test-model", f"{key}:{layer}"
     )
     return backend
 
@@ -375,3 +429,46 @@ def test_put_chunks_raises_when_grpc_fallback_disabled(monkeypatch: Any) -> None
         assert False, "expected RuntimeError"
     except RuntimeError as exc:
         assert "RDMA put_chunks failed" in str(exc)
+
+
+def test_shared_gds_maps_single_placement_into_local_mount() -> None:
+    lookup = _FakeLookup(6, [_FakePlacementChunk("/server/data/a/object.bin", 0, 6)])
+    gds = _FakeSharedGds(6)
+    backend = _make_shared_gds_backend(lookup, gds)
+
+    assert backend.get_chunks_to_gpu("prefix", "layer", 0x1000, 64, 6, 0) == 6
+    assert gds.calls == [
+        (
+            0x1000,
+            64,
+            0,
+            [(Path("/lustre/contextstore/a/object.bin"), 0, 6)],
+        )
+    ]
+
+
+def test_shared_gds_preserves_stripe_offsets() -> None:
+    lookup = _FakeLookup(
+        8,
+        [
+            _FakePlacementChunk("/server/data/a/stripe-1", 4, 4),
+            _FakePlacementChunk("/server/data/a/stripe-0", 0, 4),
+        ],
+    )
+    gds = _FakeSharedGds(8)
+    backend = _make_shared_gds_backend(lookup, gds)
+
+    assert backend.get_chunks_to_gpu("prefix", "layer", 0x1000, 64, 8, 1) == 8
+    assert gds.calls[0][3] == [
+        (Path("/lustre/contextstore/a/stripe-0"), 0, 4),
+        (Path("/lustre/contextstore/a/stripe-1"), 4, 4),
+    ]
+
+
+def test_shared_gds_rejects_handle_outside_configured_server_root() -> None:
+    lookup = _FakeLookup(4, [_FakePlacementChunk("/other/data/object.bin", 0, 4)])
+    gds = _FakeSharedGds(4)
+    backend = _make_shared_gds_backend(lookup, gds)
+
+    assert backend.get_chunks_to_gpu("prefix", "layer", 0x1000, 64, 4, 0) is None
+    assert gds.calls == []

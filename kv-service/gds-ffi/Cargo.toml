@@ -1,0 +1,17 @@
+[package]
+name = "contextstore-gds-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Local GPUDirect Storage C ABI for ContextStore GPU workers"
+license = "Apache-2.0"
+
+[lib]
+name = "contextstore_gds_ffi"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+libloading = "0.8"
+lru = "0.12"

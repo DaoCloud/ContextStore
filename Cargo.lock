@@ -395,6 +395,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "contextstore-gds-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "libloading",
+ "lru",
+]
+
+[[package]]
+name = "contextstore-rdma-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rdma-sys",
+]
+
+[[package]]
 name = "contextstore-server"
 version = "0.1.0"
 dependencies = [

@@ -186,6 +186,37 @@ class HostMemoryBackend(StorageBackend):
             return None
         return self._wrapped.get_chunks_into(key, layer_name, region_id, offset)
 
+    def supports_shared_gds(self) -> bool:
+        """Expose the wrapped GPU-worker-local GDS capability without bypassing L1."""
+        if not hasattr(self._wrapped, "supports_shared_gds"):
+            return False
+        return bool(self._wrapped.supports_shared_gds())
+
+    def prepare_shared_gds_buffer(self, gpu_ptr: int, gpu_capacity: int, gpu_device: int) -> None:
+        if not hasattr(self._wrapped, "prepare_shared_gds_buffer"):
+            return
+        self._wrapped.prepare_shared_gds_buffer(gpu_ptr, gpu_capacity, gpu_device)
+
+    def get_chunks_to_gpu(
+        self,
+        key: str,
+        layer_name: str,
+        gpu_ptr: int,
+        gpu_capacity: int,
+        expected_bytes: int,
+        gpu_device: int,
+    ) -> int | None:
+        if not hasattr(self._wrapped, "get_chunks_to_gpu"):
+            return None
+        return self._wrapped.get_chunks_to_gpu(
+            key,
+            layer_name,
+            gpu_ptr,
+            gpu_capacity,
+            expected_bytes,
+            gpu_device,
+        )
+
     def supports_rdma_put(self) -> bool:
         if not hasattr(self._wrapped, "supports_rdma_put"):
             return False

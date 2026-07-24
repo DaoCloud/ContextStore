@@ -10,6 +10,7 @@ class DelegatingStorageBackend(MemoryStorageBackend):
         super().__init__()
         self.put_chunks_calls: list[tuple[str, str, list[bytes]]] = []
         self.registered_regions: list[tuple[int, int]] = []
+        self.gds_prepared: list[tuple[int, int, int]] = []
 
     def put_chunks(
         self,
@@ -59,6 +60,23 @@ class DelegatingStorageBackend(MemoryStorageBackend):
             and offset == 0
             and size == 10
         )
+
+    def supports_shared_gds(self) -> bool:
+        return True
+
+    def prepare_shared_gds_buffer(self, gpu_ptr: int, gpu_capacity: int, gpu_device: int) -> None:
+        self.gds_prepared.append((gpu_ptr, gpu_capacity, gpu_device))
+
+    def get_chunks_to_gpu(
+        self,
+        key: str,
+        layer_name: str,
+        gpu_ptr: int,
+        gpu_capacity: int,
+        expected_bytes: int,
+        gpu_device: int,
+    ) -> int | None:
+        return expected_bytes
 
 
 class TestHostMemoryBackend:
@@ -158,3 +176,7 @@ class TestHostMemoryBackend:
         assert backend.get_chunks_into("k1", "l0", 7, 3) == 14
         assert backend.supports_rdma_put() is True
         assert backend.put_chunks_from("k1", "l0", 7, 0, 10) is True
+        assert backend.supports_shared_gds() is True
+        backend.prepare_shared_gds_buffer(100, 200, 3)
+        assert wrapped.gds_prepared == [(100, 200, 3)]
+        assert backend.get_chunks_to_gpu("k1", "l0", 100, 200, 10, 3) == 10

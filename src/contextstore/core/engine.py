@@ -84,6 +84,13 @@ class ContextStoreEngine:
                         rdma_gid_index=getattr(config, "rdma_gid_index", 3),
                         rdma_buf_size_mb=getattr(config, "rdma_buf_size_mb", 512),
                         rdma_fallback_to_grpc=getattr(config, "rdma_fallback_to_grpc", True),
+                        shared_gds_enabled=getattr(config, "shared_gds_enabled", False),
+                        shared_gds_server_root=getattr(config, "shared_gds_server_root", ""),
+                        shared_gds_mount_root=getattr(config, "shared_gds_mount_root", ""),
+                        shared_gds_min_bytes=getattr(config, "shared_gds_min_bytes", 1024 * 1024),
+                        shared_gds_file_cache_capacity=getattr(config, "shared_gds_file_cache_capacity", 128),
+                        shared_gds_buffer_cache_capacity=getattr(config, "shared_gds_buffer_cache_capacity", 2),
+                        shared_gds_library_path=getattr(config, "shared_gds_library_path", ""),
                     )
                     for i, ep in enumerate(endpoints)
                 ]
@@ -118,6 +125,13 @@ class ContextStoreEngine:
                     rdma_gid_index=getattr(config, "rdma_gid_index", 3),
                     rdma_buf_size_mb=getattr(config, "rdma_buf_size_mb", 512),
                     rdma_fallback_to_grpc=getattr(config, "rdma_fallback_to_grpc", True),
+                    shared_gds_enabled=getattr(config, "shared_gds_enabled", False),
+                    shared_gds_server_root=getattr(config, "shared_gds_server_root", ""),
+                    shared_gds_mount_root=getattr(config, "shared_gds_mount_root", ""),
+                    shared_gds_min_bytes=getattr(config, "shared_gds_min_bytes", 1024 * 1024),
+                    shared_gds_file_cache_capacity=getattr(config, "shared_gds_file_cache_capacity", 128),
+                    shared_gds_buffer_cache_capacity=getattr(config, "shared_gds_buffer_cache_capacity", 2),
+                    shared_gds_library_path=getattr(config, "shared_gds_library_path", ""),
                 )
             elif config.sharded_device_paths and len(config.sharded_device_paths) > 1:
                 from contextstore.storage.sharded import ShardedStorageBackend
