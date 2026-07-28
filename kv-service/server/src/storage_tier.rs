@@ -465,7 +465,8 @@ impl StorageTier {
             }
         } else {
             let path = self.meta_path_or_route(key, meta);
-            if let Err(error) = self.delete_file_on_device(self.meta_device_or_route(key, meta), &path)
+            if let Err(error) =
+                self.delete_file_on_device(self.meta_device_or_route(key, meta), &path)
             {
                 warn!(
                     path = %path.display(),
@@ -2615,7 +2616,9 @@ mod tests {
             .get_block(&key.to_string_key())
             .unwrap()
             .is_none());
-        assert!(paths.iter().all(|path| !std::path::Path::new(path).exists()));
+        assert!(paths
+            .iter()
+            .all(|path| !std::path::Path::new(path).exists()));
     }
 
     #[test]
