@@ -287,10 +287,6 @@ impl KVServiceImpl {
             .clone()
     }
 
-    async fn metadata_exists(&self, key: &InternalKey) -> Result<bool, Status> {
-        Ok(self.metadata_get_live(key).await?.is_some())
-    }
-
     fn meta_identity_matches(actual: &BlockMeta, expected: &BlockMeta) -> bool {
         actual.object_handle == expected.object_handle
             && actual.object_generation == expected.object_generation
@@ -333,6 +329,19 @@ impl KVServiceImpl {
         if !meta.is_expired() {
             return Ok(false);
         }
+        let write_lock = self.key_write_lock(key);
+        let _guard = write_lock.lock().await;
+        self.purge_expired_object_locked(key, meta).await
+    }
+
+    async fn purge_expired_object_locked(
+        &self,
+        key: &InternalKey,
+        meta: &BlockMeta,
+    ) -> Result<bool, Status> {
+        if !meta.is_expired() {
+            return Ok(false);
+        }
         let placement = placement_from_meta(&self.ctx, key, meta);
         if self.placement_has_remote_chunks(&placement) {
             let metadata = self.ctx.metadata.clone();
@@ -351,11 +360,15 @@ impl KVServiceImpl {
                 return Ok(false);
             }
 
-            let deleted = self
-                .ctx
-                .metadata
-                .delete_block_if_matches(&key.to_string_key(), meta)
-                .map_err(Status::from)?;
+            let metadata = self.ctx.metadata.clone();
+            let str_key = key.to_string_key();
+            let expected = meta.clone();
+            let deleted = tokio::task::spawn_blocking(move || {
+                metadata.delete_block_if_matches(&str_key, &expected)
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::from)?;
             if !deleted {
                 return Ok(false);
             }
@@ -606,8 +619,17 @@ impl KVServiceImpl {
         let write_lock = self.key_write_lock(&key);
         let _guard = write_lock.lock().await;
 
-        if self.metadata_exists(&key).await? {
-            return Ok(false);
+        let metadata = self.ctx.metadata.clone();
+        let str_key = key.to_string_key();
+        let existing = tokio::task::spawn_blocking(move || metadata.get_block(&str_key))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::from)?;
+        if let Some(existing) = existing {
+            if !existing.is_expired() {
+                return Ok(false);
+            }
+            self.purge_expired_object_locked(&key, &existing).await?;
         }
 
         self.put_distributed_bytes_impl(key, data, meta, true).await

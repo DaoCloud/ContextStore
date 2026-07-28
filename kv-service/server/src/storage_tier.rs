@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 use twox_hash::xxh3::{hash64, Hash64 as Xxh3Hash64};
 
 const DIRECT_IO_ALIGNMENT: usize = 4096;
@@ -439,6 +439,43 @@ impl StorageTier {
         Ok(())
     }
 
+    fn delete_expired_files_best_effort(&self, key: &ObjectKey, meta: &BlockMeta) {
+        if let Some(stripe) = &meta.striping {
+            for (index, path) in stripe.chunk_paths.iter().enumerate() {
+                let result = stripe
+                    .chunk_devices
+                    .get(index)
+                    .copied()
+                    .map(|device_id| device_id as usize)
+                    .or_else(|| self.device_id_for_path(Path::new(path)))
+                    .ok_or_else(|| {
+                        KVError::InvalidArgument(format!(
+                            "unable to identify storage device for {}",
+                            path
+                        ))
+                    })
+                    .and_then(|device_id| self.delete_file_on_device(device_id, Path::new(path)));
+                if let Err(error) = result {
+                    warn!(
+                        path = %path,
+                        error = %error,
+                        "failed to delete expired striped file"
+                    );
+                }
+            }
+        } else {
+            let path = self.meta_path_or_route(key, meta);
+            if let Err(error) = self.delete_file_on_device(self.meta_device_or_route(key, meta), &path)
+            {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to delete expired file"
+                );
+            }
+        }
+    }
+
     fn delete_metadata_if_current(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
         self.metadata
             .delete_block_if_matches(&key.to_string_key(), meta)
@@ -483,6 +520,32 @@ impl StorageTier {
             KVError::Io(err) => err.kind() == std::io::ErrorKind::NotFound,
             _ => false,
         }
+    }
+
+    fn delete_expired_current_locked(&self, key: &ObjectKey, expected: &BlockMeta) -> Result<bool> {
+        let str_key = key.to_string_key();
+        let Some(current) = self.metadata.get_block(&str_key)? else {
+            return Ok(false);
+        };
+        if !current.is_expired() || !Self::meta_identity_matches(&current, expected) {
+            return Ok(false);
+        }
+        self.delete_expired_files_best_effort(key, &current);
+        self.delete_metadata_if_current(key, &current)
+    }
+
+    fn purge_if_expired(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
+        if !meta.is_expired() {
+            return Ok(false);
+        }
+        let write_lock = self.key_write_lock(key);
+        let _guard = write_lock.lock();
+        self.delete_expired_current_locked(key, meta)
+    }
+
+    /// Delete the object only when metadata still points to the same expired object identity.
+    pub fn delete_if_expired(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
+        self.purge_if_expired(key, meta)
     }
 
     fn content_etag(key: &ObjectKey, generation: u64, size: u64, created_at: i64) -> String {
@@ -1126,6 +1189,12 @@ impl StorageTier {
         let Some(meta) = self.metadata.get_block(&key.to_string_key())? else {
             return Ok(false);
         };
+        if meta.is_expired() {
+            if let Err(error) = self.purge_if_expired(key, &meta) {
+                warn!(key = %key.to_string_key(), error = %error, "failed to purge expired object");
+            }
+            return Ok(false);
+        }
         if let Some(stripe) = &meta.striping {
             if self.stripe_files_exist(stripe) {
                 return Ok(true);
@@ -2547,6 +2616,40 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(paths.iter().all(|path| !std::path::Path::new(path).exists()));
+    }
+
+    #[test]
+    fn expired_object_purges_metadata_when_chunk_cleanup_fails() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(tmp.path());
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "ttl/partial-cleanup".into(),
+        };
+        let valid_path = cfg.storage.devices[1].join("expired-chunk.bin");
+        std::fs::write(&valid_path, b"chunk").unwrap();
+        let mut meta = expired_meta();
+        meta.striping = Some(StripingInfo {
+            chunk_size: 4,
+            chunk_devices: Vec::new(),
+            chunk_paths: vec![
+                "/unmanaged/missing-chunk.bin".to_string(),
+                valid_path.display().to_string(),
+            ],
+            total_size: 5,
+            chunk_locations: Vec::new(),
+        });
+        st.metadata.put_block(&key.to_string_key(), &meta).unwrap();
+
+        assert!(!st.exists(&key).unwrap());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+        assert!(!valid_path.exists());
     }
 
     #[test]
