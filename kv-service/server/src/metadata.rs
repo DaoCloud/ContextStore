@@ -2,16 +2,17 @@
 
 use crate::config::Config;
 use crate::error::{KVError, Result};
+use crate::metrics::Metrics;
 use parking_lot::Mutex;
 use redis::Commands;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::Arc;
 
 const BLOCK_META_SEGMENT: &str = "block_meta";
 const GENERATION_SEGMENT: &str = "generation";
@@ -99,6 +100,10 @@ pub struct MetadataService {
 
 impl MetadataService {
     pub fn new(config: &Config) -> Result<Self> {
+        Self::new_with_metrics(config, None)
+    }
+
+    pub fn new_with_metrics(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self> {
         #[cfg(test)]
         if config.metadata.redis_url.starts_with("memory://") {
             return Ok(Self {
@@ -109,7 +114,7 @@ impl MetadataService {
         }
 
         Ok(Self {
-            backend: MetadataBackend::Redis(RedisMetadataBackend::new(config)?),
+            backend: MetadataBackend::Redis(RedisMetadataBackend::new(config, metrics)?),
         })
     }
 
@@ -186,10 +191,11 @@ struct RedisMetadataBackend {
     connect_timeout: Duration,
     command_timeout: Duration,
     connection: Mutex<redis::Connection>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl RedisMetadataBackend {
-    fn new(config: &Config) -> Result<Self> {
+    fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self> {
         let client = redis::Client::open(config.metadata.redis_url.as_str())
             .map_err(|e| KVError::Metadata(format!("open Redis client: {}", e)))?;
         let connect_timeout = Duration::from_millis(config.metadata.redis_connect_timeout_ms);
@@ -205,6 +211,7 @@ impl RedisMetadataBackend {
             connect_timeout,
             command_timeout,
             connection: Mutex::new(connection),
+            metrics,
         })
     }
 
@@ -235,8 +242,9 @@ impl RedisMetadataBackend {
     where
         F: FnMut(&mut redis::Connection) -> redis::RedisResult<T>,
     {
+        let started = self.metrics.as_ref().map(|_| Instant::now());
         let mut connection = self.connection.lock();
-        match command(&mut connection) {
+        let result = match command(&mut connection) {
             Ok(value) => Ok(value),
             Err(first_error) => {
                 tracing::warn!(
@@ -244,18 +252,32 @@ impl RedisMetadataBackend {
                     op,
                     first_error
                 );
-                let mut new_connection =
-                    Self::connect(&self.client, self.connect_timeout, self.command_timeout)?;
-                let value = command(&mut new_connection).map_err(|second_error| {
-                    KVError::Metadata(format!(
-                        "redis {} failed after reconnect: {}; first error: {}",
-                        op, second_error, first_error
-                    ))
-                })?;
-                *connection = new_connection;
-                Ok(value)
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_metadata_reconnect();
+                }
+                match Self::connect(&self.client, self.connect_timeout, self.command_timeout) {
+                    Ok(mut new_connection) => match command(&mut new_connection) {
+                        Ok(value) => {
+                            *connection = new_connection;
+                            Ok(value)
+                        }
+                        Err(second_error) => Err(KVError::Metadata(format!(
+                            "redis {} failed after reconnect: {}; first error: {}",
+                            op, second_error, first_error
+                        ))),
+                    },
+                    Err(reconnect_error) => Err(reconnect_error),
+                }
             }
+        };
+        if let (Some(metrics), Some(started)) = (&self.metrics, started) {
+            metrics.record_metadata_operation(
+                op,
+                if result.is_ok() { "ok" } else { "error" },
+                started.elapsed().as_secs_f64(),
+            );
         }
+        result
     }
 
     fn block_key(&self, key: &str) -> String {
@@ -277,7 +299,7 @@ impl RedisMetadataBackend {
     fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
         let redis_key = self.block_key(key);
         let bytes = Self::serialize(meta)?;
-        self.run_with_reconnect("SET block metadata", |connection| {
+        self.run_with_reconnect("put_block", |connection| {
             connection.set::<_, _, ()>(&redis_key, &bytes)
         })
     }
@@ -285,7 +307,7 @@ impl RedisMetadataBackend {
     fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
         let redis_key = self.block_key(key);
         let bytes = Self::serialize(meta)?;
-        let result = self.run_with_reconnect("SET NX block metadata", |connection| {
+        let result = self.run_with_reconnect("put_block_if_absent", |connection| {
             redis::cmd("SET")
                 .arg(&redis_key)
                 .arg(&bytes)
@@ -297,7 +319,7 @@ impl RedisMetadataBackend {
 
     fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
         let redis_key = self.block_key(key);
-        let bytes = self.run_with_reconnect("GET block metadata", |connection| {
+        let bytes = self.run_with_reconnect("get_block", |connection| {
             connection.get::<_, Option<Vec<u8>>>(&redis_key)
         })?;
         bytes.as_deref().map(Self::deserialize).transpose()
@@ -305,7 +327,7 @@ impl RedisMetadataBackend {
 
     fn delete_block(&self, key: &str) -> Result<()> {
         let redis_key = self.block_key(key);
-        self.run_with_reconnect("DEL block metadata", |connection| {
+        self.run_with_reconnect("delete_block", |connection| {
             connection.del::<_, ()>(&redis_key)
         })
     }
@@ -329,21 +351,18 @@ impl RedisMetadataBackend {
             "#,
             )
         });
-        let deleted =
-            self.run_with_reconnect("compare-and-delete block metadata", |connection| {
-                script
-                    .key(&redis_key)
-                    .arg(expected_generation)
-                    .invoke::<i32>(connection)
-            })?;
+        let deleted = self.run_with_reconnect("delete_block_if_matches", |connection| {
+            script
+                .key(&redis_key)
+                .arg(expected_generation)
+                .invoke::<i32>(connection)
+        })?;
         Ok(deleted == 1)
     }
 
     fn exists_block(&self, key: &str) -> Result<bool> {
         let redis_key = self.block_key(key);
-        self.run_with_reconnect("EXISTS block metadata", |connection| {
-            connection.exists(&redis_key)
-        })
+        self.run_with_reconnect("exists_block", |connection| connection.exists(&redis_key))
     }
 
     fn next_generation(&self, key: &str) -> Result<u64> {
@@ -371,7 +390,7 @@ impl RedisMetadataBackend {
             "#,
             )
         });
-        self.run_with_reconnect("allocate generation", |connection| {
+        self.run_with_reconnect("next_generation", |connection| {
             script
                 .key(&block_key)
                 .key(&generation_key)

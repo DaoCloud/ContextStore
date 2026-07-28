@@ -193,15 +193,18 @@ fn run_listener(
                     tracing::info!("RDMA client connected: {} (nic_idx={})", peer, nic_idx);
                     #[cfg(feature = "metrics")]
                     if let Some(metrics) = &kv_ctx.metrics {
-                        metrics.set_rdma_connection_state(&peer, true);
+                        metrics.change_rdma_connections(&format!("nic{}", nic_idx), 1);
                     }
-                    if let Err(e) =
-                        handle_client(stream, kv_ctx.clone(), rdma, port_num, gid_index, nic_idx)
-                    {
+                    let result =
+                        handle_client(stream, kv_ctx.clone(), rdma, port_num, gid_index, nic_idx);
+                    #[cfg(feature = "metrics")]
+                    if let Some(metrics) = &kv_ctx.metrics {
+                        metrics.change_rdma_connections(&format!("nic{}", nic_idx), -1);
+                    }
+                    if let Err(e) = result {
                         #[cfg(feature = "metrics")]
                         if let Some(metrics) = &kv_ctx.metrics {
                             metrics.record_rdma_error(&format!("nic{}", nic_idx), "disconnect");
-                            metrics.set_rdma_connection_state(&peer, false);
                         }
                         tracing::warn!(
                             "RDMA client {} (nic_idx={}) disconnected: {}",

@@ -47,7 +47,11 @@ impl KVServiceContext {
     #[cfg(not(feature = "metrics"))]
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let router = Arc::new(ShardRouter::new(&config)?);
-        let storage = Arc::new(StorageTier::new(&config, router.clone())?);
+        let storage = Arc::new(StorageTier::new_with_metrics(
+            &config,
+            router.clone(),
+            None,
+        )?);
         let metadata = storage.metadata();
         let memory = Arc::new(MemoryTier::new(&config, storage.clone()));
 
@@ -68,7 +72,11 @@ impl KVServiceContext {
     #[cfg(feature = "metrics")]
     pub fn new_with_metrics(config: Config, metrics: Option<Arc<Metrics>>) -> anyhow::Result<Self> {
         let router = Arc::new(ShardRouter::new(&config)?);
-        let storage = Arc::new(StorageTier::new(&config, router.clone())?);
+        let storage = Arc::new(StorageTier::new_with_metrics(
+            &config,
+            router.clone(),
+            metrics.clone(),
+        )?);
         let metadata = storage.metadata();
         let memory = Arc::new(MemoryTier::new(&config, storage.clone()));
 
