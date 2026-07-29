@@ -103,6 +103,15 @@ enum RingJob {
         reqs: Vec<(IORequest, PtrWrapperMut, usize)>,
         resp: channel::Sender<Vec<Result<usize>>>,
     },
+    /// Streaming counterpart of ReadAlignedIntoPtrBatch. A device worker sends one
+    /// completion directly to the shared receiver after its stripe has finished.
+    ReadAlignedIntoPtrStream {
+        job_id: u64,
+        queued_at: std::time::Instant,
+        original_index: usize,
+        req: (IORequest, PtrWrapperMut, usize),
+        completion: channel::Sender<(usize, Result<usize>)>,
+    },
     SingleRead {
         req: IORequest,
         resp: channel::Sender<Result<Vec<u8>>>,
@@ -417,6 +426,45 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                     },
                 );
                 let _ = resp.send(r);
+            }
+            RingJob::ReadAlignedIntoPtrStream {
+                job_id,
+                queued_at,
+                original_index,
+                req,
+                completion,
+            } => {
+                let started = std::time::Instant::now();
+                let queue_wait_us = started.duration_since(queued_at).as_micros() as u64;
+                let (request, _, capacity) = &req;
+                let result = do_read_aligned_into_ptr_batch(&mut ring, std::slice::from_ref(&req))
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Err(KVError::Internal("missing stream result".into())));
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "read",
+                    mode: "aligned_into_ptr_stream",
+                    device_id: device_idx as i64,
+                    job_id,
+                };
+                match &result {
+                    Ok(bytes_read) => log_io_request(context, request, *bytes_read, *bytes_read),
+                    Err(error) => log_io_error(context, request, *capacity, error),
+                }
+                log_io_batch(
+                    context,
+                    IoBatchStats {
+                        request_count: 1,
+                        success_count: if result.is_ok() { 1 } else { 0 },
+                        failure_count: if result.is_err() { 1 } else { 0 },
+                        requested_bytes: *capacity,
+                        completed_bytes: result.as_ref().ok().copied().unwrap_or(0),
+                        queue_wait_us,
+                        duration_us: started.elapsed().as_micros() as u64,
+                    },
+                );
+                let _ = completion.send((original_index, result));
             }
             RingJob::Shutdown => break,
         }
@@ -1965,27 +2013,20 @@ impl IOExecutor for TierBExecutor {
     /// soon as each IO finishes.
     /// Comparison with the batch version:
     /// - batch: collects all device batch_results and returns a Vec only after all done
-    /// - stream: each device worker pushes all its IO-completion events into a shared
-    ///   tx as soon as it finishes
+    /// - stream: forwards each completed stripe through a shared channel immediately
     ///
-    /// Note the current granularity is **per-device** (not per-IO — a device's N IOs
-    /// only push after they all complete):
-    /// - Our RDMA GET path is 8 stripes = 8 IOs = each on a different device (path
-    ///   prefix decides) → each device has 1 IO → push on completion is equivalent to
-    ///   per-IO.
-    /// - If a device holds multiple IOs, they still complete serially inside the batch
-    ///   (chunked SQEs within the batch impl), and once batch_results is done all IO
-    ///   events are pushed in one shot (gain is still "parallel across devices").
+    /// Each stream item is submitted as an independent job to its device worker. The
+    /// worker remains FIFO, so a device retains the queue depth used by one striped
+    /// read, but the first completed stripe can be handed to RDMA while the worker
+    /// reads the next stripe on that device. Grouping all stripes from one device in a
+    /// single batch would defer that notification until the whole group completed and
+    /// turn the intended storage/RDMA pipeline back into two serial phases.
     fn read_aligned_into_ptr_stream(
         &self,
         requests: Vec<(IORequest, *mut u8, usize)>,
     ) -> channel::Receiver<(usize, Result<usize>)> {
-        let n = requests.len();
         let (tx, rx) = channel::unbounded::<(usize, Result<usize>)>();
 
-        // Group by device (same as the batch impl).
-        let mut groups: BTreeMap<usize, Vec<(usize, (IORequest, PtrWrapperMut, usize))>> =
-            BTreeMap::new();
         for (orig_idx, (req, ptr, cap)) in requests.into_iter().enumerate() {
             let device_idx = self
                 .prefix_index
@@ -1993,68 +2034,26 @@ impl IOExecutor for TierBExecutor {
                 .find(|(p, _)| req.path.starts_with(p))
                 .map(|(_, i)| *i)
                 .unwrap_or(0);
-            groups
-                .entry(device_idx)
-                .or_default()
-                .push((orig_idx, (req, PtrWrapperMut(ptr), cap)));
-        }
-
-        if groups.is_empty() {
-            return rx;
-        }
-
-        // Each device group spawns its own forwarder thread:
-        // take batch_results from the device worker → immediately push each IO's
-        // completion into the shared tx. So the order events reach tx matches the
-        // order devices finish.
-        for (device_idx, group) in groups {
-            let (resp_tx, resp_rx) = channel::bounded::<Vec<Result<usize>>>(1);
-            let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
-            let reqs: Vec<(IORequest, PtrWrapperMut, usize)> =
-                group.into_iter().map(|(_, p)| p).collect();
             let worker = &self.devices[device_idx];
             let job_id = self.job_seq.fetch_add(1, Ordering::Relaxed);
             if worker
                 .sender
-                .send(RingJob::ReadAlignedIntoPtrBatch {
+                .send(RingJob::ReadAlignedIntoPtrStream {
                     job_id,
                     queued_at: std::time::Instant::now(),
-                    reqs,
-                    resp: resp_tx,
+                    original_index: orig_idx,
+                    req: (req, PtrWrapperMut(ptr), cap),
+                    completion: tx.clone(),
                 })
                 .is_err()
             {
-                for i in orig_indices {
-                    let _ = tx.send((i, Err(KVError::Internal("worker shut down".into()))));
-                }
-                continue;
+                let _ = tx.send((orig_idx, Err(KVError::Internal("worker shut down".into()))));
             }
-            // forwarder: separate thread waits on the device worker and pushes the
-            // result into the shared tx (uses std thread because device worker
-            // rx.recv() is blocking).
-            let tx_clone = tx.clone();
-            std::thread::Builder::new()
-                .name(format!("stream-fwd-{}", device_idx))
-                .spawn(move || match resp_rx.recv() {
-                    Ok(batch_results) => {
-                        for (orig_idx, r) in orig_indices.into_iter().zip(batch_results) {
-                            let _ = tx_clone.send((orig_idx, r));
-                        }
-                    }
-                    Err(_) => {
-                        for i in orig_indices {
-                            let _ = tx_clone
-                                .send((i, Err(KVError::Internal("worker no response".into()))));
-                        }
-                    }
-                })
-                .expect("spawn stream forwarder");
         }
 
-        // Drop the original tx → rx naturally closes once all forwarder threads exit.
-        // (Note: forwarders hold tx_clone; the channel closes when the last one exits.)
+        // Device jobs hold completion clones, so the receiver closes after the final
+        // stripe has been sent.
         drop(tx);
-        let _ = n; // suppress unused warning
         rx
     }
 
@@ -2191,5 +2190,57 @@ mod tests {
             let want = &write_reqs[i].1;
             assert_eq!(r.unwrap().as_slice(), want.as_ref());
         }
+    }
+
+    #[test]
+    fn stream_read_populates_each_aligned_destination() {
+        let tmp = TempDir::new().unwrap();
+        let exec = setup_executor(&tmp, 2);
+        let payloads: Vec<Vec<u8>> = (0..4)
+            .map(|index| vec![index as u8 + 1; DIRECT_IO_ALIGN])
+            .collect();
+        let paths: Vec<PathBuf> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let path = tmp.path().join(format!("nvme{}/stripe-{}.bin", index % 2, index));
+                std::fs::write(&path, payload).unwrap();
+                path
+            })
+            .collect();
+        let mut buffers: Vec<AlignedBuffer> = (0..paths.len())
+            .map(|_| AlignedBuffer::new(DIRECT_IO_ALIGN, DIRECT_IO_ALIGN))
+            .collect();
+        let requests = paths
+            .iter()
+            .zip(buffers.iter_mut())
+            .map(|(path, buffer)| {
+                (
+                    IORequest {
+                        path: path.clone(),
+                        offset: 0,
+                        length: 0,
+                    },
+                    buffer.as_mut_ptr(),
+                    buffer.capacity(),
+                )
+            })
+            .collect();
+
+        let completions = exec.read_aligned_into_ptr_stream(requests);
+        let mut seen = vec![false; payloads.len()];
+        for _ in 0..payloads.len() {
+            let (index, bytes_read) = completions
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("stream completion");
+            assert_eq!(bytes_read.unwrap(), DIRECT_IO_ALIGN);
+            assert!(!seen[index], "duplicate completion for stripe {}", index);
+            seen[index] = true;
+            let actual = unsafe {
+                std::slice::from_raw_parts(buffers[index].as_mut_ptr(), DIRECT_IO_ALIGN)
+            };
+            assert_eq!(actual, payloads[index].as_slice());
+        }
+        assert_eq!(seen, vec![true; payloads.len()]);
     }
 }

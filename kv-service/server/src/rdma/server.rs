@@ -747,7 +747,6 @@ fn try_serve_get_via_slab_with_meta(
     let view = extent.view(nic_idx);
     let t_post_start = std::time::Instant::now();
     let mut n_writes_posted = 0u64;
-    let mut last_wr_id = 0u64;
     let mut had_error: Option<String> = None;
     // Track each stripe's completion time relative to stream_start along with its stripe_idx
     let mut stripe_finish_times_us: Vec<(u64, usize)> = Vec::with_capacity(8);
@@ -756,8 +755,8 @@ fn try_serve_get_via_slab_with_meta(
         let t_now_us = t_stream_start.elapsed().as_micros() as u64;
         stripe_finish_times_us.push((t_now_us, stripe_idx));
         match result {
-            Ok(_bytes_read) => {
-                qp.post_write(
+            Ok(bytes_read) if bytes_read == stripe_len && had_error.is_none() => {
+                if let Err(error) = qp.post_write(
                     stripe_idx as u64,
                     view.addr + offset_in_value as u64,
                     view.lkey,
@@ -765,33 +764,50 @@ fn try_serve_get_via_slab_with_meta(
                     dst_rkey,
                     stripe_len as u32,
                     true, // signaled
-                )?;
-                n_writes_posted += 1;
-                last_wr_id = stripe_idx as u64;
+                ) {
+                    had_error = Some(format!(
+                        "post RDMA write for stripe {}: {}",
+                        stripe_idx, error
+                    ));
+                } else {
+                    n_writes_posted += 1;
+                }
             }
-            Err(e) => {
-                had_error = Some(format!("{}", e));
-                break;
+            Ok(bytes_read) if bytes_read != stripe_len && had_error.is_none() => {
+                had_error = Some(format!(
+                    "stripe {} short read: expected {} bytes, got {}",
+                    stripe_idx, stripe_len, bytes_read
+                ));
             }
+            Ok(_) => {}
+            Err(e) if had_error.is_none() => {
+                had_error = Some(format!("stripe {} read failed: {}", stripe_idx, e));
+            }
+            Err(_) => {}
         }
     }
     let t_post_done = t_post_start.elapsed().as_micros() as u64;
 
-    if let Some(e) = had_error {
-        return Err(anyhow!("stripe read failed: {}", e));
-    }
-    if n_writes_posted == 0 {
-        return Err(anyhow!("no stripes posted"));
-    }
-
-    // 5. Poll all N WRITE completions (each is signaled)
+    // 5. Drain every posted WRITE before returning, including when a later stripe
+    // failed. The slab extent backs in-flight RNIC DMA and must not be released early.
     let t_poll_start = std::time::Instant::now();
-    RcQp::poll_n(client_cq, n_writes_posted as usize)?;
+    let poll_result = if n_writes_posted > 0 {
+        RcQp::poll_n(client_cq, n_writes_posted as usize)
+    } else {
+        Ok(())
+    };
     let t_poll_done = std::time::Instant::now();
-    let _ = last_wr_id;
 
     let post_us = t_post_done;
     let poll_us = t_poll_done.duration_since(t_poll_start).as_micros() as u64;
+
+    if let Some(error) = had_error {
+        return Err(anyhow!("RDMA GET stream failed: {}", error));
+    }
+    poll_result?;
+    if n_writes_posted == 0 {
+        return Err(anyhow!("no stripes posted"));
+    }
 
     // 6. Inject into chunks_cache (slab-backed) so subsequent GETs cache-hit.
     // **DIAGNOSTIC TOGGLE**: with CS_FORCE_DISK_READ=1 we skip injection, so the next GET
