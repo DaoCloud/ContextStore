@@ -933,6 +933,7 @@ fn descriptor_meta_from_req(
             chunk_paths,
             total_size: req.size,
             chunk_locations: Vec::new(),
+            chunk_checksums: Vec::new(),
         });
     } else {
         let device_id = kv_ctx.router.route(key);
@@ -957,7 +958,9 @@ fn handle_descriptor_get(
 ) -> Result<()> {
     let req = wire::recv_descriptor_get_req_body(stream)?;
     let kv_key = parse_string_key(&req.key)?;
-    let descriptor_meta = descriptor_meta_from_req(kv_ctx, &kv_key, &req)?;
+    // Validate descriptor layout fields before consulting the authoritative metadata. The actual
+    // metadata is used for I/O so optional per-stripe checksums cannot be omitted by a client.
+    let _ = descriptor_meta_from_req(kv_ctx, &kv_key, &req)?;
 
     let active_meta = match kv_ctx.metadata.get_block(&kv_key.to_string_key())? {
         Some(meta) => meta,
@@ -1010,7 +1013,7 @@ fn handle_descriptor_get(
             qp,
             client_cq,
             &kv_key,
-            &descriptor_meta,
+            &active_meta,
             req.dst_addr,
             req.dst_rkey,
             req.max_size,
@@ -1025,7 +1028,7 @@ fn handle_descriptor_get(
                 );
                 match kv_ctx
                     .storage
-                    .get_chunks_with_meta(&kv_key, &descriptor_meta)
+                    .get_chunks_with_meta(&kv_key, &active_meta)
                 {
                     Ok(Some((segments, _meta))) => {
                         let (found, bytes, chunks, _reg_post_us, _poll_us) = serve_get_fallback(

@@ -16,12 +16,13 @@ use crate::router::{ObjectKey, ShardRouter};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use prost::bytes::{Bytes, BytesMut};
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
-use twox_hash::xxh3::hash64;
+use twox_hash::xxh3::{hash64, Hash64 as Xxh3Hash64};
 
 const DIRECT_IO_ALIGNMENT: usize = 4096;
 
@@ -33,6 +34,7 @@ pub struct StorageTier {
     striping_threshold: u64,
     striping_chunk_size: u64,
     rdma_stream_chunk_size: usize,
+    verify_stripe_checksums: bool,
     executor_name: String,
     device_labels: Vec<String>,
     metrics: Option<Arc<Metrics>>,
@@ -81,6 +83,7 @@ impl StorageTier {
             rdma_stream_chunk_size: (config.storage.rdma_stream_chunk_size as usize)
                 .max(DIRECT_IO_ALIGNMENT)
                 & !(DIRECT_IO_ALIGNMENT - 1),
+            verify_stripe_checksums: config.storage.verify_stripe_checksums,
             executor_name: config.io_executor.kind.clone(),
             device_labels: (0..num_devices)
                 .map(|device_id| format!("nvme{}", device_id))
@@ -112,6 +115,11 @@ impl StorageTier {
 
     pub fn striping_chunk_size(&self) -> u64 {
         self.striping_chunk_size
+    }
+
+    /// Whether striped disk reads are protected by persisted per-stripe checksums.
+    pub fn verify_stripe_checksums(&self) -> bool {
+        self.verify_stripe_checksums
     }
 
     pub fn device_read_bytes(&self, device_id: usize) -> u64 {
@@ -157,6 +165,73 @@ impl StorageTier {
 
     fn file_size(path: &Path) -> u64 {
         std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    fn checksum_bytes(data: &[u8]) -> String {
+        format!("{:016x}", hash64(data))
+    }
+
+    fn checksum_segments(segments: &[Bytes]) -> String {
+        let mut hasher = Xxh3Hash64::default();
+        for segment in segments {
+            hasher.write(segment);
+        }
+        format!("{:016x}", hasher.finish())
+    }
+
+    fn checksum_ptr(ptr: *const u8, len: usize) -> String {
+        // The caller guarantees that this range is valid and initialized by the I/O operation.
+        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+        Self::checksum_bytes(data)
+    }
+
+    fn expected_stripe_checksum<'a>(
+        &self,
+        stripe: &'a StripingInfo,
+        stripe_index: usize,
+    ) -> Result<Option<&'a str>> {
+        if !self.verify_stripe_checksums {
+            return Ok(None);
+        }
+        stripe
+            .chunk_checksums
+            .get(stripe_index)
+            .filter(|checksum| !checksum.is_empty())
+            .map(String::as_str)
+            .map(Some)
+            .ok_or_else(|| {
+                KVError::NotFound(format!(
+                    "striped object has no checksum for stripe {}; rewrite required",
+                    stripe_index
+                ))
+            })
+    }
+
+    fn verify_stripe_bytes(
+        &self,
+        stripe: &StripingInfo,
+        stripe_index: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some(expected) = self.expected_stripe_checksum(stripe, stripe_index)? else {
+            return Ok(());
+        };
+        let actual = Self::checksum_bytes(data);
+        if actual == expected {
+            return Ok(());
+        }
+        tracing::warn!(
+            event = "stripe_integrity_check_failed",
+            stripe_index,
+            expected_checksum = expected,
+            actual_checksum = actual,
+            bytes = data.len(),
+            "stripe checksum mismatch"
+        );
+        Err(KVError::NotFound(format!(
+            "striped object checksum mismatch for stripe {}",
+            stripe_index
+        )))
     }
 
     fn observe_io<T>(
@@ -493,7 +568,7 @@ impl StorageTier {
         generation: u64,
         layout_version: u64,
         data: Bytes,
-    ) -> Result<(u32, String)> {
+    ) -> Result<(u32, String, String)> {
         let device_id = self.router.chunk_device(key, stripe_index);
         let path = self.router.chunk_versioned_path(
             key,
@@ -505,11 +580,15 @@ impl StorageTier {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        let checksum = self
+            .verify_stripe_checksums
+            .then(|| Self::checksum_bytes(&data))
+            .unwrap_or_default();
         self.write_file_on_device(device_id, &path, &data)?;
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        Ok((device_id as u32, path.to_string_lossy().to_string()))
+        Ok((device_id as u32, path.to_string_lossy().to_string(), checksum))
     }
 
     /// Validate that a placement chunk handle matches the descriptor identity and router layout.
@@ -552,6 +631,7 @@ impl StorageTier {
         &self,
         storage_handle: &str,
         expected_len: u64,
+        expected_checksum: &str,
     ) -> Result<Option<Bytes>> {
         let path = PathBuf::from(storage_handle);
         self.ensure_managed_path(&path)?;
@@ -572,6 +652,27 @@ impl StorageTier {
                 data.len(),
                 path.display()
             )));
+        }
+        if self.verify_stripe_checksums {
+            if expected_checksum.is_empty() {
+                return Err(KVError::NotFound(
+                    "placement chunk has no checksum; rewrite required".to_string(),
+                ));
+            }
+            let actual = Self::checksum_bytes(&data);
+            if actual != expected_checksum {
+                tracing::warn!(
+                    event = "stripe_integrity_check_failed",
+                    expected_checksum,
+                    actual_checksum = actual,
+                    bytes = data.len(),
+                    path = %path.display(),
+                    "placement chunk checksum mismatch"
+                );
+                return Err(KVError::NotFound(
+                    "placement chunk checksum mismatch".to_string(),
+                ));
+            }
         }
         self.reads_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_read
@@ -897,6 +998,7 @@ impl StorageTier {
 
         let mut chunk_devices: Vec<u32> = Vec::with_capacity(n_stripes);
         let mut chunk_paths: Vec<String> = Vec::with_capacity(n_stripes);
+        let mut chunk_checksums: Vec<String> = Vec::with_capacity(n_stripes);
         let mut io_items: Vec<(IORequest, *const u8, usize)> = Vec::with_capacity(n_stripes);
 
         for i in 0..n_stripes {
@@ -921,6 +1023,9 @@ impl StorageTier {
             // Key point: slab ptr + offset, no memory copy. SLAB_ALIGN=4096 guarantees sub-segments
             // are also 4K-aligned (chunk_size default 64MB is an integer multiple of 4K).
             let stripe_ptr = unsafe { ptr.add(stripe_start) };
+            if self.verify_stripe_checksums {
+                chunk_checksums.push(Self::checksum_ptr(stripe_ptr, stripe_len));
+            }
             io_items.push((
                 IORequest {
                     path,
@@ -973,6 +1078,7 @@ impl StorageTier {
             chunk_paths,
             total_size: total as u64,
             chunk_locations: Vec::new(),
+            chunk_checksums,
         });
         let new_paths = meta
             .striping
@@ -1173,6 +1279,7 @@ impl StorageTier {
 
         let mut chunk_devices: Vec<u32> = Vec::with_capacity(n_stripes);
         let mut chunk_paths: Vec<String> = Vec::with_capacity(n_stripes);
+        let mut chunk_checksums: Vec<String> = Vec::with_capacity(n_stripes);
 
         // Rebucket segments on chunk_size boundaries: each stripe = Vec<Bytes>.
         // Time complexity O(segments + stripes); only Bytes::slice (Arc bump), no large buffer
@@ -1209,6 +1316,9 @@ impl StorageTier {
         let mut io_items: Vec<(IORequest, Vec<Bytes>)> = Vec::with_capacity(n_stripes);
         for (i, stripe_segs) in stripes.into_iter().enumerate() {
             let stripe_len: usize = stripe_segs.iter().map(|s| s.len()).sum();
+            if self.verify_stripe_checksums {
+                chunk_checksums.push(Self::checksum_segments(&stripe_segs));
+            }
             let dev_id = self.router.chunk_device(key, i);
             let path = self.router.chunk_versioned_path(
                 key,
@@ -1271,6 +1381,7 @@ impl StorageTier {
             chunk_paths,
             total_size: total as u64,
             chunk_locations: Vec::new(),
+            chunk_checksums,
         });
         let new_paths = meta
             .striping
@@ -1360,6 +1471,7 @@ impl StorageTier {
             if let Some(device_id) = stripe.chunk_devices.get(i) {
                 self.record_device_read(*device_id as usize, chunk.len() as u64);
             }
+            self.verify_stripe_bytes(stripe, i, &chunk)?;
             out.push(chunk);
         }
         Ok(out)
@@ -1577,6 +1689,22 @@ impl StorageTier {
             if let Some(device_id) = stripe.chunk_devices.get(i) {
                 self.record_device_read(*device_id as usize, n as u64);
             }
+            let stripe_offset = i * chunk_size;
+            let stripe_len = ((i + 1) * chunk_size).min(total) - stripe_offset;
+            if n != stripe_len {
+                self.delete_metadata_if_current(key, &meta)?;
+                return Ok(None);
+            }
+            let stripe_ptr = unsafe { ptr.add(stripe_offset) };
+            if let Err(KVError::NotFound(_)) = self.verify_stripe_bytes(
+                stripe,
+                i,
+                // The executor has completed this stripe before returning its byte count.
+                unsafe { std::slice::from_raw_parts(stripe_ptr, stripe_len) },
+            ) {
+                self.delete_metadata_if_current(key, &meta)?;
+                return Ok(None);
+            }
             total_read += n;
         }
         if total_read != total {
@@ -1779,10 +1907,111 @@ impl StorageTier {
         let (tx_out, rx_out) = crossbeam_channel::unbounded();
         let device_read_bytes = self.device_read_bytes_total.clone();
         let chunk_devices = stripe.chunk_devices.clone();
+        let chunk_checksums = stripe.chunk_checksums.clone();
+        let integrity_enabled = self.verify_stripe_checksums;
         let metadata = self.metadata.clone();
         let cleanup_key = str_key.clone();
         let cleanup_meta = meta.clone();
+        let ptr_addr = ptr as usize;
         std::thread::spawn(move || {
+            if integrity_enabled {
+                let mut per_stripe: Vec<Vec<(usize, Result<usize>)>> =
+                    (0..n_stripes).map(|_| Vec::new()).collect();
+                let mut expected_counts = vec![0usize; n_stripes];
+                for (stripe_idx, _, _) in &stream_meta {
+                    expected_counts[*stripe_idx] += 1;
+                }
+
+                while let Ok((idx, result)) = raw_rx.recv() {
+                    if idx >= stream_meta.len() {
+                        continue;
+                    }
+                    let stripe_idx = stream_meta[idx].0;
+                    per_stripe[stripe_idx].push((idx, result));
+                    if per_stripe[stripe_idx].len() != expected_counts[stripe_idx] {
+                        continue;
+                    }
+
+                    let stripe_offset = stripe_idx * chunk_size;
+                    let stripe_len = ((stripe_idx + 1) * chunk_size).min(total) - stripe_offset;
+                    let mut integrity_error = per_stripe[stripe_idx]
+                        .iter()
+                        .find_map(|(event_idx, result)| match result {
+                            Ok(n) if *n == stream_meta[*event_idx].2 => None,
+                            Ok(_) => Some(KVError::NotFound(format!(
+                                "striped object short read for stripe {}",
+                                stripe_idx
+                            ))),
+                            Err(error) if StorageTier::is_not_found_error(error) => {
+                                Some(KVError::NotFound(format!(
+                                    "striped object missing chunk {}",
+                                    stripe_idx
+                                )))
+                            }
+                            Err(error) => Some(KVError::Internal(format!(
+                                "read striped chunk {}: {}",
+                                stripe_idx, error
+                            ))),
+                        });
+                    if integrity_error.is_none() {
+                        let expected = chunk_checksums
+                            .get(stripe_idx)
+                            .filter(|checksum| !checksum.is_empty());
+                        integrity_error = match expected {
+                            Some(expected) => {
+                                let data = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (ptr_addr + stripe_offset) as *const u8,
+                                        stripe_len,
+                                    )
+                                };
+                                let actual = StorageTier::checksum_bytes(data);
+                                if actual == *expected {
+                                    None
+                                } else {
+                                    tracing::warn!(
+                                        event = "stripe_integrity_check_failed",
+                                        stripe_index = stripe_idx,
+                                        expected_checksum = %expected,
+                                        actual_checksum = %actual,
+                                        bytes = stripe_len,
+                                        "stripe checksum mismatch"
+                                    );
+                                    Some(KVError::NotFound(format!(
+                                        "striped object checksum mismatch for stripe {}",
+                                        stripe_idx
+                                    )))
+                                }
+                            }
+                            None => Some(KVError::NotFound(format!(
+                                "striped object has no checksum for stripe {}; rewrite required",
+                                stripe_idx
+                            ))),
+                        };
+                    }
+
+                    if let Some(error) = integrity_error {
+                        let _ = metadata.delete_block_if_matches(&cleanup_key, &cleanup_meta);
+                        let (event_idx, off, len) = stream_meta[per_stripe[stripe_idx][0].0];
+                        let _ = tx_out.send((event_idx, off, len, Err(error)));
+                        continue;
+                    }
+
+                    for (event_idx, result) in per_stripe[stripe_idx].drain(..) {
+                        if let Ok(n) = result.as_ref() {
+                            if let Some(device_id) = chunk_devices.get(stripe_idx) {
+                                if let Some(counter) = device_read_bytes.get(*device_id as usize) {
+                                    counter.fetch_add(*n as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        let (_, off, len) = stream_meta[event_idx];
+                        let _ = tx_out.send((event_idx, off, len, result));
+                    }
+                }
+                return;
+            }
+
             while let Ok((idx, result)) = raw_rx.recv() {
                 if idx < stream_meta.len() {
                     let result = match result {
@@ -2138,6 +2367,90 @@ mod tests {
     }
 
     #[test]
+    fn stripe_integrity_is_opt_in_and_corruption_becomes_cache_miss() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        cfg.storage.verify_stripe_checksums = true;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "integrity/striped".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"abcdefghijkl"), mk_meta())
+            .unwrap();
+        let meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+        let stripe = meta.striping.as_ref().unwrap();
+        assert_eq!(stripe.chunk_checksums.len(), 3);
+        assert!(stripe.chunk_checksums.iter().all(|checksum| checksum.len() == 16));
+
+        std::fs::write(&stripe.chunk_paths[1], b"XXXX").unwrap();
+        assert!(st.get(&key).unwrap().is_none());
+        assert!(st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stripe_integrity_disabled_keeps_legacy_read_behavior() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "integrity/disabled".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"abcdefghijkl"), mk_meta())
+            .unwrap();
+        let meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+        let stripe = meta.striping.as_ref().unwrap();
+        assert!(stripe.chunk_checksums.is_empty());
+
+        std::fs::write(&stripe.chunk_paths[1], b"XXXX").unwrap();
+        let (data, _) = st.get(&key).unwrap().unwrap();
+        assert_eq!(data.as_ref(), b"abcdXXXXijkl");
+    }
+
+    #[test]
+    fn placement_chunk_integrity_rejects_corruption() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.verify_stripe_checksums = true;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "integrity/placement".into(),
+        };
+
+        let (_device_id, path, checksum) = st
+            .put_placement_chunk(&key, 0, 1, 1, Bytes::from_static(b"placement"))
+            .unwrap();
+        std::fs::write(&path, b"corrupted").unwrap();
+        let err = st
+            .read_placement_chunk(&path, 9, &checksum)
+            .unwrap_err();
+        assert!(matches!(err, KVError::NotFound(_)));
+    }
+
+    #[test]
     fn metadata_put_failure_rolls_back_single_file() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(tmp.path());
@@ -2183,6 +2496,7 @@ mod tests {
             ],
             total_size: 5,
             chunk_locations: Vec::new(),
+            chunk_checksums: Vec::new(),
         });
 
         assert!(st.delete_files_for_meta(&key, &meta).is_err());

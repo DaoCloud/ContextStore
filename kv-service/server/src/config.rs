@@ -98,6 +98,13 @@ pub struct StorageConfig {
     /// read in smaller, 4 KiB-aligned ranges so disk reads and RDMA writes can overlap.
     #[serde(default = "default_rdma_stream_chunk_size")]
     pub rdma_stream_chunk_size: u64,
+    /// Verify an xxh3-64 checksum for every striped chunk before serving a disk read.
+    ///
+    /// Disabled by default so the normal cache path does not incur an additional memory scan.
+    /// When enabled, striped values written before this setting was enabled have no checksum and
+    /// are treated as cache misses until rewritten.
+    #[serde(default)]
+    pub verify_stripe_checksums: bool,
 }
 
 fn default_striping_threshold() -> u64 {
@@ -120,6 +127,7 @@ impl Default for StorageConfig {
             striping_threshold: default_striping_threshold(),
             striping_chunk_size: default_striping_chunk_size(),
             rdma_stream_chunk_size: default_rdma_stream_chunk_size(),
+            verify_stripe_checksums: false,
         }
     }
 }

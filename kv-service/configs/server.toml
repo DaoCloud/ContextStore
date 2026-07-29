@@ -24,6 +24,9 @@ data_subdir = "contextstore"
 striping_threshold = 268435456    # 256 MB
 striping_chunk_size = 67108864    # 64 MB
 rdma_stream_chunk_size = 8388608  # 8 MB; disk-read/RDMA pipeline granularity
+# Optional data-integrity mode. Computes and verifies xxh3-64 per physical stripe.
+# Existing striped cache entries without checksums become cache misses after enabling it.
+verify_stripe_checksums = false
 
 [memory_tier]
 # L1 in-memory cache capacity

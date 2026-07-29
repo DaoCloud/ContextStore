@@ -58,7 +58,7 @@ KVService exposes an **object store** (not a byte-addressable KV): each write pr
 | `object_generation` | Content generation; monotonically increases on overwrite of the same key |
 | `content_etag` | Lightweight content-identity token (avoids re-hashing large payloads on every GET) |
 | `layout_version` | Physical layout version; bumped by rebalance / migration without changing content |
-| `striping` | Optional `StripingInfo{chunk_size, chunk_devices, chunk_paths, total_size, chunk_locations}` for objects striped across multiple NVMe / nodes |
+| `striping` | Optional `StripingInfo{chunk_size, chunk_devices, chunk_paths, total_size, chunk_locations, chunk_checksums}` for objects striped across multiple NVMe / nodes |
 
 **Descriptor-based reads.** The gRPC surface splits read into two RPCs:
 

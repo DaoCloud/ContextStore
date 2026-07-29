@@ -35,6 +35,9 @@ pub struct ChunkLocation {
     pub storage_handle: String,
     pub offset: u64,
     pub length: u64,
+    /// xxh3-64 checksum of the physical stripe, encoded as lowercase hexadecimal.
+    #[serde(default)]
+    pub checksum: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +56,11 @@ pub struct StripingInfo {
     /// placement derived from chunk_paths/chunk_devices.
     #[serde(default)]
     pub chunk_locations: Vec<ChunkLocation>,
+    /// xxh3-64 checksum for each chunk, indexed by chunk 0..N.
+    ///
+    /// Empty means the object was written while optional stripe integrity was disabled.
+    #[serde(default)]
+    pub chunk_checksums: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
