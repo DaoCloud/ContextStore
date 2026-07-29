@@ -49,6 +49,13 @@ struct Args {
     /// Number of iterations
     #[arg(long, default_value_t = 5usize)]
     iters: usize,
+
+    /// Clear the complete receive buffer before every request.
+    ///
+    /// Disabled by default because clearing multi-GiB buffers between requests lowers
+    /// the sustained disk duty cycle while being outside the timed RDMA transfer.
+    #[arg(long, default_value_t = false)]
+    clear_buffer: bool,
 }
 
 const MSG_HELLO: u8 = 1;
@@ -280,14 +287,27 @@ fn main() -> Result<()> {
             return Err(anyhow!("modify_qp RTS: {}", rc));
         }
 
-        println!("[client] QP established. starting benchmark...");
+        println!(
+            "[client] QP established. starting benchmark (validation={})...",
+            if args.clear_buffer {
+                "full_buffer_clear"
+            } else {
+                "prefix_sentinel"
+            }
+        );
 
         // ===== 5. Run N GETs =====
         let mut latencies = Vec::new();
         let mut last_bytes = 0u64;
         for i in 0..args.iters {
-            // Zero the buffer so we can verify the server really wrote to it.
-            std::ptr::write_bytes(buf_ptr, 0u8, buf_size);
+            // A small sentinel proves the RDMA WRITE updated the target without adding a
+            // multi-GiB host-memory memset between requests. The full clear remains useful
+            // for diagnostics but must be explicitly requested.
+            if args.clear_buffer {
+                std::ptr::write_bytes(buf_ptr, 0u8, buf_size);
+            } else {
+                std::ptr::write_bytes(buf_ptr, 0xff, 64.min(buf_size));
+            }
 
             let t0 = Instant::now();
 
@@ -326,7 +346,7 @@ fn main() -> Result<()> {
             // Verify data: cs-bench combined fills with the (i % 251) pattern.
             // Look at the first few bytes.
             let head = std::slice::from_raw_parts(buf_ptr, 16.min(bytes_written as usize));
-            let expected: Vec<u8> = (0..16).map(|i| (i % 251) as u8).collect();
+            let expected: Vec<u8> = (0..head.len()).map(|i| (i % 251) as u8).collect();
             let matches = head == expected.as_slice();
             let bw_gbps = (bytes_written as f64 * 8.0) / dt.as_secs_f64() / 1e9;
             let bw_gb = (bytes_written as f64) / dt.as_secs_f64() / (1024.0 * 1024.0 * 1024.0);
