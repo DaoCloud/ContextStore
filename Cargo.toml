@@ -11,3 +11,9 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# rdma-sys 0.3.0 pins bindgen 0.59, which cannot parse recent rdma-core headers.
+# Keep the API-compatible crate source local so RDMA builds are reproducible on current
+# Mellanox/rdma-core distributions.
+[patch.crates-io]
+rdma-sys = { path = "kv-service/vendor/rdma-sys" }

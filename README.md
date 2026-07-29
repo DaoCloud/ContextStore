@@ -200,6 +200,16 @@ make lint                      # run Rust clippy checks
 profile. `make proto`, `make proto-rust`, and `make proto-python` regenerate
 protocol bindings; the Python targets require `grpcio-tools`.
 
+### RDMA prerequisites
+
+RDMA-enabled builds require Linux `rdma-core` development packages
+(`libibverbs` and `librdmacm` headers and libraries) plus Clang for bindgen.
+At runtime, the service needs a memlock limit large enough for its registered
+RDMA slab. For systemd deployments, set `LimitMEMLOCK=infinity` (or a value at
+least as large as the configured slab). Select a NIC with a valid RoCE v2 GID;
+`CS_RDMA_DEVICES=<device>:<listen-host>:<port>` overrides the default NIC and
+listener, while the current data plane uses GID index 3.
+
 ### Benchmarks
 
 ```bash
