@@ -62,6 +62,9 @@ impl QpInfo {
 }
 
 impl RcQp {
+    /// Maximum send work requests configured for each RDMA RC queue pair.
+    pub const MAX_SEND_WR: usize = 128;
+
     /// Create an RC QP in RESET state. Follow with to_init/to_rtr/to_rts.
     ///
     /// `cq`: dedicated CQ (per-client) to avoid races when multiple client threads poll the same CQ concurrently.
@@ -73,8 +76,8 @@ impl RcQp {
                 recv_cq: cq.as_ptr(),
                 srq: ptr::null_mut(),
                 cap: ibv_qp_cap {
-                    max_send_wr: 128,
-                    max_recv_wr: 128,
+                    max_send_wr: Self::MAX_SEND_WR as u32,
+                    max_recv_wr: Self::MAX_SEND_WR as u32,
                     max_send_sge: 4,
                     max_recv_sge: 4,
                     max_inline_data: 0,

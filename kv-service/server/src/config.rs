@@ -92,6 +92,12 @@ pub struct StorageConfig {
     /// Size of each chunk when striping (bytes)
     #[serde(default = "default_striping_chunk_size")]
     pub striping_chunk_size: u64,
+    /// Maximum RDMA cache-miss read size emitted by a storage stream (bytes).
+    ///
+    /// This does not change the on-disk striping layout. Large physical stripes are
+    /// read in smaller, 4 KiB-aligned ranges so disk reads and RDMA writes can overlap.
+    #[serde(default = "default_rdma_stream_chunk_size")]
+    pub rdma_stream_chunk_size: u64,
 }
 
 fn default_striping_threshold() -> u64 {
@@ -102,6 +108,10 @@ fn default_striping_chunk_size() -> u64 {
     64 * 1024 * 1024 // 64 MB
 }
 
+fn default_rdma_stream_chunk_size() -> u64 {
+    8 * 1024 * 1024 // 8 MB
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +119,7 @@ impl Default for StorageConfig {
             data_subdir: "contextstore".to_string(),
             striping_threshold: default_striping_threshold(),
             striping_chunk_size: default_striping_chunk_size(),
+            rdma_stream_chunk_size: default_rdma_stream_chunk_size(),
         }
     }
 }

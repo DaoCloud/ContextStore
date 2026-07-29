@@ -60,6 +60,7 @@ devices = ["./data/nvme0"]
 data_subdir = "contextstore"
 striping_threshold = 268435456
 striping_chunk_size = 67108864
+rdma_stream_chunk_size = 8388608
 
 [memory_tier]
 capacity_mb = 4096
@@ -102,6 +103,7 @@ listen = "0.0.0.0:9090"
 | `data_subdir` | `"contextstore"` | Subdirectory created below each configured device. |
 | `striping_threshold` | `268435456` | Object size threshold in bytes for internal striping. `0` disables striping. |
 | `striping_chunk_size` | `67108864` | Chunk size in bytes when striping is enabled. |
+| `rdma_stream_chunk_size` | `8388608` | Maximum 4 KiB-aligned range emitted by the RDMA disk-miss read stream. It preserves the physical striping layout while overlapping disk reads and RDMA writes. |
 
 KVService stores object data under each device's `data_subdir`. It creates
 subdirectories and object files; it does not format raw devices.

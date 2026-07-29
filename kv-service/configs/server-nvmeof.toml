@@ -27,6 +27,7 @@ data_subdir = "contextstore"
 # fully exploit 8-way disk parallelism.
 striping_threshold = 268435456    # 256 MB
 striping_chunk_size = 67108864    # 64 MB
+rdma_stream_chunk_size = 8388608  # 8 MB; disk-read/RDMA pipeline granularity
 
 [memory_tier]
 # Production L1 capacity

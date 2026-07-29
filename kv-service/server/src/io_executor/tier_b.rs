@@ -1218,7 +1218,7 @@ fn do_read_aligned_into_ptr_batch(
     let n = reqs.len();
     let mut results: Vec<Result<usize>> = (0..n).map(|_| Ok(0)).collect();
     let mut files: Vec<Option<std::fs::File>> = (0..n).map(|_| None).collect();
-    let mut file_sizes: Vec<usize> = vec![0; n];
+    let mut requested_lengths: Vec<usize> = vec![0; n];
 
     // sqe_plans[i] = Vec<(offset_in_file, ptr_in_buf, chunk_len)>
     let mut sqe_plans: Vec<Vec<(u64, *mut u8, u32)>> = (0..n).map(|_| Vec::new()).collect();
@@ -1243,15 +1243,37 @@ fn do_read_aligned_into_ptr_batch(
         }
         match open_for_direct_read(&req.path) {
             Ok((Some(f), file_size)) => {
-                if file_size == 0 {
+                let file_offset = req.offset as usize;
+                if file_offset > file_size {
+                    results[i] = Err(KVError::Internal(format!(
+                        "read_aligned_into_ptr: offset {} beyond file size {}",
+                        req.offset, file_size
+                    )));
+                    continue;
+                }
+                if file_offset % DIRECT_IO_ALIGN != 0 {
+                    results[i] = Err(KVError::Internal(format!(
+                        "read_aligned_into_ptr: offset {} not 4K-aligned",
+                        req.offset
+                    )));
+                    continue;
+                }
+                let requested_len = if req.length == 0 {
+                    file_size - file_offset
+                } else {
+                    req.length.min(file_size - file_offset)
+                };
+                if requested_len == 0 {
                     results[i] = Ok(0);
                     continue;
                 }
-                let aligned_len = (file_size + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
+                let aligned_len =
+                    (requested_len + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
                 if capacity < aligned_len {
                     results[i] = Err(KVError::Internal(format!(
-                        "read_aligned_into_ptr: capacity {} < aligned file_size {}",
-                        capacity, aligned_len
+                        "read_aligned_into_ptr: capacity {} < aligned requested range {} \
+                         (file_offset={}, request_length={}, file_size={})",
+                        capacity, aligned_len, req.offset, req.length, file_size
                     )));
                     continue;
                 }
@@ -1260,15 +1282,35 @@ fn do_read_aligned_into_ptr_batch(
                 while off < aligned_len {
                     let chunk_len = (aligned_len - off).min(MAX_AIO_CHUNK_READ);
                     let chunk_ptr = unsafe { dst_ptr.add(off) };
-                    sqe_plans[i].push((off as u64, chunk_ptr, chunk_len as u32));
+                    sqe_plans[i].push(((file_offset + off) as u64, chunk_ptr, chunk_len as u32));
                     off += chunk_len;
                 }
                 files[i] = Some(f);
-                file_sizes[i] = file_size;
+                requested_lengths[i] = requested_len;
             }
-            Ok((None, _file_size)) => {
+            Ok((None, file_size)) => {
                 // O_DIRECT not supported (container/filesystem): fall back to buffered sync
                 // read; use ordinary read then memcpy into ptr (slow path; rarely triggered).
+                let file_offset = req.offset as usize;
+                if file_offset > file_size {
+                    results[i] = Err(KVError::Internal(format!(
+                        "fallback read: offset {} beyond file size {}",
+                        req.offset, file_size
+                    )));
+                    continue;
+                }
+                let requested_len = if req.length == 0 {
+                    file_size - file_offset
+                } else {
+                    req.length.min(file_size - file_offset)
+                };
+                if requested_len > capacity {
+                    results[i] = Err(KVError::Internal(format!(
+                        "fallback read: requested {} > capacity {}",
+                        requested_len, capacity
+                    )));
+                    continue;
+                }
                 let f = match OpenOptions::new().read(true).open(&req.path) {
                     Ok(f) => f,
                     Err(e) => {
@@ -1276,23 +1318,19 @@ fn do_read_aligned_into_ptr_batch(
                         continue;
                     }
                 };
-                let file_size = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                if file_size > capacity {
-                    results[i] = Err(KVError::Internal(format!(
-                        "fallback read: file_size {} > capacity {}",
-                        file_size, capacity
-                    )));
-                    continue;
-                }
-                let mut buf = vec![0u8; file_size];
+                let mut buf = vec![0u8; requested_len];
                 use std::io::Read as _;
                 let mut f_mut = f;
-                match f_mut.read_exact(&mut buf) {
+                use std::io::{Seek as _, SeekFrom};
+                let read_result = f_mut
+                    .seek(SeekFrom::Start(req.offset))
+                    .and_then(|_| f_mut.read_exact(&mut buf));
+                match read_result {
                     Ok(()) => {
                         unsafe {
-                            std::ptr::copy_nonoverlapping(buf.as_ptr(), dst_ptr, file_size);
+                            std::ptr::copy_nonoverlapping(buf.as_ptr(), dst_ptr, requested_len);
                         }
-                        results[i] = Ok(file_size);
+                        results[i] = Ok(requested_len);
                     }
                     Err(e) => results[i] = Err(KVError::Io(e)),
                 }
@@ -1385,8 +1423,8 @@ fn do_read_aligned_into_ptr_batch(
     // ===== Phase 3: fill in return values (real file_size, not 4K padding) =====
     for i in 0..n {
         if !any_error[i] && files[i].is_some() {
-            // total_read[i] may be ≥ file_size (0-padded to 4K); take the real file_size.
-            results[i] = Ok(file_sizes[i].min(total_read[i]));
+            // total_read[i] may include the final 4K padding; return only the requested range.
+            results[i] = Ok(requested_lengths[i].min(total_read[i]));
         }
     }
 
@@ -2242,5 +2280,33 @@ mod tests {
             assert_eq!(actual, payloads[index].as_slice());
         }
         assert_eq!(seen, vec![true; payloads.len()]);
+    }
+
+    #[test]
+    fn stream_read_honors_aligned_range() {
+        let tmp = TempDir::new().unwrap();
+        let exec = setup_executor(&tmp, 1);
+        let path = tmp.path().join("nvme0/range.bin");
+        let mut payload = vec![0x11; DIRECT_IO_ALIGN];
+        payload.extend(vec![0x22; DIRECT_IO_ALIGN]);
+        std::fs::write(&path, &payload).unwrap();
+
+        let mut buffer = AlignedBuffer::new(DIRECT_IO_ALIGN, DIRECT_IO_ALIGN);
+        let completions = exec.read_aligned_into_ptr_stream(vec![(
+            IORequest {
+                path,
+                offset: DIRECT_IO_ALIGN as u64,
+                length: DIRECT_IO_ALIGN,
+            },
+            buffer.as_mut_ptr(),
+            buffer.capacity(),
+        )]);
+        let (index, bytes_read) = completions
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("range stream completion");
+        assert_eq!(index, 0);
+        assert_eq!(bytes_read.unwrap(), DIRECT_IO_ALIGN);
+        let actual = unsafe { std::slice::from_raw_parts(buffer.as_mut_ptr(), DIRECT_IO_ALIGN) };
+        assert_eq!(actual, vec![0x22; DIRECT_IO_ALIGN].as_slice());
     }
 }

@@ -23,6 +23,8 @@ use std::time::Instant;
 use tracing::debug;
 use twox_hash::xxh3::hash64;
 
+const DIRECT_IO_ALIGNMENT: usize = 4096;
+
 pub struct StorageTier {
     router: Arc<ShardRouter>,
     executor: Arc<dyn IOExecutor>,
@@ -30,6 +32,7 @@ pub struct StorageTier {
     write_locks: DashMap<String, Arc<Mutex<()>>>,
     striping_threshold: u64,
     striping_chunk_size: u64,
+    rdma_stream_chunk_size: usize,
     executor_name: String,
     device_labels: Vec<String>,
     metrics: Option<Arc<Metrics>>,
@@ -75,6 +78,9 @@ impl StorageTier {
             write_locks: DashMap::new(),
             striping_threshold: config.storage.striping_threshold,
             striping_chunk_size: config.storage.striping_chunk_size.max(1),
+            rdma_stream_chunk_size: (config.storage.rdma_stream_chunk_size as usize)
+                .max(DIRECT_IO_ALIGNMENT)
+                & !(DIRECT_IO_ALIGNMENT - 1),
             executor_name: config.io_executor.kind.clone(),
             device_labels: (0..num_devices)
                 .map(|device_id| format!("nvme{}", device_id))
@@ -1705,35 +1711,51 @@ impl StorageTier {
         }
 
         let n_stripes = stripe.chunk_paths.len();
-        let mut reqs: Vec<(IORequest, *mut u8, usize)> = Vec::with_capacity(n_stripes);
-        // Record each stripe's (offset_in_value, len) for event push.
-        let mut stripe_meta: Vec<(usize, usize)> = Vec::with_capacity(n_stripes);
+        let stream_chunk_size = self.rdma_stream_chunk_size;
+        let estimated_requests = n_stripes
+            .saturating_mul(chunk_size.div_ceil(stream_chunk_size));
+        let mut reqs: Vec<(IORequest, *mut u8, usize)> = Vec::with_capacity(estimated_requests);
+        // Record each streamed subrange's logical value offset and length.
+        let mut stream_meta: Vec<(usize, usize, usize)> = Vec::with_capacity(estimated_requests);
         for (i, p) in stripe.chunk_paths.iter().enumerate() {
             let stripe_offset = i * chunk_size;
             let stripe_end = ((i + 1) * chunk_size).min(total);
             let stripe_len = stripe_end - stripe_offset;
-            let aligned_stripe = (stripe_len + 4095) & !4095;
-            let stripe_ptr = unsafe { ptr.add(stripe_offset) };
-            let stripe_cap = (capacity - stripe_offset).min((chunk_size + 4095) & !4095);
-            if stripe_cap < aligned_stripe {
-                return Err(KVError::Internal(format!(
-                    "stripe {} cap {} < aligned {}",
-                    i, stripe_cap, aligned_stripe
-                )));
+            for offset_in_stripe in (0..stripe_len).step_by(stream_chunk_size) {
+                let stream_len = (stripe_len - offset_in_stripe).min(stream_chunk_size);
+                let aligned_len = (stream_len + DIRECT_IO_ALIGNMENT - 1)
+                    & !(DIRECT_IO_ALIGNMENT - 1);
+                let offset_in_value = stripe_offset + offset_in_stripe;
+                let stream_ptr = unsafe { ptr.add(offset_in_value) };
+                let stream_cap = capacity - offset_in_value;
+                if stream_cap < aligned_len {
+                    return Err(KVError::Internal(format!(
+                        "stripe {} stream offset {} cap {} < aligned {}",
+                        i, offset_in_stripe, stream_cap, aligned_len
+                    )));
+                }
+                reqs.push((
+                    IORequest {
+                        path: std::path::PathBuf::from(p),
+                        offset: offset_in_stripe as u64,
+                        length: stream_len,
+                    },
+                    stream_ptr,
+                    aligned_len,
+                ));
+                stream_meta.push((i, offset_in_value, stream_len));
             }
-            reqs.push((
-                IORequest {
-                    path: std::path::PathBuf::from(p),
-                    offset: 0,
-                    length: 0,
-                },
-                stripe_ptr,
-                stripe_cap,
-            ));
-            stripe_meta.push((stripe_offset, stripe_len));
         }
-        let min_stripe_len = stripe_meta.iter().map(|(_, len)| *len).min().unwrap_or(0);
-        let max_stripe_len = stripe_meta.iter().map(|(_, len)| *len).max().unwrap_or(0);
+        let min_stream_len = stream_meta
+            .iter()
+            .map(|(_, _, len)| *len)
+            .min()
+            .unwrap_or(0);
+        let max_stream_len = stream_meta
+            .iter()
+            .map(|(_, _, len)| *len)
+            .max()
+            .unwrap_or(0);
         debug!(
             target: "contextstore_server::storage_io",
             event = "storage_io_plan",
@@ -1741,10 +1763,12 @@ impl StorageTier {
             mode = "striped",
             key = %str_key,
             total_bytes = total,
-            chunk_size_bytes = chunk_size,
-            request_count = n_stripes,
-            min_request_bytes = min_stripe_len,
-            max_request_bytes = max_stripe_len,
+            stripe_chunk_size_bytes = chunk_size,
+            stream_chunk_size_bytes = stream_chunk_size,
+            stripe_count = n_stripes,
+            request_count = reqs.len(),
+            min_request_bytes = min_stream_len,
+            max_request_bytes = max_stream_len,
         );
 
         // Call executor's stream API to get an (idx, Result) event stream.
@@ -1760,7 +1784,7 @@ impl StorageTier {
         let cleanup_meta = meta.clone();
         std::thread::spawn(move || {
             while let Ok((idx, result)) = raw_rx.recv() {
-                if idx < stripe_meta.len() {
+                if idx < stream_meta.len() {
                     let result = match result {
                         Err(e) if StorageTier::is_not_found_error(&e) => {
                             let _ = metadata.delete_block_if_matches(&cleanup_key, &cleanup_meta);
@@ -1772,13 +1796,14 @@ impl StorageTier {
                         other => other,
                     };
                     if let Ok(n) = result.as_ref() {
-                        if let Some(device_id) = chunk_devices.get(idx) {
+                        let stripe_idx = stream_meta[idx].0;
+                        if let Some(device_id) = chunk_devices.get(stripe_idx) {
                             if let Some(counter) = device_read_bytes.get(*device_id as usize) {
                                 counter.fetch_add(*n as u64, Ordering::Relaxed);
                             }
                         }
                     }
-                    let (off, len) = stripe_meta[idx];
+                    let (_, off, len) = stream_meta[idx];
                     let _ = tx_out.send((idx, off, len, result));
                 }
             }

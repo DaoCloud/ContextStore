@@ -23,6 +23,7 @@ data_subdir = "contextstore"
 # distributed across devices (round-robin). Set to 0 to disable striping.
 striping_threshold = 268435456    # 256 MB
 striping_chunk_size = 67108864    # 64 MB
+rdma_stream_chunk_size = 8388608  # 8 MB; disk-read/RDMA pipeline granularity
 
 [memory_tier]
 # L1 in-memory cache capacity
