@@ -106,8 +106,11 @@ the config file format and examples.
 
 `make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
 metrics. It produces the server, Rust client SDK, and RDMA C ABI under
-`target/release/`. Regenerate Python protobuf bindings only after changing the
-protocol:
+`target/release/`. Before building, it prints the selected profile, features,
+and protobuf compiler. `protoc` is discovered from an explicit `PROTOC`, a
+bundled repository tool, `/opt/contextstore/tools/protoc`, or the system
+`PATH`, in that order. Regenerate Python protobuf bindings only after changing
+the protocol:
 
 ```bash
 make proto
