@@ -11,6 +11,7 @@ use contextstore_server::metadata::{BlockMeta, StripingInfo};
 use contextstore_server::router::ObjectKey;
 use redis::Connection;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
@@ -33,6 +34,8 @@ struct Cli {
 enum Command {
     /// Inspect one object by a readable namespace/object-key pair or canonical key.
     Get(GetArgs),
+    /// List namespaces that currently have object metadata in Redis.
+    Namespaces,
     /// Search current object metadata by readable namespace and object-key prefix.
     List(ListArgs),
 }
@@ -58,9 +61,9 @@ struct ListArgs {
     /// Optional prefix of the logical object key.
     #[arg(long, default_value = "")]
     object_prefix: String,
-    /// Maximum number of matching entries to print after sorting.
-    #[arg(long, default_value_t = 50)]
-    limit: usize,
+    /// Optionally limit matching entries after sorting. By default every current key is shown.
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +80,12 @@ struct Entry {
     canonical_key: String,
     object_key: ObjectKey,
     metadata: BlockMeta,
+}
+
+#[derive(Serialize)]
+struct NamespaceSummary {
+    namespace: String,
+    object_count: usize,
 }
 
 fn main() -> Result<()> {
@@ -109,6 +118,10 @@ fn main() -> Result<()> {
             };
             print_entry(&entry, cli.json)?;
         }
+        Command::Namespaces => {
+            let namespaces = list_namespaces(&mut connection, &config)?;
+            print_namespaces(&namespaces, cli.json)?;
+        }
         Command::List(args) => {
             let entries = list_entries(&mut connection, &config, &args)?;
             print_entries(&entries, cli.json)?;
@@ -116,6 +129,46 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn list_namespaces(connection: &mut Connection, config: &Config) -> Result<Vec<NamespaceSummary>> {
+    let redis_prefix = block_redis_prefix(config);
+    let pattern = format!("{redis_prefix}*");
+    let mut cursor = 0_u64;
+    let mut object_counts = BTreeMap::<String, usize>::new();
+
+    loop {
+        let (next_cursor, redis_keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(256)
+            .query(connection)
+            .context("scan Redis metadata keys")?;
+
+        for redis_key in redis_keys {
+            let Some(canonical_key) = redis_key.strip_prefix(&redis_prefix) else {
+                continue;
+            };
+            let object_key = ObjectKey::from_string_key(canonical_key)
+                .with_context(|| format!("parse Redis metadata key {redis_key}"))?;
+            *object_counts.entry(object_key.namespace).or_default() += 1;
+        }
+
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    Ok(object_counts
+        .into_iter()
+        .map(|(namespace, object_count)| NamespaceSummary {
+            namespace,
+            object_count,
+        })
+        .collect())
 }
 
 fn resolve_get_key(args: GetArgs) -> Result<ObjectKey> {
@@ -203,7 +256,9 @@ fn list_entries(connection: &mut Connection, config: &Config, args: &ListArgs) -
         Ordering::Equal => left.object_key.object_key.cmp(&right.object_key.object_key),
         other => other,
     });
-    entries.truncate(args.limit);
+    if let Some(limit) = args.limit {
+        entries.truncate(limit);
+    }
     Ok(entries)
 }
 
@@ -235,6 +290,22 @@ fn print_entry(entry: &Entry, json: bool) -> Result<()> {
     );
     println!("TTL seconds:     {}", entry.metadata.ttl_seconds);
     print_striping(entry.metadata.striping.as_ref());
+    Ok(())
+}
+
+fn print_namespaces(namespaces: &[NamespaceSummary], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(namespaces)?);
+        return Ok(());
+    }
+    if namespaces.is_empty() {
+        println!("No current object metadata.");
+        return Ok(());
+    }
+    println!("NAMESPACE\tOBJECTS");
+    for namespace in namespaces {
+        println!("{}\t{}", namespace.namespace, namespace.object_count);
+    }
     Ok(())
 }
 

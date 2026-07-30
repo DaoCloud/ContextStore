@@ -130,6 +130,8 @@ Inspect Redis metadata without manually constructing a canonical key:
 
 ```bash
 make meta
+./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml namespaces
+
 ./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
   get --namespace rust-bench --object-key 'rdma-checksum0/**combined**'
 
@@ -137,8 +139,10 @@ make meta
   list --namespace rust-bench --object-prefix rdma-checksum
 ```
 
-The `get` output includes every stripe path, device, and checksum status. Use
-`--json` for the complete machine-readable metadata record.
+The `namespaces` command shows all current namespaces and object counts. The
+`list` command shows every current key in a namespace; `get` adds every stripe
+path, device, and checksum status for one key. Use `--json` for machine-readable
+output. Pass `--limit <count>` to truncate a large namespace listing.
 
 ### 3. Wire the Connector into vLLM
 
