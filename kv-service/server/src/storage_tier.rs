@@ -626,12 +626,15 @@ impl StorageTier {
         Ok(())
     }
 
-    /// Data-node internal API: read a stripe by a storage_handle previously returned by the server.
+    /// Data-node internal API: read a placement chunk by a server-generated storage handle.
+    ///
+    /// `expected_checksum` is present only for striped objects. A non-striped placement chunk
+    /// intentionally skips the optional stripe-integrity check.
     pub fn read_placement_chunk(
         &self,
         storage_handle: &str,
         expected_len: u64,
-        expected_checksum: &str,
+        expected_checksum: Option<&str>,
     ) -> Result<Option<Bytes>> {
         let path = PathBuf::from(storage_handle);
         self.ensure_managed_path(&path)?;
@@ -654,24 +657,26 @@ impl StorageTier {
             )));
         }
         if self.verify_stripe_checksums {
-            if expected_checksum.is_empty() {
-                return Err(KVError::NotFound(
-                    "placement chunk has no checksum; rewrite required".to_string(),
-                ));
-            }
-            let actual = Self::checksum_bytes(&data);
-            if actual != expected_checksum {
-                tracing::warn!(
-                    event = "stripe_integrity_check_failed",
-                    expected_checksum,
-                    actual_checksum = actual,
-                    bytes = data.len(),
-                    path = %path.display(),
-                    "placement chunk checksum mismatch"
-                );
-                return Err(KVError::NotFound(
-                    "placement chunk checksum mismatch".to_string(),
-                ));
+            if let Some(expected_checksum) = expected_checksum {
+                if expected_checksum.is_empty() {
+                    return Err(KVError::NotFound(
+                        "placement chunk has no checksum; rewrite required".to_string(),
+                    ));
+                }
+                let actual = Self::checksum_bytes(&data);
+                if actual != expected_checksum {
+                    tracing::warn!(
+                        event = "stripe_integrity_check_failed",
+                        expected_checksum,
+                        actual_checksum = actual,
+                        bytes = data.len(),
+                        path = %path.display(),
+                        "placement chunk checksum mismatch"
+                    );
+                    return Err(KVError::NotFound(
+                        "placement chunk checksum mismatch".to_string(),
+                    ));
+                }
             }
         }
         self.reads_total.fetch_add(1, Ordering::Relaxed);
@@ -1918,6 +1923,7 @@ impl StorageTier {
                 let mut per_stripe: Vec<Vec<(usize, Result<usize>)>> =
                     (0..n_stripes).map(|_| Vec::new()).collect();
                 let mut expected_counts = vec![0usize; n_stripes];
+                let mut metadata_deleted = false;
                 for (stripe_idx, _, _) in &stream_meta {
                     expected_counts[*stripe_idx] += 1;
                 }
@@ -1991,7 +1997,10 @@ impl StorageTier {
                     }
 
                     if let Some(error) = integrity_error {
-                        let _ = metadata.delete_block_if_matches(&cleanup_key, &cleanup_meta);
+                        if !metadata_deleted {
+                            let _ = metadata.delete_block_if_matches(&cleanup_key, &cleanup_meta);
+                            metadata_deleted = true;
+                        }
                         let (event_idx, off, len) = stream_meta[per_stripe[stripe_idx][0].0];
                         let _ = tx_out.send((event_idx, off, len, Err(error)));
                         continue;
@@ -2445,9 +2454,28 @@ mod tests {
             .unwrap();
         std::fs::write(&path, b"corrupted").unwrap();
         let err = st
-            .read_placement_chunk(&path, 9, &checksum)
+            .read_placement_chunk(&path, 9, Some(&checksum))
             .unwrap_err();
         assert!(matches!(err, KVError::NotFound(_)));
+    }
+
+    #[test]
+    fn placement_chunk_integrity_skips_non_striped_objects() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.verify_stripe_checksums = true;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "integrity/non-striped-placement".into(),
+        };
+
+        let (_device_id, path, _checksum) = st
+            .put_placement_chunk(&key, 0, 1, 1, Bytes::from_static(b"placement"))
+            .unwrap();
+        let data = st.read_placement_chunk(&path, 9, None).unwrap().unwrap();
+        assert_eq!(data.as_ref(), b"placement");
     }
 
     #[test]

@@ -538,10 +538,10 @@ impl KVServiceImpl {
             let storage = ctx.storage.clone();
             let handle = chunk.storage_handle.clone();
             let expected_len = chunk.length;
-            let expected_checksum = chunk.checksum.clone();
+            let expected_checksum = descriptor.is_striped.then(|| chunk.checksum.clone());
             let stripe_index = chunk.stripe_index;
             let data = tokio::task::spawn_blocking(move || {
-                storage.read_placement_chunk(&handle, expected_len, &expected_checksum)
+                storage.read_placement_chunk(&handle, expected_len, expected_checksum.as_deref())
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -1402,7 +1402,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let storage = self.ctx.storage.clone();
         let handle = chunk.storage_handle.clone();
         let expected_len = chunk.length;
-        let expected_checksum = chunk.checksum.clone();
+        let expected_checksum = descriptor.is_striped.then(|| chunk.checksum.clone());
         storage
             .validate_placement_chunk_handle(
                 &internal,
@@ -1414,7 +1414,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             )
             .map_err(Status::from)?;
         let data = tokio::task::spawn_blocking(move || {
-            storage.read_placement_chunk(&handle, expected_len, &expected_checksum)
+            storage.read_placement_chunk(&handle, expected_len, expected_checksum.as_deref())
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?

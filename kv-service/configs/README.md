@@ -110,6 +110,13 @@ listen = "0.0.0.0:9090"
 KVService stores object data under each device's `data_subdir`. It creates
 subdirectories and object files; it does not format raw devices.
 
+For an RDMA disk miss, integrity mode holds each physical stripe until all of
+its `rdma_stream_chunk_size` reads complete and the full stripe checksum
+passes. This preserves data integrity, but releases RDMA writes at stripe
+granularity rather than the normal subrange granularity and can increase
+first-byte latency. Keep the option disabled for latency-sensitive cache reads
+unless this integrity trade-off is required.
+
 ### `[memory_tier]`
 
 | Field | Default | Description |
@@ -150,7 +157,10 @@ environments that share one Redis instance.
 
 When `storage.verify_stripe_checksums = true`, enable it on every coordinator
 and data node in a placement cluster. The coordinator rejects a distributed
-write if any data node does not return a stripe checksum.
+write if any data node does not return a stripe checksum. Upgrade Python
+clients too: regenerate their protobuf stubs with `make proto` before building
+or packaging the client, so cached placement descriptors retain the checksum
+field during forwarding.
 
 ### `[cluster]`
 
