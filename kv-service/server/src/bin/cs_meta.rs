@@ -16,6 +16,13 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 const BLOCK_META_SEGMENT: &str = "block_meta";
+const NAMESPACE_WIDTH: usize = 20;
+const OBJECT_KEY_WIDTH: usize = 56;
+const SIZE_WIDTH: usize = 12;
+const STRIPES_WIDTH: usize = 7;
+const CHECKSUMS_WIDTH: usize = 18;
+const GENERATION_WIDTH: usize = 10;
+const LAYOUT_WIDTH: usize = 7;
 
 #[derive(Parser)]
 #[command(name = "cs-meta", about = "Inspect ContextStore Redis object metadata")]
@@ -302,9 +309,13 @@ fn print_namespaces(namespaces: &[NamespaceSummary], json: bool) -> Result<()> {
         println!("No current object metadata.");
         return Ok(());
     }
-    println!("NAMESPACE\tOBJECTS");
+    println!("{:<NAMESPACE_WIDTH$}  {:>7}", "NAMESPACE", "OBJECTS");
     for namespace in namespaces {
-        println!("{}\t{}", namespace.namespace, namespace.object_count);
+        println!(
+            "{:<NAMESPACE_WIDTH$}  {:>7}",
+            truncate_for_table(&namespace.namespace, NAMESPACE_WIDTH),
+            namespace.object_count,
+        );
     }
     Ok(())
 }
@@ -329,7 +340,16 @@ fn print_entries(entries: &[Entry], json: bool) -> Result<()> {
         println!("No matching current object metadata.");
         return Ok(());
     }
-    println!("NAMESPACE\tOBJECT KEY\tSIZE\tSTRIPES\tCHECKSUMS\tGENERATION\tLAYOUT");
+    println!(
+        "{:<NAMESPACE_WIDTH$}  {:<OBJECT_KEY_WIDTH$}  {:>SIZE_WIDTH$}  {:>STRIPES_WIDTH$}  {:<CHECKSUMS_WIDTH$}  {:>GENERATION_WIDTH$}  {:>LAYOUT_WIDTH$}",
+        "NAMESPACE",
+        "OBJECT KEY",
+        "SIZE",
+        "STRIPES",
+        "CHECKSUMS",
+        "GENERATION",
+        "LAYOUT",
+    );
     for entry in entries {
         let stripe_count = entry
             .metadata
@@ -338,9 +358,9 @@ fn print_entries(entries: &[Entry], json: bool) -> Result<()> {
             .map(|striping| striping.chunk_paths.len())
             .unwrap_or(0);
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            entry.object_key.namespace,
-            entry.object_key.object_key,
+            "{:<NAMESPACE_WIDTH$}  {:<OBJECT_KEY_WIDTH$}  {:>SIZE_WIDTH$}  {:>STRIPES_WIDTH$}  {:<CHECKSUMS_WIDTH$}  {:>GENERATION_WIDTH$}  {:>LAYOUT_WIDTH$}",
+            truncate_for_table(&entry.object_key.namespace, NAMESPACE_WIDTH),
+            truncate_for_table(&entry.object_key.object_key, OBJECT_KEY_WIDTH),
             format_bytes(entry.metadata.size),
             stripe_count,
             checksum_status(entry.metadata.striping.as_ref()),
@@ -363,7 +383,7 @@ fn print_striping(striping: Option<&StripingInfo>) {
         format_bytes(striping.chunk_size),
         checksum_status(Some(striping)),
     );
-    println!("STRIPE\tDEVICE\tCHECKSUM\tPATH");
+    println!("{:>6}  {:<20}  {:<18}  PATH", "STRIPE", "DEVICE", "CHECKSUM");
     for (index, path) in striping.chunk_paths.iter().enumerate() {
         let device = stripe_device(striping, index);
         let checksum = striping
@@ -372,7 +392,7 @@ fn print_striping(striping: Option<&StripingInfo>) {
             .map(String::as_str)
             .filter(|checksum| !checksum.is_empty())
             .unwrap_or("<missing>");
-        println!("{}\t{}\t{}\t{}", index, device, checksum, path);
+        println!("{:>6}  {:<20}  {:<18}  {}", index, device, checksum, path);
     }
 }
 
@@ -424,6 +444,18 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn truncate_for_table(value: &str, width: usize) -> String {
+    let character_count = value.chars().count();
+    if character_count <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let prefix: String = value.chars().take(width - 3).collect();
+    format!("{prefix}...")
+}
+
 fn empty_as_unset(value: &str) -> &str {
     if value.is_empty() {
         "<unset>"
@@ -462,5 +494,13 @@ mod tests {
         assert_eq!(checksum_status(Some(&striping)), "missing (0/2)");
         striping.chunk_checksums = vec!["abcd".to_string(), "efgh".to_string()];
         assert_eq!(checksum_status(Some(&striping)), "complete (2/2)");
+    }
+
+    #[test]
+    fn table_truncation_preserves_character_boundaries() {
+        assert_eq!(truncate_for_table("short", 8), "short");
+        assert_eq!(truncate_for_table("abcdef", 5), "ab...");
+        assert_eq!(truncate_for_table("metadata-key", 3), "...");
+        assert_eq!(truncate_for_table("rust-bench/combined", 12), "rust-benc...");
     }
 }
