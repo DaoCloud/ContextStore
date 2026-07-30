@@ -95,9 +95,8 @@ pip install -e '.[proto]'   # adds grpcio-tools for `make proto`
 # Build server / client-rs / rdma-ffi with the deployment feature set.
 make build
 
-# Start the server (listens on :50051)
-./target/release/contextstore-server \
-    --config kv-service/configs/server.toml
+# Build and start the server in the foreground (logs stay in this terminal).
+make deploy
 ```
 
 KVService reads one TOML config file and requires a reachable Redis metadata
@@ -114,6 +113,17 @@ the protocol:
 
 ```bash
 make proto
+```
+
+`make deploy` always runs the freshly built binary and does not change an
+installed systemd service or copy artifacts into `/opt`. Select another TOML
+file with `CONFIG=/path/to/server.toml`; RDMA deployment variables are passed
+through unchanged:
+
+```bash
+CS_RDMA_DEVICES=mlx5_1:0.0.0.0:50053 \
+CS_FORCE_DISK_READ=1 \
+make deploy CONFIG=/etc/contextstore/rdma-bench.toml
 ```
 
 ### 3. Wire the Connector into vLLM
