@@ -11,3 +11,9 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# rdma-sys 0.3.0 pins bindgen 0.59, which cannot parse the anonymous unions
+# exposed by current rdma-core headers. Keep the FFI API stable while using a
+# maintained bindgen version to generate bindings on modern RDMA hosts.
+[patch.crates-io]
+rdma-sys = { path = "kv-service/vendor/rdma-sys" }
