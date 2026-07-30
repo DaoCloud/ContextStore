@@ -85,6 +85,7 @@ message PlacementChunk {
   string storage_handle = 6;     // Server-generated chunk/file handle; the client does not interpret its format
   uint64 offset = 7;
   uint64 length = 8;
+  string checksum = 9;          // Optional xxh3-64 checksum, set when stripe integrity is enabled
 }
 
 message PlacementDescriptor {

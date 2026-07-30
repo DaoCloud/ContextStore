@@ -62,6 +62,9 @@ impl QpInfo {
 }
 
 impl RcQp {
+    /// Maximum send work requests configured for each RDMA RC queue pair.
+    pub const MAX_SEND_WR: usize = 128;
+
     /// Create an RC QP in RESET state. Follow with to_init/to_rtr/to_rts.
     ///
     /// `cq`: dedicated CQ (per-client) to avoid races when multiple client threads poll the same CQ concurrently.
@@ -73,8 +76,8 @@ impl RcQp {
                 recv_cq: cq.as_ptr(),
                 srq: ptr::null_mut(),
                 cap: ibv_qp_cap {
-                    max_send_wr: 128,
-                    max_recv_wr: 128,
+                    max_send_wr: Self::MAX_SEND_WR as u32,
+                    max_recv_wr: Self::MAX_SEND_WR as u32,
                     max_send_sge: 4,
                     max_recv_sge: 4,
                     max_inline_data: 0,
@@ -244,6 +247,7 @@ impl RcQp {
                 wcs.push(std::mem::zeroed());
             }
             let mut got = 0;
+            let mut first_error: Option<String> = None;
             let start = std::time::Instant::now();
             while got < expected {
                 let n = ibv_poll_cq(
@@ -257,12 +261,14 @@ impl RcQp {
                 if n > 0 {
                     for i in got..(got + n as usize) {
                         if wcs[i].status != ibv_wc_status::IBV_WC_SUCCESS {
-                            return Err(anyhow!(
-                                "WR {} failed: status={} ({})",
-                                wcs[i].wr_id,
-                                wcs[i].status,
-                                wc_status_str(wcs[i].status),
-                            ));
+                            first_error.get_or_insert_with(|| {
+                                format!(
+                                    "WR {} failed: status={} ({})",
+                                    wcs[i].wr_id,
+                                    wcs[i].status,
+                                    wc_status_str(wcs[i].status),
+                                )
+                            });
                         }
                     }
                     got += n as usize;
@@ -271,7 +277,10 @@ impl RcQp {
                     return Err(anyhow!("poll_n timeout after 30s, got {}/{}", got, expected));
                 }
             }
-            Ok(())
+            match first_error {
+                Some(error) => Err(anyhow!(error)),
+                None => Ok(()),
+            }
         }
     }
 }

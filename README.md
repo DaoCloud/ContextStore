@@ -58,7 +58,7 @@ KVService exposes an **object store** (not a byte-addressable KV): each write pr
 | `object_generation` | Content generation; monotonically increases on overwrite of the same key |
 | `content_etag` | Lightweight content-identity token (avoids re-hashing large payloads on every GET) |
 | `layout_version` | Physical layout version; bumped by rebalance / migration without changing content |
-| `striping` | Optional `StripingInfo{chunk_size, chunk_devices, chunk_paths, total_size, chunk_locations}` for objects striped across multiple NVMe / nodes |
+| `striping` | Optional `StripingInfo{chunk_size, chunk_devices, chunk_paths, total_size, chunk_locations, chunk_checksums}` for objects striped across multiple NVMe / nodes |
 
 **Descriptor-based reads.** The gRPC surface splits read into two RPCs:
 
@@ -95,9 +95,8 @@ pip install -e '.[proto]'   # adds grpcio-tools for `make proto`
 # Build server / client-rs / rdma-ffi with the deployment feature set.
 make build
 
-# Start the server (listens on :50051)
-./target/release/contextstore-server \
-    --config kv-service/configs/server.toml
+# Build and start the server in the foreground (logs stay in this terminal).
+make deploy
 ```
 
 KVService reads one TOML config file and requires a reachable Redis metadata
@@ -106,12 +105,44 @@ the config file format and examples.
 
 `make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
 metrics. It produces the server, Rust client SDK, and RDMA C ABI under
-`target/release/`. Regenerate Python protobuf bindings only after changing the
-protocol:
+`target/release/`. Before building, it prints the selected profile, features,
+and protobuf compiler. `protoc` is discovered from an explicit `PROTOC`, a
+bundled repository tool, `/opt/contextstore/tools/protoc`, or the system
+`PATH`, in that order. Regenerate Python protobuf bindings only after changing
+the protocol:
 
 ```bash
 make proto
 ```
+
+`make deploy` always runs the freshly built binary and does not change an
+installed systemd service or copy artifacts into `/opt`. Select another TOML
+file with `CONFIG=/path/to/server.toml`; RDMA deployment variables are passed
+through unchanged:
+
+```bash
+CS_RDMA_DEVICES=mlx5_1:0.0.0.0:50053 \
+CS_FORCE_DISK_READ=1 \
+make deploy CONFIG=/etc/contextstore/rdma-bench.toml
+```
+
+Inspect Redis metadata without manually constructing a canonical key:
+
+```bash
+make meta
+./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml namespaces
+
+./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
+  get --namespace rust-bench --object-key 'rdma-checksum0/**combined**'
+
+./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
+  list --namespace rust-bench --object-prefix rdma-checksum
+```
+
+The `namespaces` command shows all current namespaces and object counts. The
+`list` command shows every current key in a namespace; `get` adds every stripe
+path, device, and checksum status for one key. Use `--json` for machine-readable
+output. Pass `--limit <count>` to truncate a large namespace listing.
 
 ### 3. Wire the Connector into vLLM
 

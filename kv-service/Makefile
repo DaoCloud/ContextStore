@@ -4,13 +4,35 @@
 # (src/contextstore/kvservice_client/) and is shipped by the root
 # pyproject.toml; it is no longer built as a separate wheel here.
 
-.PHONY: all build server server-debug run-server client-rs rdma-ffi proto proto-rust proto-python \
+.PHONY: all build build-info check-build-tools server server-debug run-server client-rs rdma-ffi meta proto proto-rust proto-python \
         test test-server test-integration bench fmt lint docker docker-push clean help
 
 # ===== Config =====
 CARGO  ?= cargo
 PYTHON ?= python3
 DOCKER ?= docker
+
+# Prefer an explicitly supplied protoc. Otherwise discover a bundled compiler
+# before falling back to the system installation.
+PROTOC_ORIGIN := explicit
+ifeq ($(strip $(PROTOC)),)
+PROTOC_ORIGIN := auto-discovered
+PROTOC_CANDIDATES := \
+	$(CURDIR)/../tools/protoc/protoc \
+	/opt/contextstore/tools/protoc/protoc \
+	$(shell command -v protoc 2>/dev/null)
+PROTOC := $(firstword $(foreach candidate,$(PROTOC_CANDIDATES),$(wildcard $(candidate))))
+endif
+
+PROTOC_BIN_DIR := $(patsubst %/,%,$(dir $(PROTOC)))
+PROTOC_LIBRARY_CANDIDATES := $(PROTOC_BIN_DIR)/lib $(PROTOC_BIN_DIR)
+PROTOC_LIBRARY_PATH := $(firstword $(foreach candidate,$(PROTOC_LIBRARY_CANDIDATES),$(if $(wildcard $(candidate)/libprotoc.so*),$(candidate))))
+ifneq ($(strip $(PROTOC_LIBRARY_PATH)),)
+export LD_LIBRARY_PATH := $(PROTOC_LIBRARY_PATH)$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
+else
+PROTOC_LIBRARY_PATH := system loader path
+endif
+export PROTOC
 
 SERVER_DIR   := server
 CLIENT_RS    := client-rs
@@ -27,10 +49,25 @@ PY_PB_OUT := ../src/contextstore/kvservice_client/_pb
 # ===== Top-level targets =====
 all: build
 
-build: server client-rs rdma-ffi
+build: build-info server client-rs rdma-ffi meta
+
+build-info: check-build-tools
+	@echo "==> ContextStore KVService build configuration"
+	@echo "    profile: $(BUILD_TYPE)"
+	@echo "    server features: $(SERVER_FEATURES)"
+	@echo "    Rust client features: $(CLIENT_RS_FEATURES)"
+	@echo "    protoc ($(PROTOC_ORIGIN)): $(PROTOC)"
+	@echo "    protoc library path: $(PROTOC_LIBRARY_PATH)"
+
+check-build-tools:
+	@if [ -z "$(PROTOC)" ] || { ! command -v "$(PROTOC)" >/dev/null 2>&1 && [ ! -x "$(PROTOC)" ]; }; then \
+		echo "error: protoc was not found."; \
+		echo "Set PROTOC=/path/to/protoc or install protoc on PATH."; \
+		exit 1; \
+	fi
 
 # ===== Server (Rust) =====
-server:
+server: check-build-tools
 	@echo "==> Building contextstore-server ($(BUILD_TYPE), features: $(SERVER_FEATURES))"
 	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(SERVER_FEATURES)
 
@@ -42,7 +79,7 @@ run-server: server
 		--config configs/server.toml
 
 # ===== Rust client + bench =====
-client-rs:
+client-rs: check-build-tools
 	@echo "==> Building contextstore-client-rs ($(BUILD_TYPE), features: $(CLIENT_RS_FEATURES))"
 	cd $(CLIENT_RS) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(CLIENT_RS_FEATURES)
 
@@ -50,10 +87,15 @@ client-rs:
 rdma-ffi:
 	cd $(RDMA_FFI_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
 
+# ===== Metadata inspection =====
+meta: check-build-tools
+	@echo "==> Building cs-meta ($(BUILD_TYPE), features: $(SERVER_FEATURES))"
+	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(SERVER_FEATURES) --bin cs-meta
+
 # ===== Protobuf =====
 proto: proto-rust proto-python
 
-proto-rust:
+proto-rust: check-build-tools
 	@echo "==> Generating Rust protobuf (triggered by build.rs)"
 	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
 
@@ -109,10 +151,11 @@ clean:
 help:
 	@echo "ContextStore KV Service build targets:"
 	@echo ""
-	@echo "  make build         Build server + client-rs + rdma-ffi with deployment features"
+	@echo "  make build         Build server, clients, RDMA FFI, and metadata CLI"
 	@echo "  make server        Build only the Rust server"
 	@echo "  make client-rs     Build only the Rust client SDK + bench"
 	@echo "  make rdma-ffi      Build only the RDMA C ABI cdylib"
+	@echo "  make meta          Build the Redis metadata inspection CLI"
 	@echo "  make proto         Regenerate protobuf code (Rust + Python)"
 	@echo "  make test          Rust unit tests + Python integration tests"
 	@echo "  make bench         Run the perf benchmark (requires a running server)"

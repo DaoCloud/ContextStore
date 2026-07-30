@@ -222,6 +222,7 @@ class KVClient:
                     storage_handle=chunk.storage_handle,
                     offset=chunk.offset,
                     length=chunk.length,
+                    checksum=chunk.checksum,
                 )
                 for chunk in p.chunks
             ],
@@ -238,6 +239,7 @@ class KVClient:
             storage_handle=chunk.storage_handle,
             offset=chunk.offset,
             length=chunk.length,
+            checksum=chunk.checksum,
         )
 
     @staticmethod
@@ -263,6 +265,7 @@ class KVClient:
                     storage_handle=chunk.storage_handle,
                     offset=chunk.offset,
                     length=chunk.length,
+                    checksum=chunk.checksum,
                 )
                 for chunk in p.chunks
             ],

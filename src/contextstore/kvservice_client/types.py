@@ -66,6 +66,7 @@ class PlacementChunk:
     storage_handle: str
     offset: int
     length: int
+    checksum: str = ""
 
 
 @dataclass

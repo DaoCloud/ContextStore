@@ -12,6 +12,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use contextstore_client_rs::rdma::canonical_key;
 use rdma_sys::*;
 use std::ffi::CStr;
 use std::io::{Read, Write};
@@ -38,9 +39,16 @@ struct Args {
     gid_index: u8,
 
     /// Canonical object key to GET: <namespace_byte_len>:<namespace><object_key>.
-    /// Default matches what cs-bench --combined writes: rust-bench / comb0/__combined__.
-    #[arg(long, default_value = "10:rust-benchcomb0/__combined__")]
-    key: String,
+    #[arg(long, conflicts_with_all = ["namespace", "object_key"])]
+    key: Option<String>,
+
+    /// Logical namespace. Use together with --object-key for a readable selector.
+    #[arg(long, requires = "object_key")]
+    namespace: Option<String>,
+
+    /// Logical object key within --namespace.
+    #[arg(long, requires = "namespace")]
+    object_key: Option<String>,
 
     /// Buffer size in MB (client side recv buffer)
     #[arg(long, default_value_t = 512usize)]
@@ -49,6 +57,13 @@ struct Args {
     /// Number of iterations
     #[arg(long, default_value_t = 5usize)]
     iters: usize,
+
+    /// Clear the complete receive buffer before every request.
+    ///
+    /// Disabled by default because clearing multi-GiB buffers between requests lowers
+    /// the sustained disk duty cycle while being outside the timed RDMA transfer.
+    #[arg(long, default_value_t = false)]
+    clear_buffer: bool,
 }
 
 const MSG_HELLO: u8 = 1;
@@ -91,6 +106,7 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Result<Vec<u8>> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let object_key = resolve_object_key(&args)?;
     let buf_size = args.buf_mb * 1024 * 1024;
 
     // ===== 1. Open HCA + PD + CQ + register MR =====
@@ -280,19 +296,32 @@ fn main() -> Result<()> {
             return Err(anyhow!("modify_qp RTS: {}", rc));
         }
 
-        println!("[client] QP established. starting benchmark...");
+        println!(
+            "[client] QP established. starting benchmark (validation={})...",
+            if args.clear_buffer {
+                "full_buffer_clear"
+            } else {
+                "prefix_sentinel"
+            }
+        );
 
         // ===== 5. Run N GETs =====
         let mut latencies = Vec::new();
         let mut last_bytes = 0u64;
         for i in 0..args.iters {
-            // Zero the buffer so we can verify the server really wrote to it.
-            std::ptr::write_bytes(buf_ptr, 0u8, buf_size);
+            // A small sentinel proves the RDMA WRITE updated the target without adding a
+            // multi-GiB host-memory memset between requests. The full clear remains useful
+            // for diagnostics but must be explicitly requested.
+            if args.clear_buffer {
+                std::ptr::write_bytes(buf_ptr, 0u8, buf_size);
+            } else {
+                std::ptr::write_bytes(buf_ptr, 0xff, 64.min(buf_size));
+            }
 
             let t0 = Instant::now();
 
             // send GetReq
-            let key_bytes = args.key.as_bytes();
+            let key_bytes = object_key.as_bytes();
             let mut req = Vec::with_capacity(1 + 2 + key_bytes.len() + 8 + 4 + 8);
             req.push(MSG_GET_REQ);
             req.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
@@ -317,7 +346,7 @@ fn main() -> Result<()> {
             if !found {
                 return Err(anyhow!(
                     "key '{}' not found in server cache. Run cs-bench first to PUT",
-                    args.key
+                    object_key
                 ));
             }
             latencies.push(dt);
@@ -326,7 +355,7 @@ fn main() -> Result<()> {
             // Verify data: cs-bench combined fills with the (i % 251) pattern.
             // Look at the first few bytes.
             let head = std::slice::from_raw_parts(buf_ptr, 16.min(bytes_written as usize));
-            let expected: Vec<u8> = (0..16).map(|i| (i % 251) as u8).collect();
+            let expected: Vec<u8> = (0..head.len()).map(|i| (i % 251) as u8).collect();
             let matches = head == expected.as_slice();
             let bw_gbps = (bytes_written as f64 * 8.0) / dt.as_secs_f64() / 1e9;
             let bw_gb = (bytes_written as f64) / dt.as_secs_f64() / (1024.0 * 1024.0 * 1024.0);
@@ -380,4 +409,68 @@ fn main() -> Result<()> {
         ibv_close_device(ctx.as_ptr());
     }
     Ok(())
+}
+
+fn resolve_object_key(args: &Args) -> Result<String> {
+    match (&args.key, &args.namespace, &args.object_key) {
+        (Some(key), None, None) => {
+            validate_canonical_key(key)?;
+            Ok(key.clone())
+        }
+        (None, Some(namespace), Some(object_key)) => Ok(canonical_key(namespace, object_key)),
+        (None, None, None) => Ok(canonical_key("rust-bench", "comb0/__combined__")),
+        _ => Err(anyhow!(
+            "provide --key <canonical-key> or both --namespace <namespace> and --object-key <object-key>"
+        )),
+    }
+}
+
+fn validate_canonical_key(key: &str) -> Result<()> {
+    let Some((namespace_length, remainder)) = key.split_once(':') else {
+        return Err(anyhow!(
+            "invalid --key {key:?}: expected <namespace_byte_len>:<namespace><object_key>; use --namespace and --object-key for a readable selector"
+        ));
+    };
+    let namespace_length: usize = namespace_length.parse().map_err(|_| {
+        anyhow!(
+            "invalid --key {key:?}: namespace byte length must be a decimal integer; use --namespace and --object-key for a readable selector"
+        )
+    })?;
+    if namespace_length > remainder.len() {
+        return Err(anyhow!(
+            "invalid --key {key:?}: namespace byte length exceeds the remaining key bytes; use --namespace and --object-key for a readable selector"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readable_selector_encodes_canonical_key() {
+        let args = Args {
+            key: None,
+            namespace: Some("rust-bench".to_string()),
+            object_key: Some("rdma-checksum0/__combined__".to_string()),
+            server: "127.0.0.1:50053".to_string(),
+            device: "mlx5_0".to_string(),
+            port: 1,
+            gid_index: 3,
+            buf_mb: 512,
+            iters: 5,
+            clear_buffer: false,
+        };
+        assert_eq!(
+            resolve_object_key(&args).unwrap(),
+            "10:rust-benchrdma-checksum0/__combined__"
+        );
+    }
+
+    #[test]
+    fn raw_object_key_explains_readable_selector() {
+        let error = validate_canonical_key("rdma-checksum0/__combined__").unwrap_err();
+        assert!(error.to_string().contains("--namespace and --object-key"));
+    }
 }

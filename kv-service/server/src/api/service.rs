@@ -139,6 +139,7 @@ mod tests {
                     storage_handle: "/tmp/a".to_string(),
                     offset: 0,
                     length: 6,
+                    checksum: "checksum-a".to_string(),
                 },
                 ChunkLocation {
                     stripe_index: 1,
@@ -149,14 +150,17 @@ mod tests {
                     storage_handle: "/tmp/b".to_string(),
                     offset: 6,
                     length: 6,
+                    checksum: "checksum-b".to_string(),
                 },
             ],
+            chunk_checksums: vec!["checksum-a".to_string(), "checksum-b".to_string()],
         });
 
         let placement = placement_from_meta(&ctx, &key(), &meta);
         assert_eq!(placement.chunks.len(), 2);
         assert_eq!(placement.chunks[0].node_id, "node-a");
         assert_eq!(placement.chunks[1].grpc_endpoint, "10.0.0.2:50051");
+        assert_eq!(placement.chunks[0].checksum, "checksum-a");
     }
 
     #[test]
@@ -311,7 +315,7 @@ impl KVServiceImpl {
             let storage = ctx.storage.clone();
             let generation = descriptor.object_generation;
             let layout_version = descriptor.layout_version;
-            let (device_id, storage_handle) = tokio::task::spawn_blocking(move || {
+            let (device_id, storage_handle, checksum) = tokio::task::spawn_blocking(move || {
                 storage.put_placement_chunk(
                     &key_for_write,
                     stripe_index,
@@ -332,6 +336,7 @@ impl KVServiceImpl {
                 storage_handle,
                 offset,
                 length: data_len,
+                checksum,
             });
         }
 
@@ -411,10 +416,24 @@ impl KVServiceImpl {
             .iter()
             .map(|loc| chunk_location_to_pb(&key, loc))
             .collect::<Vec<_>>();
+        if self.ctx.storage.verify_stripe_checksums()
+            && locations.iter().any(|location| location.checksum.is_empty())
+        {
+            for chunk in rollback_chunks {
+                let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+            }
+            return Err(Status::failed_precondition(
+                "stripe integrity is enabled but a data node did not return a checksum",
+            ));
+        }
         let chunk_devices = locations.iter().map(|loc| loc.device_id).collect();
         let chunk_paths = locations
             .iter()
             .map(|loc| loc.storage_handle.clone())
+            .collect();
+        let chunk_checksums = locations
+            .iter()
+            .map(|loc| loc.checksum.clone())
             .collect();
         let mut committed = prepared_meta;
         committed.size = total as u64;
@@ -426,6 +445,7 @@ impl KVServiceImpl {
             chunk_paths,
             total_size: total as u64,
             chunk_locations: locations,
+            chunk_checksums,
         });
         self.ctx.memory.invalidate(&key);
         let metadata = self.ctx.metadata.clone();
@@ -518,9 +538,10 @@ impl KVServiceImpl {
             let storage = ctx.storage.clone();
             let handle = chunk.storage_handle.clone();
             let expected_len = chunk.length;
+            let expected_checksum = descriptor.is_striped.then(|| chunk.checksum.clone());
             let stripe_index = chunk.stripe_index;
             let data = tokio::task::spawn_blocking(move || {
-                storage.read_placement_chunk(&handle, expected_len)
+                storage.read_placement_chunk(&handle, expected_len, expected_checksum.as_deref())
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -809,6 +830,7 @@ fn chunk_location_to_pb(key: &InternalKey, loc: &ChunkLocation) -> pb::Placement
         storage_handle: loc.storage_handle.clone(),
         offset: loc.offset,
         length: loc.length,
+        checksum: loc.checksum.clone(),
     }
 }
 
@@ -822,6 +844,7 @@ fn pb_chunk_to_location(chunk: &pb::PlacementChunk) -> ChunkLocation {
         storage_handle: chunk.storage_handle.clone(),
         offset: chunk.offset,
         length: chunk.length,
+        checksum: chunk.checksum.clone(),
     }
 }
 
@@ -889,6 +912,7 @@ fn placement_from_meta(
                     storage_handle: path.clone(),
                     offset,
                     length,
+                    checksum: stripe.chunk_checksums.get(idx).cloned().unwrap_or_default(),
                 }
             })
             .collect(),
@@ -901,6 +925,7 @@ fn placement_from_meta(
             storage_handle: meta.file_path.clone(),
             offset: 0,
             length: meta.size,
+            checksum: String::new(),
         }],
     };
 
@@ -1322,7 +1347,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let offset = stripe_index as u64 * req.chunk_size;
         let local = local_node(&self.ctx);
         let ctx = self.ctx.clone();
-        let (device_id, storage_handle) = tokio::task::spawn_blocking(move || {
+        let (device_id, storage_handle, checksum) = tokio::task::spawn_blocking(move || {
             ctx.storage.put_placement_chunk(
                 &internal,
                 stripe_index,
@@ -1345,6 +1370,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 storage_handle,
                 offset,
                 length: data_len,
+                checksum,
             }),
         }))
     }
@@ -1376,6 +1402,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let storage = self.ctx.storage.clone();
         let handle = chunk.storage_handle.clone();
         let expected_len = chunk.length;
+        let expected_checksum = descriptor.is_striped.then(|| chunk.checksum.clone());
         storage
             .validate_placement_chunk_handle(
                 &internal,
@@ -1387,7 +1414,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             )
             .map_err(Status::from)?;
         let data = tokio::task::spawn_blocking(move || {
-            storage.read_placement_chunk(&handle, expected_len)
+            storage.read_placement_chunk(&handle, expected_len, expected_checksum.as_deref())
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?

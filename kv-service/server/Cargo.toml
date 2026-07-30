@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "cs-kvservice-bench"
 path = "src/bin/cs_kvservice_bench.rs"
 
+[[bin]]
+name = "cs-meta"
+path = "src/bin/cs_meta.rs"
+
 [dependencies]
 # gRPC
 tonic = "0.11"

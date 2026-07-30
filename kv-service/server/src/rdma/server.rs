@@ -743,21 +743,26 @@ fn try_serve_get_via_slab_with_meta(
     };
     let t_stream_setup = t_stream_start.elapsed().as_micros() as u64;
 
-    // 4. Consume each stripe-completion event, immediately posting the RDMA WRITE for that segment
+    // 4. Consume each stream completion and immediately post its RDMA WRITE. Keep the
+    // number of outstanding WRs bounded so a larger object or more devices cannot exhaust
+    // the QP send queue.
+    const RDMA_WRITE_COMPLETION_WINDOW: usize = RcQp::MAX_SEND_WR / 2;
     let view = extent.view(nic_idx);
     let t_post_start = std::time::Instant::now();
     let mut n_writes_posted = 0u64;
-    let mut last_wr_id = 0u64;
+    let mut outstanding_writes = 0usize;
+    let mut poll_us = 0u64;
     let mut had_error: Option<String> = None;
-    // Track each stripe's completion time relative to stream_start along with its stripe_idx
-    let mut stripe_finish_times_us: Vec<(u64, usize)> = Vec::with_capacity(8);
+    let mut first_stream_completion_us: Option<u64> = None;
+    let mut last_stream_completion_us = 0u64;
 
     while let Ok((stripe_idx, offset_in_value, stripe_len, result)) = stream_rx.recv() {
         let t_now_us = t_stream_start.elapsed().as_micros() as u64;
-        stripe_finish_times_us.push((t_now_us, stripe_idx));
+        first_stream_completion_us.get_or_insert(t_now_us);
+        last_stream_completion_us = t_now_us;
         match result {
-            Ok(_bytes_read) => {
-                qp.post_write(
+            Ok(bytes_read) if bytes_read == stripe_len && had_error.is_none() => {
+                if let Err(error) = qp.post_write(
                     stripe_idx as u64,
                     view.addr + offset_in_value as u64,
                     view.lkey,
@@ -765,33 +770,62 @@ fn try_serve_get_via_slab_with_meta(
                     dst_rkey,
                     stripe_len as u32,
                     true, // signaled
-                )?;
-                n_writes_posted += 1;
-                last_wr_id = stripe_idx as u64;
+                ) {
+                    had_error = Some(format!(
+                        "post RDMA write for stripe {}: {}",
+                        stripe_idx, error
+                    ));
+                } else {
+                    n_writes_posted += 1;
+                    outstanding_writes += 1;
+                    if outstanding_writes == RDMA_WRITE_COMPLETION_WINDOW {
+                        let poll_start = std::time::Instant::now();
+                        if let Err(error) = RcQp::poll_n(client_cq, outstanding_writes) {
+                            had_error = Some(format!(
+                                "poll RDMA write completion window: {}",
+                                error
+                            ));
+                        }
+                        poll_us += poll_start.elapsed().as_micros() as u64;
+                        outstanding_writes = 0;
+                    }
+                }
             }
-            Err(e) => {
-                had_error = Some(format!("{}", e));
-                break;
+            Ok(bytes_read) if bytes_read != stripe_len && had_error.is_none() => {
+                had_error = Some(format!(
+                    "stripe {} short read: expected {} bytes, got {}",
+                    stripe_idx, stripe_len, bytes_read
+                ));
             }
+            Ok(_) => {}
+            Err(e) if had_error.is_none() => {
+                had_error = Some(format!("stripe {} read failed: {}", stripe_idx, e));
+            }
+            Err(_) => {}
         }
     }
     let t_post_done = t_post_start.elapsed().as_micros() as u64;
 
-    if let Some(e) = had_error {
-        return Err(anyhow!("stripe read failed: {}", e));
+    // 5. Drain every posted WRITE before returning, including when a later stripe
+    // failed. The slab extent backs in-flight RNIC DMA and must not be released early.
+    let poll_result = if outstanding_writes > 0 {
+        let poll_start = std::time::Instant::now();
+        let result = RcQp::poll_n(client_cq, outstanding_writes);
+        poll_us += poll_start.elapsed().as_micros() as u64;
+        result
+    } else {
+        Ok(())
+    };
+
+    let post_us = t_post_done;
+
+    if let Some(error) = had_error {
+        return Err(anyhow!("RDMA GET stream failed: {}", error));
     }
+    poll_result?;
     if n_writes_posted == 0 {
         return Err(anyhow!("no stripes posted"));
     }
-
-    // 5. Poll all N WRITE completions (each is signaled)
-    let t_poll_start = std::time::Instant::now();
-    RcQp::poll_n(client_cq, n_writes_posted as usize)?;
-    let t_poll_done = std::time::Instant::now();
-    let _ = last_wr_id;
-
-    let post_us = t_post_done;
-    let poll_us = t_poll_done.duration_since(t_poll_start).as_micros() as u64;
 
     // 6. Inject into chunks_cache (slab-backed) so subsequent GETs cache-hit.
     // **DIAGNOSTIC TOGGLE**: with CS_FORCE_DISK_READ=1 we skip injection, so the next GET
@@ -806,27 +840,21 @@ fn try_serve_get_via_slab_with_meta(
     }
     let t_inject = t_inject_start.elapsed().as_micros() as u64;
 
-    // **DETAILED TRACE**: break down every stage to see where time goes
-    // **DETAILED TRACE**: break down every stage to see where time goes
-    // Emit [(ms@stripe_idx)...] so we can spot which stripes (= which disks) are slow
-    let stripe_finish_str = stripe_finish_times_us
-        .iter()
-        .map(|(t, idx)| format!("{}@{}", t / 1000, idx))
-        .collect::<Vec<_>>()
-        .join(",");
     tracing::info!(
         "MISS_DETAIL wall_us={} key={} bytes={} meta_us={} alloc_us={} stream_setup_us={} \
-         post_done_us={} poll_us={} inject_us={} stripe_finish_ms=[{}] n_writes={}",
+         first_stream_completion_us={} last_stream_completion_us={} post_done_us={} poll_us={} \
+         inject_us={} n_writes={}",
         wall_start_us,
         kv_key.to_string_key(),
         size,
         t_meta,
         t_alloc,
         t_stream_setup,
+        first_stream_completion_us.unwrap_or(0),
+        last_stream_completion_us,
         post_us,
         poll_us,
         t_inject,
-        stripe_finish_str,
         n_writes_posted,
     );
 
@@ -905,6 +933,7 @@ fn descriptor_meta_from_req(
             chunk_paths,
             total_size: req.size,
             chunk_locations: Vec::new(),
+            chunk_checksums: Vec::new(),
         });
     } else {
         let device_id = kv_ctx.router.route(key);
@@ -929,7 +958,9 @@ fn handle_descriptor_get(
 ) -> Result<()> {
     let req = wire::recv_descriptor_get_req_body(stream)?;
     let kv_key = parse_string_key(&req.key)?;
-    let descriptor_meta = descriptor_meta_from_req(kv_ctx, &kv_key, &req)?;
+    // Validate descriptor layout fields before consulting the authoritative metadata. The actual
+    // metadata is used for I/O so optional per-stripe checksums cannot be omitted by a client.
+    let _ = descriptor_meta_from_req(kv_ctx, &kv_key, &req)?;
 
     let active_meta = match kv_ctx.metadata.get_block(&kv_key.to_string_key())? {
         Some(meta) => meta,
@@ -982,7 +1013,7 @@ fn handle_descriptor_get(
             qp,
             client_cq,
             &kv_key,
-            &descriptor_meta,
+            &active_meta,
             req.dst_addr,
             req.dst_rkey,
             req.max_size,
@@ -997,7 +1028,7 @@ fn handle_descriptor_get(
                 );
                 match kv_ctx
                     .storage
-                    .get_chunks_with_meta(&kv_key, &descriptor_meta)
+                    .get_chunks_with_meta(&kv_key, &active_meta)
                 {
                     Ok(Some((segments, _meta))) => {
                         let (found, bytes, chunks, _reg_post_us, _poll_us) = serve_get_fallback(
