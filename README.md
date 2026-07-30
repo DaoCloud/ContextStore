@@ -133,7 +133,7 @@ make meta
 ./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml namespaces
 
 ./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
-  get --namespace rust-bench --object-key 'rdma-checksum0/**combined**'
+  get --namespace rust-bench --object-key 'rdma-checksum0/__combined__'
 
 ./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
   list --namespace rust-bench --object-prefix rdma-checksum
@@ -143,6 +143,22 @@ The `namespaces` command shows all current namespaces and object counts. The
 `list` command shows every current key in a namespace; `get` adds every stripe
 path, device, and checksum status for one key. Use `--json` for machine-readable
 output. Pass `--limit <count>` to truncate a large namespace listing.
+
+For a direct RDMA read benchmark, prefer the readable selector over a manually
+constructed canonical key:
+
+```bash
+./target/release/cs-rdma-bench \
+  --server 127.0.0.1:50053 \
+  --device mlx5_0 \
+  --namespace rust-bench \
+  --object-key 'rdma-checksum0/__combined__' \
+  --buf-mb 1024 \
+  --iters 10
+```
+
+`--key` remains available for protocol debugging and accepts the internal
+`<namespace-byte-length>:<namespace><object-key>` form.
 
 ### 3. Wire the Connector into vLLM
 
@@ -285,7 +301,7 @@ Directions we plan to work on next. This is a feature-level roadmap, not a relea
 | Prefix Index | Namespace and tenant isolation | planned | First-class model / tenant / namespace isolation, quotas and lifecycle rules |
 | KVService | Object lifecycle | in progress | TTL expiry, quota-based rejection, and cross-tier LRU eviction (L1 LRU is already live) |
 | Data Path | Raw JBOF block allocator | planned | Skip the filesystem: block allocator + placement policy directly against raw JBOF / NVMe-oF namespaces |
-| Data Path | GDS (GPUDirect Storage) | in progress | End-to-end `libcufile` + `nvidia-fs` path from NVMe straight into GPU HBM (requires datacenter-class GPUs) |
+| Data Path | GDS (GPUDirect Storage) | experimental | Explicit `gds` build feature for local GPU IPC and unstriped NVMe objects; striped and cross-node GDS remain future work |
 | Codec | Higher-ratio KV codec | planned | INT4, per-layer quantization, and other layouts beyond the current INT8 codec |
 
 Contributions are welcome — please open an issue first to align on scope.

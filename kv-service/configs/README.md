@@ -236,13 +236,22 @@ Key metrics for performance tuning include:
 This section is optional and only has an effect when the server is built with
 the `gds` feature.
 
+The default `make build` does not include GDS. Build it explicitly on a Linux
+host that has CUDA, `libcufile.so`, and the `nvidia-fs` kernel module:
+
+```bash
+make build SERVER_FEATURES=io-uring,rdma,metrics,gds
+```
+
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Attempts to initialize GPUDirect Storage support. |
 | `device` | `-1` | CUDA device ordinal. `-1` means do not force a device. |
 
 GDS initialization failures are logged as warnings and normal I/O paths remain
-available.
+available. The current implementation uses CUDA IPC for a GPU buffer on the
+same host and supports only unstriped local objects. It does not provide
+striped or cross-node GDS reads or writes.
 
 ## Deployment notes
 
