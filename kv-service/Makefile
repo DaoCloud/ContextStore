@@ -4,7 +4,7 @@
 # (src/contextstore/kvservice_client/) and is shipped by the root
 # pyproject.toml; it is no longer built as a separate wheel here.
 
-.PHONY: all build build-info check-build-tools server server-debug run-server client-rs rdma-ffi proto proto-rust proto-python \
+.PHONY: all build build-info check-build-tools server server-debug run-server client-rs rdma-ffi meta proto proto-rust proto-python \
         test test-server test-integration bench fmt lint docker docker-push clean help
 
 # ===== Config =====
@@ -25,7 +25,7 @@ PROTOC := $(firstword $(foreach candidate,$(PROTOC_CANDIDATES),$(wildcard $(cand
 endif
 
 PROTOC_BIN_DIR := $(patsubst %/,%,$(dir $(PROTOC)))
-PROTOC_LIBRARY_CANDIDATES := $(PROTOC_BIN_DIR) $(PROTOC_BIN_DIR)/lib
+PROTOC_LIBRARY_CANDIDATES := $(PROTOC_BIN_DIR)/lib $(PROTOC_BIN_DIR)
 PROTOC_LIBRARY_PATH := $(firstword $(foreach candidate,$(PROTOC_LIBRARY_CANDIDATES),$(if $(wildcard $(candidate)/libprotoc.so*),$(candidate))))
 ifneq ($(strip $(PROTOC_LIBRARY_PATH)),)
 export LD_LIBRARY_PATH := $(PROTOC_LIBRARY_PATH)$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
@@ -49,7 +49,7 @@ PY_PB_OUT := ../src/contextstore/kvservice_client/_pb
 # ===== Top-level targets =====
 all: build
 
-build: build-info server client-rs rdma-ffi
+build: build-info server client-rs rdma-ffi meta
 
 build-info: check-build-tools
 	@echo "==> ContextStore KVService build configuration"
@@ -86,6 +86,11 @@ client-rs: check-build-tools
 # ===== RDMA FFI cdylib (consumed by Python via ctypes) =====
 rdma-ffi:
 	cd $(RDMA_FFI_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG)
+
+# ===== Metadata inspection =====
+meta: check-build-tools
+	@echo "==> Building cs-meta ($(BUILD_TYPE), features: $(SERVER_FEATURES))"
+	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(SERVER_FEATURES) --bin cs-meta
 
 # ===== Protobuf =====
 proto: proto-rust proto-python
@@ -146,10 +151,11 @@ clean:
 help:
 	@echo "ContextStore KV Service build targets:"
 	@echo ""
-	@echo "  make build         Build server + client-rs + rdma-ffi with deployment features"
+	@echo "  make build         Build server, clients, RDMA FFI, and metadata CLI"
 	@echo "  make server        Build only the Rust server"
 	@echo "  make client-rs     Build only the Rust client SDK + bench"
 	@echo "  make rdma-ffi      Build only the RDMA C ABI cdylib"
+	@echo "  make meta          Build the Redis metadata inspection CLI"
 	@echo "  make proto         Regenerate protobuf code (Rust + Python)"
 	@echo "  make test          Rust unit tests + Python integration tests"
 	@echo "  make bench         Run the perf benchmark (requires a running server)"

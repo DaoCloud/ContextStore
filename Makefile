@@ -3,7 +3,7 @@
 # The KVService is self-contained under kv-service/, but project-level builds
 # should always be invoked from the repository root with `make build`.
 
-.PHONY: all build deploy check-deploy-config server server-debug run-server client-rs rdma-ffi proto proto-rust \
+.PHONY: all build deploy check-deploy-config server server-debug run-server client-rs rdma-ffi meta proto proto-rust \
 	proto-python test test-server test-integration bench fmt lint docker docker-push clean help
 
 KV_SERVICE_DIR := kv-service
@@ -47,6 +47,9 @@ client-rs:
 rdma-ffi:
 	$(MAKE) -C $(KV_SERVICE_DIR) rdma-ffi
 
+meta:
+	$(MAKE) -C $(KV_SERVICE_DIR) meta
+
 proto:
 	$(MAKE) -C $(KV_SERVICE_DIR) proto
 
@@ -85,11 +88,12 @@ clean:
 help:
 	@echo "ContextStore build targets:"
 	@echo ""
-	@echo "  make build            Build KVService server, Rust SDK, and RDMA C ABI"
+	@echo "  make build            Build server, clients, RDMA FFI, and metadata CLI"
 	@echo "  make deploy           Build and start the server in the foreground"
 	@echo "  make server           Build only the KVService server"
 	@echo "  make client-rs        Build only the Rust client SDK"
 	@echo "  make rdma-ffi         Build only the RDMA C ABI library"
+	@echo "  make meta             Build the Redis metadata inspection CLI"
 	@echo "  make proto            Regenerate Rust and Python protobuf code"
 	@echo "  make test             Run KVService server and integration tests"
 	@echo "  make bench            Run KVService benchmarks"

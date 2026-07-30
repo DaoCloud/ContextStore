@@ -126,6 +126,20 @@ CS_FORCE_DISK_READ=1 \
 make deploy CONFIG=/etc/contextstore/rdma-bench.toml
 ```
 
+Inspect Redis metadata without manually constructing a canonical key:
+
+```bash
+make meta
+./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
+  get --namespace rust-bench --object-key 'rdma-checksum0/**combined**'
+
+./target/release/cs-meta --config /etc/contextstore/rdma-bench.toml \
+  list --namespace rust-bench --object-prefix rdma-checksum
+```
+
+The `get` output includes every stripe path, device, and checksum status. Use
+`--json` for the complete machine-readable metadata record.
+
 ### 3. Wire the Connector into vLLM
 
 Pass a `--kv-transfer-config` to vLLM v1:
