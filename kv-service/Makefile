@@ -4,8 +4,8 @@
 # (src/contextstore/kvservice_client/) and is shipped by the root
 # pyproject.toml; it is no longer built as a separate wheel here.
 
-.PHONY: all build build-info check-build-tools server server-debug run-server client-rs rdma-ffi meta proto proto-rust proto-python \
-        test test-server test-integration bench fmt lint docker docker-push clean help
+.PHONY: all build build-info check-build-tools check-e2e-tools server e2e-server server-debug run-server client-rs rdma-ffi meta proto proto-rust proto-python \
+        test test-server test-integration e2e bench fmt lint docker docker-push clean help
 
 # ===== Config =====
 CARGO  ?= cargo
@@ -71,6 +71,12 @@ server: check-build-tools
 	@echo "==> Building contextstore-server ($(BUILD_TYPE), features: $(SERVER_FEATURES))"
 	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG) --features $(SERVER_FEATURES)
 
+# E2E is intentionally hardware-independent: use the default server build instead
+# of the deployment build, which enables the optional RDMA feature.
+e2e-server: check-build-tools
+	@echo "==> Building contextstore-server for hardware-independent E2E ($(BUILD_TYPE))"
+	cd $(SERVER_DIR) && $(CARGO) build $(CARGO_RELEASE_FLAG) --bin contextstore-server
+
 server-debug:
 	cd $(SERVER_DIR) && $(CARGO) build
 
@@ -118,6 +124,15 @@ test-server:
 test-integration:
 	$(PYTHON) -m pytest tests/ -v
 
+# Starts an isolated Redis plus two local KVService processes. The test owns all
+# ports, metadata keys, and data directories and requires no pre-existing service.
+e2e: check-e2e-tools e2e-server
+	cd $(CLIENT_RS) && CS_E2E_SERVER_BIN="$(CURDIR)/../target/$(BUILD_TYPE)/contextstore-server" \
+		$(CARGO) test $(CARGO_RELEASE_FLAG) --test local_cluster_e2e -- --nocapture
+
+check-e2e-tools:
+	@command -v redis-server >/dev/null 2>&1 || { echo "error: redis-server is required for make e2e"; exit 1; }
+
 bench:
 	cd benchmarks && $(PYTHON) run_benchmark.py
 
@@ -153,11 +168,13 @@ help:
 	@echo ""
 	@echo "  make build         Build server, clients, RDMA FFI, and metadata CLI"
 	@echo "  make server        Build only the Rust server"
+	@echo "  make e2e-server    Build the default-feature server used by make e2e"
 	@echo "  make client-rs     Build only the Rust client SDK + bench"
 	@echo "  make rdma-ffi      Build only the RDMA C ABI cdylib"
 	@echo "  make meta          Build the Redis metadata inspection CLI"
 	@echo "  make proto         Regenerate protobuf code (Rust + Python)"
 	@echo "  make test          Rust unit tests + Python integration tests"
+	@echo "  make e2e           Run isolated Redis + two-node local-cluster E2E tests"
 	@echo "  make bench         Run the perf benchmark (requires a running server)"
 	@echo "  make docker        Build the Docker image"
 	@echo "  make fmt / lint    Format / static analysis"

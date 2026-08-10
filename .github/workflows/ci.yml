@@ -88,3 +88,24 @@ jobs:
       - name: Cargo test (server)
         working-directory: kv-service/server
         run: cargo test --release
+
+  # ==========================================================================
+  # E2E: isolated Redis + two loopback KVService nodes
+  # ==========================================================================
+  e2e:
+    name: Local cluster E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Redis and Rust build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              redis-server protobuf-compiler pkg-config cmake
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run local cluster E2E
+        run: make e2e

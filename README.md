@@ -239,6 +239,7 @@ make client-rs                 # build only the Rust client SDK
 make rdma-ffi                  # build only the Python ctypes C ABI library
 make test-server               # Rust server tests
 make test-integration          # requires a running server
+make e2e                       # isolated Redis + two local KVService nodes
 make fmt                       # format Rust code
 make lint                      # run Rust clippy checks
 ```
@@ -246,6 +247,13 @@ make lint                      # run Rust clippy checks
 `make build BUILD_TYPE=debug` builds the same artifacts with Cargo's debug
 profile. `make proto`, `make proto-rust`, and `make proto-python` regenerate
 protocol bindings; the Python targets require `grpcio-tools`.
+
+`make e2e` is hardware-independent. It starts an ephemeral Redis and two
+loopback-only KVService processes with isolated data directories, then verifies
+streaming I/O, shared metadata, cross-node stripe placement, node restart
+recovery, and distributed deletion. It requires `redis-server` and the Python
+toolchain used to build KVService, but never uses or modifies a configured
+Redis instance.
 
 ### Benchmarks
 
