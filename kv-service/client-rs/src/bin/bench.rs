@@ -97,7 +97,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // (2026-06-11): c.clone() shared a single connection and only reached
                 // 0.85 GB/s under 8-way concurrency; independent connects break through.
                 let endpoint = args.endpoint.clone();
-                let data = big.clone();
+                // bytes_pass+stream mode only touches big_b (Arc bump) — skip the 512MB
+                // Vec clone that would otherwise sit inside the timed region.
+                let data = if bytes_pass && args.stream {
+                    Vec::new()
+                } else {
+                    big.clone()
+                };
                 let big_b = big_bytes.clone();
                 let sem = sem.clone();
                 let stream = args.stream;

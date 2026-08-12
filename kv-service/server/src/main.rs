@@ -193,12 +193,23 @@ async fn main() -> anyhow::Result<()> {
         .max_encoding_message_size(2 * 1024 * 1024 * 1024);
     // HTTP/2 flow-control tuning: the ~64KB default forces large-value transfers to
     // wait on frequent WINDOW_UPDATEs, capping loopback throughput at ~0.2 GB/s.
-    // Bump the stream window to 64MB and the connection window to 128MB, paired with
-    // a 16MB max frame size, so large chunks can be pushed through in one go.
+    // Stream window 64MB default; connection window must cover all concurrent streams
+    // or parallel PUTs serialize on connection-level WINDOW_UPDATEs (measured: 4x
+    // concurrent 512MB PUT stuck at 1.29 GB/s aggregate with a 128MB connection window).
+    // Values overridable via env for profiling: CS_GRPC_STREAM_WINDOW_MB / CS_GRPC_CONN_WINDOW_MB.
+    let stream_window_mb: u32 = std::env::var("CS_GRPC_STREAM_WINDOW_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let conn_window_mb: u32 = std::env::var("CS_GRPC_CONN_WINDOW_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
     Server::builder()
-        .initial_stream_window_size(Some(64 * 1024 * 1024))
-        .initial_connection_window_size(Some(128 * 1024 * 1024))
+        .initial_stream_window_size(Some(stream_window_mb * 1024 * 1024))
+        .initial_connection_window_size(Some(conn_window_mb * 1024 * 1024))
         .max_frame_size(Some(16 * 1024 * 1024 - 1))
+        .tcp_nodelay(true)
         .add_service(kv_server)
         .serve(addr)
         .await?;
