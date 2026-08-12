@@ -214,6 +214,45 @@ impl StorageTier {
         Ok((device_id as u32, path.to_string_lossy().to_string()))
     }
 
+    /// Data-node internal API: write an object stripe from multiple `Bytes` segments without
+    /// flattening. Used by the streaming PUT pipeline — a stripe accumulated as N gRPC chunk
+    /// segments is handed to `write_batch_vectored` (writev fast path on tier_a) directly, so no
+    /// 64MB intermediate concat buffer is ever allocated.
+    pub fn put_placement_chunk_segments(
+        &self,
+        key: &ObjectKey,
+        stripe_index: usize,
+        generation: u64,
+        layout_version: u64,
+        segments: Vec<Bytes>,
+    ) -> Result<(u32, String)> {
+        let device_id = self.router.chunk_device(key, stripe_index);
+        let path = self.router.chunk_versioned_path(
+            key,
+            stripe_index,
+            device_id,
+            generation,
+            layout_version,
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let total: usize = segments.iter().map(|s| s.len()).sum();
+        let req = IORequest {
+            path: path.clone(),
+            offset: 0,
+            length: total,
+        };
+        let results = self.executor.write_batch_vectored(vec![(req, segments)]);
+        results
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(KVError::Internal("write_batch_vectored empty result".into())))?;
+        self.writes_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written.fetch_add(total as u64, Ordering::Relaxed);
+        Ok((device_id as u32, path.to_string_lossy().to_string()))
+    }
+
     /// Validate that a placement chunk handle matches the descriptor identity and router layout.
     pub fn validate_placement_chunk_handle(
         &self,
