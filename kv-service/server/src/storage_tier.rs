@@ -637,11 +637,12 @@ impl StorageTier {
         &self,
         key: &ObjectKey,
         stripe_index: usize,
+        device_stripe_index: usize,
         generation: u64,
         layout_version: u64,
         data: Bytes,
     ) -> Result<(u32, String, String)> {
-        let device_id = self.router.chunk_device(key, stripe_index);
+        let device_id = self.router.chunk_device(key, device_stripe_index);
         let path = self.router.chunk_versioned_path(
             key,
             stripe_index,
@@ -671,11 +672,12 @@ impl StorageTier {
         &self,
         key: &ObjectKey,
         stripe_index: usize,
+        device_stripe_index: usize,
         generation: u64,
         layout_version: u64,
         segments: Vec<Bytes>,
     ) -> Result<(u32, String, String)> {
-        let device_id = self.router.chunk_device(key, stripe_index);
+        let device_id = self.router.chunk_device(key, device_stripe_index);
         let path = self.router.chunk_versioned_path(
             key,
             stripe_index,
@@ -2667,7 +2669,7 @@ mod tests {
         };
 
         let (_device_id, path, checksum) = st
-            .put_placement_chunk(&key, 0, 1, 1, Bytes::from_static(b"placement"))
+            .put_placement_chunk(&key, 0, 0, 1, 1, Bytes::from_static(b"placement"))
             .unwrap();
         std::fs::write(&path, b"corrupted").unwrap();
         let err = st
@@ -2689,7 +2691,7 @@ mod tests {
         };
 
         let (_device_id, path, _checksum) = st
-            .put_placement_chunk(&key, 0, 1, 1, Bytes::from_static(b"placement"))
+            .put_placement_chunk(&key, 0, 0, 1, 1, Bytes::from_static(b"placement"))
             .unwrap();
         let data = st.read_placement_chunk(&path, 9, None).unwrap().unwrap();
         assert_eq!(data.as_ref(), b"placement");
