@@ -222,6 +222,22 @@ mod tests {
     }
 
     #[test]
+    fn local_stripe_indices_handle_duplicate_local_data_nodes() {
+        let nodes = vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-a", "10.0.0.1:50051"),
+        ];
+        let ctx = ctx_with_local_and_nodes("node-a", "10.0.0.1:50051", nodes);
+
+        for stripe_index in 0..8 {
+            assert_eq!(
+                local_device_stripe_index(&ctx, &key(), stripe_index),
+                Some(stripe_index)
+            );
+        }
+    }
+
+    #[test]
     fn placement_validation_accepts_current_descriptor() {
         let ctx = ctx_with_nodes(vec![data_node("node-a", "10.0.0.1:50051")]);
         let meta = meta();
@@ -987,11 +1003,24 @@ fn local_device_stripe_index(
     stripe_index: usize,
 ) -> Option<usize> {
     let nodes = configured_data_nodes(ctx);
-    let local_index = nodes.iter().position(|node| is_local_node(ctx, node))?;
+    let local_count = nodes.iter().filter(|node| is_local_node(ctx, node)).count();
+    if local_count == 0 {
+        return None;
+    }
     let base = (hash64(key.to_string_key().as_bytes()) as usize) % nodes.len();
-    let first_stripe = (local_index + nodes.len() - base) % nodes.len();
-    (stripe_index >= first_stripe && (stripe_index - first_stripe) % nodes.len() == 0)
-        .then_some((stripe_index - first_stripe) / nodes.len())
+    let slot = (base + stripe_index) % nodes.len();
+    if !is_local_node(ctx, &nodes[slot]) {
+        return None;
+    }
+
+    // Count local assignments before this stripe by whole node-list cycles, then
+    // count the remaining partial cycle. This also handles duplicate local entries.
+    let full_cycles = stripe_index / nodes.len();
+    let remainder = stripe_index % nodes.len();
+    let local_in_partial_cycle = (0..=remainder)
+        .filter(|offset| is_local_node(ctx, &nodes[(base + offset) % nodes.len()]))
+        .count();
+    Some(full_cycles * local_count + local_in_partial_cycle - 1)
 }
 
 fn placement_policy_id(ctx: &KVServiceContext) -> String {
