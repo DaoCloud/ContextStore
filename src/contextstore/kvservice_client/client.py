@@ -222,6 +222,7 @@ class KVClient:
                     storage_handle=chunk.storage_handle,
                     offset=chunk.offset,
                     length=chunk.length,
+                    checksum=chunk.checksum,
                 )
                 for chunk in p.chunks
             ],
@@ -238,6 +239,7 @@ class KVClient:
             storage_handle=chunk.storage_handle,
             offset=chunk.offset,
             length=chunk.length,
+            checksum=chunk.checksum,
         )
 
     @staticmethod
@@ -263,6 +265,7 @@ class KVClient:
                     storage_handle=chunk.storage_handle,
                     offset=chunk.offset,
                     length=chunk.length,
+                    checksum=chunk.checksum,
                 )
                 for chunk in p.chunks
             ],
@@ -378,6 +381,7 @@ class KVClient:
     def _read_placement_chunk_bytes(
         self,
         descriptor: ObjectDescriptor,
+        placement: PlacementDescriptor,
         chunk: PlacementChunk,
         fallback_endpoint: str,
     ) -> tuple[int, bytes]:
@@ -387,6 +391,7 @@ class KVClient:
             pb.ReadPlacementChunkRequest(
                 descriptor=self._to_pb_descriptor(descriptor),
                 chunk=self._to_pb_chunk(chunk),
+                placement=self._to_pb_placement(placement),
             ),
             timeout=self.timeout,
         )
@@ -406,6 +411,7 @@ class KVClient:
             self._chunk_executor.submit(
                 self._read_placement_chunk_bytes,
                 descriptor,
+                placement,
                 chunk,
                 placement.primary_grpc_endpoint,
             )

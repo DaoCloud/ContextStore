@@ -2,16 +2,17 @@
 
 use crate::config::Config;
 use crate::error::{KVError, Result};
+use crate::metrics::Metrics;
 use parking_lot::Mutex;
 use redis::Commands;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::Arc;
 
 const BLOCK_META_SEGMENT: &str = "block_meta";
 const GENERATION_SEGMENT: &str = "generation";
@@ -34,6 +35,9 @@ pub struct ChunkLocation {
     pub storage_handle: String,
     pub offset: u64,
     pub length: u64,
+    /// xxh3-64 checksum of the physical stripe, encoded as lowercase hexadecimal.
+    #[serde(default)]
+    pub checksum: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -52,6 +56,11 @@ pub struct StripingInfo {
     /// placement derived from chunk_paths/chunk_devices.
     #[serde(default)]
     pub chunk_locations: Vec<ChunkLocation>,
+    /// xxh3-64 checksum for each chunk, indexed by chunk 0..N.
+    ///
+    /// Empty means the object was written while optional stripe integrity was disabled.
+    #[serde(default)]
+    pub chunk_checksums: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +96,23 @@ pub struct BlockMeta {
     pub striping: Option<StripingInfo>,
 }
 
+impl BlockMeta {
+    /// Return true when the object has a positive TTL and its creation timestamp is past expiry.
+    pub fn is_expired_at(&self, now: i64) -> bool {
+        self.ttl_seconds > 0
+            && self
+                .created_at
+                .checked_add(self.ttl_seconds)
+                .map(|expires_at| expires_at <= now)
+                .unwrap_or(true)
+    }
+
+    /// Return true when the object is expired at the current wall-clock timestamp.
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(chrono::Utc::now().timestamp())
+    }
+}
+
 enum MetadataBackend {
     Redis(RedisMetadataBackend),
     #[cfg(test)]
@@ -99,6 +125,10 @@ pub struct MetadataService {
 
 impl MetadataService {
     pub fn new(config: &Config) -> Result<Self> {
+        Self::new_with_metrics(config, None)
+    }
+
+    pub fn new_with_metrics(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self> {
         #[cfg(test)]
         if config.metadata.redis_url.starts_with("memory://") {
             return Ok(Self {
@@ -109,7 +139,7 @@ impl MetadataService {
         }
 
         Ok(Self {
-            backend: MetadataBackend::Redis(RedisMetadataBackend::new(config)?),
+            backend: MetadataBackend::Redis(RedisMetadataBackend::new(config, metrics)?),
         })
     }
 
@@ -147,6 +177,15 @@ impl MetadataService {
         }
     }
 
+    /// Delete metadata only when the stored value still matches the expected object metadata.
+    pub fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.delete_block_if_matches(key, expected),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.delete_block_if_matches(key, expected),
+        }
+    }
+
     pub fn exists_block(&self, key: &str) -> Result<bool> {
         match &self.backend {
             MetadataBackend::Redis(backend) => backend.exists_block(key),
@@ -162,6 +201,13 @@ impl MetadataService {
             MetadataBackend::Memory(backend) => backend.next_generation(key),
         }
     }
+
+    #[cfg(test)]
+    pub fn fail_next_put_for_test(&self) {
+        if let MetadataBackend::Memory(backend) = &self.backend {
+            backend.fail_next_put();
+        }
+    }
 }
 
 struct RedisMetadataBackend {
@@ -170,10 +216,11 @@ struct RedisMetadataBackend {
     connect_timeout: Duration,
     command_timeout: Duration,
     connection: Mutex<redis::Connection>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl RedisMetadataBackend {
-    fn new(config: &Config) -> Result<Self> {
+    fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self> {
         let client = redis::Client::open(config.metadata.redis_url.as_str())
             .map_err(|e| KVError::Metadata(format!("open Redis client: {}", e)))?;
         let connect_timeout = Duration::from_millis(config.metadata.redis_connect_timeout_ms);
@@ -189,6 +236,7 @@ impl RedisMetadataBackend {
             connect_timeout,
             command_timeout,
             connection: Mutex::new(connection),
+            metrics,
         })
     }
 
@@ -219,8 +267,9 @@ impl RedisMetadataBackend {
     where
         F: FnMut(&mut redis::Connection) -> redis::RedisResult<T>,
     {
+        let started = self.metrics.as_ref().map(|_| Instant::now());
         let mut connection = self.connection.lock();
-        match command(&mut connection) {
+        let result = match command(&mut connection) {
             Ok(value) => Ok(value),
             Err(first_error) => {
                 tracing::warn!(
@@ -228,18 +277,32 @@ impl RedisMetadataBackend {
                     op,
                     first_error
                 );
-                let mut new_connection =
-                    Self::connect(&self.client, self.connect_timeout, self.command_timeout)?;
-                let value = command(&mut new_connection).map_err(|second_error| {
-                    KVError::Metadata(format!(
-                        "redis {} failed after reconnect: {}; first error: {}",
-                        op, second_error, first_error
-                    ))
-                })?;
-                *connection = new_connection;
-                Ok(value)
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_metadata_reconnect();
+                }
+                match Self::connect(&self.client, self.connect_timeout, self.command_timeout) {
+                    Ok(mut new_connection) => match command(&mut new_connection) {
+                        Ok(value) => {
+                            *connection = new_connection;
+                            Ok(value)
+                        }
+                        Err(second_error) => Err(KVError::Metadata(format!(
+                            "redis {} failed after reconnect: {}; first error: {}",
+                            op, second_error, first_error
+                        ))),
+                    },
+                    Err(reconnect_error) => Err(reconnect_error),
+                }
             }
+        };
+        if let (Some(metrics), Some(started)) = (&self.metrics, started) {
+            metrics.record_metadata_operation(
+                op,
+                if result.is_ok() { "ok" } else { "error" },
+                started.elapsed().as_secs_f64(),
+            );
         }
+        result
     }
 
     fn block_key(&self, key: &str) -> String {
@@ -261,7 +324,7 @@ impl RedisMetadataBackend {
     fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
         let redis_key = self.block_key(key);
         let bytes = Self::serialize(meta)?;
-        self.run_with_reconnect("SET block metadata", |connection| {
+        self.run_with_reconnect("put_block", |connection| {
             connection.set::<_, _, ()>(&redis_key, &bytes)
         })
     }
@@ -269,7 +332,7 @@ impl RedisMetadataBackend {
     fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
         let redis_key = self.block_key(key);
         let bytes = Self::serialize(meta)?;
-        let result = self.run_with_reconnect("SET NX block metadata", |connection| {
+        let result = self.run_with_reconnect("put_block_if_absent", |connection| {
             redis::cmd("SET")
                 .arg(&redis_key)
                 .arg(&bytes)
@@ -281,7 +344,7 @@ impl RedisMetadataBackend {
 
     fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
         let redis_key = self.block_key(key);
-        let bytes = self.run_with_reconnect("GET block metadata", |connection| {
+        let bytes = self.run_with_reconnect("get_block", |connection| {
             connection.get::<_, Option<Vec<u8>>>(&redis_key)
         })?;
         bytes.as_deref().map(Self::deserialize).transpose()
@@ -289,16 +352,42 @@ impl RedisMetadataBackend {
 
     fn delete_block(&self, key: &str) -> Result<()> {
         let redis_key = self.block_key(key);
-        self.run_with_reconnect("DEL block metadata", |connection| {
+        self.run_with_reconnect("delete_block", |connection| {
             connection.del::<_, ()>(&redis_key)
         })
     }
 
+    fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+        let redis_key = self.block_key(key);
+        let expected_generation = expected.object_generation;
+        let script = SCRIPT.get_or_init(|| {
+            redis::Script::new(
+                r#"
+            local meta = redis.call("GET", KEYS[1])
+            if meta then
+                local ok, decoded = pcall(cjson.decode, meta)
+                if ok and type(decoded) == "table" and tonumber(decoded["object_generation"]) == tonumber(ARGV[1]) then
+                    redis.call("DEL", KEYS[1])
+                    return 1
+                end
+            end
+            return 0
+            "#,
+            )
+        });
+        let deleted = self.run_with_reconnect("delete_block_if_matches", |connection| {
+            script
+                .key(&redis_key)
+                .arg(expected_generation)
+                .invoke::<i32>(connection)
+        })?;
+        Ok(deleted == 1)
+    }
+
     fn exists_block(&self, key: &str) -> Result<bool> {
         let redis_key = self.block_key(key);
-        self.run_with_reconnect("EXISTS block metadata", |connection| {
-            connection.exists(&redis_key)
-        })
+        self.run_with_reconnect("exists_block", |connection| connection.exists(&redis_key))
     }
 
     fn next_generation(&self, key: &str) -> Result<u64> {
@@ -326,7 +415,7 @@ impl RedisMetadataBackend {
             "#,
             )
         });
-        self.run_with_reconnect("allocate generation", |connection| {
+        self.run_with_reconnect("next_generation", |connection| {
             script
                 .key(&block_key)
                 .key(&generation_key)
@@ -346,6 +435,7 @@ struct MemoryMetadataBackend {
 struct MemoryMetadataInner {
     blocks: HashMap<String, Vec<u8>>,
     generations: HashMap<String, u64>,
+    fail_next_puts: usize,
 }
 
 #[cfg(test)]
@@ -370,15 +460,21 @@ impl MemoryMetadataBackend {
     }
 
     fn put_block(&self, key: &str, meta: &BlockMeta) -> Result<()> {
-        self.inner
-            .lock()
-            .blocks
-            .insert(key.to_string(), Self::serialize(meta)?);
+        let mut inner = self.inner.lock();
+        if inner.fail_next_puts > 0 {
+            inner.fail_next_puts -= 1;
+            return Err(KVError::Metadata("injected put failure".to_string()));
+        }
+        inner.blocks.insert(key.to_string(), Self::serialize(meta)?);
         Ok(())
     }
 
     fn put_block_if_absent(&self, key: &str, meta: &BlockMeta) -> Result<bool> {
         let mut inner = self.inner.lock();
+        if inner.fail_next_puts > 0 {
+            inner.fail_next_puts -= 1;
+            return Err(KVError::Metadata("injected put failure".to_string()));
+        }
         if inner.blocks.contains_key(key) {
             return Ok(false);
         }
@@ -400,6 +496,18 @@ impl MemoryMetadataBackend {
         Ok(())
     }
 
+    fn delete_block_if_matches(&self, key: &str, expected: &BlockMeta) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if let Some(bytes) = inner.blocks.get(key) {
+            let stored = Self::deserialize(bytes)?;
+            if stored.object_generation == expected.object_generation {
+                inner.blocks.remove(key);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn exists_block(&self, key: &str) -> Result<bool> {
         Ok(self.inner.lock().blocks.contains_key(key))
     }
@@ -417,6 +525,10 @@ impl MemoryMetadataBackend {
         let next = current.max(old_generation) + 1;
         inner.generations.insert(key.to_string(), next);
         Ok(next)
+    }
+
+    fn fail_next_put(&self) {
+        self.inner.lock().fail_next_puts += 1;
     }
 }
 
@@ -483,6 +595,48 @@ mod tests {
     }
 
     #[test]
+    fn delete_block_if_matches_keeps_newer_metadata() {
+        let svc = MetadataService::new(&test_config("compare-delete")).unwrap();
+        let mut first = meta();
+        first.object_generation = 1;
+        let mut second = meta();
+        second.object_generation = 2;
+
+        svc.put_block("k1", &second).unwrap();
+
+        assert!(!svc.delete_block_if_matches("k1", &first).unwrap());
+        assert_eq!(svc.get_block("k1").unwrap().unwrap().object_generation, 2);
+        assert!(svc.delete_block_if_matches("k1", &second).unwrap());
+        assert!(svc.get_block("k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_block_if_matches_uses_generation_identity() {
+        let svc = MetadataService::new(&test_config("compare-delete-generation")).unwrap();
+        let stored = meta();
+        let mut expected = meta();
+        expected.content_etag = "etag-from-older-binary".to_string();
+        expected.layout_version = 99;
+
+        svc.put_block("k1", &stored).unwrap();
+
+        assert!(svc.delete_block_if_matches("k1", &expected).unwrap());
+        assert!(svc.get_block("k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn injected_put_failure_is_one_shot() {
+        let svc = MetadataService::new(&test_config("inject-put")).unwrap();
+        let meta = meta();
+
+        svc.fail_next_put_for_test();
+        assert!(svc.put_block("k1", &meta).is_err());
+        svc.put_block("k1", &meta).unwrap();
+
+        assert!(svc.exists_block("k1").unwrap());
+    }
+
+    #[test]
     fn next_generation_is_monotonic() {
         let svc = MetadataService::new(&test_config("generation")).unwrap();
         assert_eq!(svc.next_generation("k1").unwrap(), 1);
@@ -492,5 +646,18 @@ mod tests {
         meta.object_generation = 10;
         svc.put_block("k1", &meta).unwrap();
         assert_eq!(svc.next_generation("k1").unwrap(), 11);
+    }
+
+    #[test]
+    fn block_meta_expiry_uses_created_at_and_positive_ttl() {
+        let mut meta = meta();
+        meta.created_at = 100;
+        meta.ttl_seconds = 10;
+
+        assert!(!meta.is_expired_at(109));
+        assert!(meta.is_expired_at(110));
+
+        meta.ttl_seconds = 0;
+        assert!(!meta.is_expired_at(1_000));
     }
 }

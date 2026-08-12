@@ -60,6 +60,8 @@ devices = ["./data/nvme0"]
 data_subdir = "contextstore"
 striping_threshold = 268435456
 striping_chunk_size = 67108864
+rdma_stream_chunk_size = 8388608
+verify_stripe_checksums = false
 
 [memory_tier]
 capacity_mb = 4096
@@ -102,9 +104,18 @@ listen = "0.0.0.0:9090"
 | `data_subdir` | `"contextstore"` | Subdirectory created below each configured device. |
 | `striping_threshold` | `268435456` | Object size threshold in bytes for internal striping. `0` disables striping. |
 | `striping_chunk_size` | `67108864` | Chunk size in bytes when striping is enabled. |
+| `rdma_stream_chunk_size` | `8388608` | Maximum 4 KiB-aligned range emitted by the RDMA disk-miss read stream. It preserves the physical striping layout while overlapping disk reads and RDMA writes. |
+| `verify_stripe_checksums` | `false` | When enabled, persist an xxh3-64 checksum per physical stripe and validate it before serving disk reads. Values written before enabling it are treated as cache misses until rewritten. Disabled by default to avoid the extra CPU memory scan on the normal performance path. |
 
 KVService stores object data under each device's `data_subdir`. It creates
 subdirectories and object files; it does not format raw devices.
+
+For an RDMA disk miss, integrity mode holds each physical stripe until all of
+its `rdma_stream_chunk_size` reads complete and the full stripe checksum
+passes. This preserves data integrity, but releases RDMA writes at stripe
+granularity rather than the normal subrange granularity and can increase
+first-byte latency. Keep the option disabled for latency-sensitive cache reads
+unless this integrity trade-off is required.
 
 ### `[memory_tier]`
 
@@ -143,6 +154,13 @@ subdirectories and object files; it does not format raw devices.
 All KVService nodes that should share object metadata must use the same
 `redis_url` and `redis_key_prefix`. Use different prefixes to isolate
 environments that share one Redis instance.
+
+When `storage.verify_stripe_checksums = true`, enable it on every coordinator
+and data node in a placement cluster. The coordinator rejects a distributed
+write if any data node does not return a stripe checksum. Upgrade Python
+clients too: regenerate their protobuf stubs with `make proto` before building
+or packaging the client, so cached placement descriptors retain the checksum
+field during forwarding.
 
 ### `[cluster]`
 
@@ -184,10 +202,46 @@ rdma_endpoint = "10.0.0.12:50053"
 If `metrics.enabled = true` but the binary was not built with `--features
 metrics`, the server still starts and logs a warning.
 
+The exporter uses only low-cardinality labels. Storage I/O metrics are grouped
+by `operation`, `device`, `executor`, `mode`, and `status`; Redis metadata
+metrics are grouped by operation and status; RDMA metrics are grouped by NIC.
+Object keys, file paths, request IDs, and namespaces are intentionally not
+Prometheus labels. Use `contextstore_server::storage_io` debug logs when an
+individual path must be inspected.
+
+Key metrics for performance tuning include:
+
+- `kvservice_storage_io_total`, `kvservice_storage_io_bytes_total`,
+  `kvservice_storage_io_duration_seconds`, and
+  `kvservice_storage_io_inflight` for per-device I/O throughput, latency, and
+  concurrency. `mode` identifies the logical storage path; `aligned` may use
+  O_DIRECT or a buffered fallback depending on executor and filesystem support.
+  For `mode="batch"`, `vectored`, and `aligned` striped I/O,
+  the duration is the wall-clock submission-to-completion time of the parallel
+  batch and is emitted for each participating device; it is not a per-device
+  device-service-time measurement.
+- `kvservice_metadata_operations_total`,
+  `kvservice_metadata_operation_duration_seconds`, and
+  `kvservice_metadata_reconnect_total` for Redis metadata pressure.
+- `device_used_bytes` for per-device capacity. It is initialized once at
+  startup and updated as ContextStore writes or deletes files; scraping the
+  exporter does not walk the data directory.
+- `kvservice_rdma_bytes_total`,
+  `kvservice_rdma_transfer_duration_seconds`,
+  `kvservice_rdma_errors_total`, and `kvservice_rdma_connections` for the
+  RDMA data path.
+
 ### `[gds]`
 
 This section is optional and only has an effect when the server is built with
 the `gds` feature.
+
+The default `make build` does not include GDS. Build it explicitly on a Linux
+host that has CUDA, `libcufile.so`, and the `nvidia-fs` kernel module:
+
+```bash
+make build SERVER_FEATURES=io-uring,rdma,metrics,gds
+```
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -195,7 +249,9 @@ the `gds` feature.
 | `device` | `-1` | CUDA device ordinal. `-1` means do not force a device. |
 
 GDS initialization failures are logged as warnings and normal I/O paths remain
-available.
+available. The current implementation uses CUDA IPC for a GPU buffer on the
+same host and supports only unstriped local objects. It does not provide
+striped or cross-node GDS reads or writes.
 
 ## Deployment notes
 

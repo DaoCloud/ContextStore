@@ -25,6 +25,7 @@ devices = [
 data_subdir = "contextstore"
 striping_threshold = 268435456    # 256 MB; 0 disables striping
 striping_chunk_size = 67108864    # 64 MB
+rdma_stream_chunk_size = 8388608  # 8 MB; disk-read/RDMA pipeline granularity
 
 [memory_tier]
 capacity_mb = 16384         # L1 = 16 GB, tune to available node RAM

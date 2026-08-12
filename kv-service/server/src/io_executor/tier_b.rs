@@ -103,6 +103,15 @@ enum RingJob {
         reqs: Vec<(IORequest, PtrWrapperMut, usize)>,
         resp: channel::Sender<Vec<Result<usize>>>,
     },
+    /// Streaming counterpart of ReadAlignedIntoPtrBatch. A device worker sends one
+    /// completion directly to the shared receiver after its stripe has finished.
+    ReadAlignedIntoPtrStream {
+        job_id: u64,
+        queued_at: std::time::Instant,
+        original_index: usize,
+        req: (IORequest, PtrWrapperMut, usize),
+        completion: channel::Sender<(usize, Result<usize>)>,
+    },
     SingleRead {
         req: IORequest,
         resp: channel::Sender<Result<Vec<u8>>>,
@@ -417,6 +426,45 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                     },
                 );
                 let _ = resp.send(r);
+            }
+            RingJob::ReadAlignedIntoPtrStream {
+                job_id,
+                queued_at,
+                original_index,
+                req,
+                completion,
+            } => {
+                let started = std::time::Instant::now();
+                let queue_wait_us = started.duration_since(queued_at).as_micros() as u64;
+                let (request, _, capacity) = &req;
+                let result = do_read_aligned_into_ptr_batch(&mut ring, std::slice::from_ref(&req))
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Err(KVError::Internal("missing stream result".into())));
+                let context = IoLogContext {
+                    executor: "tier_b",
+                    operation: "read",
+                    mode: "aligned_into_ptr_stream",
+                    device_id: device_idx as i64,
+                    job_id,
+                };
+                match &result {
+                    Ok(bytes_read) => log_io_request(context, request, *bytes_read, *bytes_read),
+                    Err(error) => log_io_error(context, request, *capacity, error),
+                }
+                log_io_batch(
+                    context,
+                    IoBatchStats {
+                        request_count: 1,
+                        success_count: if result.is_ok() { 1 } else { 0 },
+                        failure_count: if result.is_err() { 1 } else { 0 },
+                        requested_bytes: *capacity,
+                        completed_bytes: result.as_ref().ok().copied().unwrap_or(0),
+                        queue_wait_us,
+                        duration_us: started.elapsed().as_micros() as u64,
+                    },
+                );
+                let _ = completion.send((original_index, result));
             }
             RingJob::Shutdown => break,
         }
@@ -1170,7 +1218,7 @@ fn do_read_aligned_into_ptr_batch(
     let n = reqs.len();
     let mut results: Vec<Result<usize>> = (0..n).map(|_| Ok(0)).collect();
     let mut files: Vec<Option<std::fs::File>> = (0..n).map(|_| None).collect();
-    let mut file_sizes: Vec<usize> = vec![0; n];
+    let mut requested_lengths: Vec<usize> = vec![0; n];
 
     // sqe_plans[i] = Vec<(offset_in_file, ptr_in_buf, chunk_len)>
     let mut sqe_plans: Vec<Vec<(u64, *mut u8, u32)>> = (0..n).map(|_| Vec::new()).collect();
@@ -1195,15 +1243,37 @@ fn do_read_aligned_into_ptr_batch(
         }
         match open_for_direct_read(&req.path) {
             Ok((Some(f), file_size)) => {
-                if file_size == 0 {
+                let file_offset = req.offset as usize;
+                if file_offset > file_size {
+                    results[i] = Err(KVError::Internal(format!(
+                        "read_aligned_into_ptr: offset {} beyond file size {}",
+                        req.offset, file_size
+                    )));
+                    continue;
+                }
+                if file_offset % DIRECT_IO_ALIGN != 0 {
+                    results[i] = Err(KVError::Internal(format!(
+                        "read_aligned_into_ptr: offset {} not 4K-aligned",
+                        req.offset
+                    )));
+                    continue;
+                }
+                let requested_len = if req.length == 0 {
+                    file_size - file_offset
+                } else {
+                    req.length.min(file_size - file_offset)
+                };
+                if requested_len == 0 {
                     results[i] = Ok(0);
                     continue;
                 }
-                let aligned_len = (file_size + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
+                let aligned_len =
+                    (requested_len + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
                 if capacity < aligned_len {
                     results[i] = Err(KVError::Internal(format!(
-                        "read_aligned_into_ptr: capacity {} < aligned file_size {}",
-                        capacity, aligned_len
+                        "read_aligned_into_ptr: capacity {} < aligned requested range {} \
+                         (file_offset={}, request_length={}, file_size={})",
+                        capacity, aligned_len, req.offset, req.length, file_size
                     )));
                     continue;
                 }
@@ -1212,15 +1282,35 @@ fn do_read_aligned_into_ptr_batch(
                 while off < aligned_len {
                     let chunk_len = (aligned_len - off).min(MAX_AIO_CHUNK_READ);
                     let chunk_ptr = unsafe { dst_ptr.add(off) };
-                    sqe_plans[i].push((off as u64, chunk_ptr, chunk_len as u32));
+                    sqe_plans[i].push(((file_offset + off) as u64, chunk_ptr, chunk_len as u32));
                     off += chunk_len;
                 }
                 files[i] = Some(f);
-                file_sizes[i] = file_size;
+                requested_lengths[i] = requested_len;
             }
-            Ok((None, _file_size)) => {
+            Ok((None, file_size)) => {
                 // O_DIRECT not supported (container/filesystem): fall back to buffered sync
                 // read; use ordinary read then memcpy into ptr (slow path; rarely triggered).
+                let file_offset = req.offset as usize;
+                if file_offset > file_size {
+                    results[i] = Err(KVError::Internal(format!(
+                        "fallback read: offset {} beyond file size {}",
+                        req.offset, file_size
+                    )));
+                    continue;
+                }
+                let requested_len = if req.length == 0 {
+                    file_size - file_offset
+                } else {
+                    req.length.min(file_size - file_offset)
+                };
+                if requested_len > capacity {
+                    results[i] = Err(KVError::Internal(format!(
+                        "fallback read: requested {} > capacity {}",
+                        requested_len, capacity
+                    )));
+                    continue;
+                }
                 let f = match OpenOptions::new().read(true).open(&req.path) {
                     Ok(f) => f,
                     Err(e) => {
@@ -1228,23 +1318,19 @@ fn do_read_aligned_into_ptr_batch(
                         continue;
                     }
                 };
-                let file_size = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                if file_size > capacity {
-                    results[i] = Err(KVError::Internal(format!(
-                        "fallback read: file_size {} > capacity {}",
-                        file_size, capacity
-                    )));
-                    continue;
-                }
-                let mut buf = vec![0u8; file_size];
+                let mut buf = vec![0u8; requested_len];
                 use std::io::Read as _;
                 let mut f_mut = f;
-                match f_mut.read_exact(&mut buf) {
+                use std::io::{Seek as _, SeekFrom};
+                let read_result = f_mut
+                    .seek(SeekFrom::Start(req.offset))
+                    .and_then(|_| f_mut.read_exact(&mut buf));
+                match read_result {
                     Ok(()) => {
                         unsafe {
-                            std::ptr::copy_nonoverlapping(buf.as_ptr(), dst_ptr, file_size);
+                            std::ptr::copy_nonoverlapping(buf.as_ptr(), dst_ptr, requested_len);
                         }
-                        results[i] = Ok(file_size);
+                        results[i] = Ok(requested_len);
                     }
                     Err(e) => results[i] = Err(KVError::Io(e)),
                 }
@@ -1337,8 +1423,8 @@ fn do_read_aligned_into_ptr_batch(
     // ===== Phase 3: fill in return values (real file_size, not 4K padding) =====
     for i in 0..n {
         if !any_error[i] && files[i].is_some() {
-            // total_read[i] may be ≥ file_size (0-padded to 4K); take the real file_size.
-            results[i] = Ok(file_sizes[i].min(total_read[i]));
+            // total_read[i] may include the final 4K padding; return only the requested range.
+            results[i] = Ok(requested_lengths[i].min(total_read[i]));
         }
     }
 
@@ -1965,27 +2051,20 @@ impl IOExecutor for TierBExecutor {
     /// soon as each IO finishes.
     /// Comparison with the batch version:
     /// - batch: collects all device batch_results and returns a Vec only after all done
-    /// - stream: each device worker pushes all its IO-completion events into a shared
-    ///   tx as soon as it finishes
+    /// - stream: forwards each completed stripe through a shared channel immediately
     ///
-    /// Note the current granularity is **per-device** (not per-IO — a device's N IOs
-    /// only push after they all complete):
-    /// - Our RDMA GET path is 8 stripes = 8 IOs = each on a different device (path
-    ///   prefix decides) → each device has 1 IO → push on completion is equivalent to
-    ///   per-IO.
-    /// - If a device holds multiple IOs, they still complete serially inside the batch
-    ///   (chunked SQEs within the batch impl), and once batch_results is done all IO
-    ///   events are pushed in one shot (gain is still "parallel across devices").
+    /// Each stream item is submitted as an independent job to its device worker. The
+    /// worker remains FIFO, so a device retains the queue depth used by one striped
+    /// read, but the first completed stripe can be handed to RDMA while the worker
+    /// reads the next stripe on that device. Grouping all stripes from one device in a
+    /// single batch would defer that notification until the whole group completed and
+    /// turn the intended storage/RDMA pipeline back into two serial phases.
     fn read_aligned_into_ptr_stream(
         &self,
         requests: Vec<(IORequest, *mut u8, usize)>,
     ) -> channel::Receiver<(usize, Result<usize>)> {
-        let n = requests.len();
         let (tx, rx) = channel::unbounded::<(usize, Result<usize>)>();
 
-        // Group by device (same as the batch impl).
-        let mut groups: BTreeMap<usize, Vec<(usize, (IORequest, PtrWrapperMut, usize))>> =
-            BTreeMap::new();
         for (orig_idx, (req, ptr, cap)) in requests.into_iter().enumerate() {
             let device_idx = self
                 .prefix_index
@@ -1993,68 +2072,26 @@ impl IOExecutor for TierBExecutor {
                 .find(|(p, _)| req.path.starts_with(p))
                 .map(|(_, i)| *i)
                 .unwrap_or(0);
-            groups
-                .entry(device_idx)
-                .or_default()
-                .push((orig_idx, (req, PtrWrapperMut(ptr), cap)));
-        }
-
-        if groups.is_empty() {
-            return rx;
-        }
-
-        // Each device group spawns its own forwarder thread:
-        // take batch_results from the device worker → immediately push each IO's
-        // completion into the shared tx. So the order events reach tx matches the
-        // order devices finish.
-        for (device_idx, group) in groups {
-            let (resp_tx, resp_rx) = channel::bounded::<Vec<Result<usize>>>(1);
-            let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
-            let reqs: Vec<(IORequest, PtrWrapperMut, usize)> =
-                group.into_iter().map(|(_, p)| p).collect();
             let worker = &self.devices[device_idx];
             let job_id = self.job_seq.fetch_add(1, Ordering::Relaxed);
             if worker
                 .sender
-                .send(RingJob::ReadAlignedIntoPtrBatch {
+                .send(RingJob::ReadAlignedIntoPtrStream {
                     job_id,
                     queued_at: std::time::Instant::now(),
-                    reqs,
-                    resp: resp_tx,
+                    original_index: orig_idx,
+                    req: (req, PtrWrapperMut(ptr), cap),
+                    completion: tx.clone(),
                 })
                 .is_err()
             {
-                for i in orig_indices {
-                    let _ = tx.send((i, Err(KVError::Internal("worker shut down".into()))));
-                }
-                continue;
+                let _ = tx.send((orig_idx, Err(KVError::Internal("worker shut down".into()))));
             }
-            // forwarder: separate thread waits on the device worker and pushes the
-            // result into the shared tx (uses std thread because device worker
-            // rx.recv() is blocking).
-            let tx_clone = tx.clone();
-            std::thread::Builder::new()
-                .name(format!("stream-fwd-{}", device_idx))
-                .spawn(move || match resp_rx.recv() {
-                    Ok(batch_results) => {
-                        for (orig_idx, r) in orig_indices.into_iter().zip(batch_results) {
-                            let _ = tx_clone.send((orig_idx, r));
-                        }
-                    }
-                    Err(_) => {
-                        for i in orig_indices {
-                            let _ = tx_clone
-                                .send((i, Err(KVError::Internal("worker no response".into()))));
-                        }
-                    }
-                })
-                .expect("spawn stream forwarder");
         }
 
-        // Drop the original tx → rx naturally closes once all forwarder threads exit.
-        // (Note: forwarders hold tx_clone; the channel closes when the last one exits.)
+        // Device jobs hold completion clones, so the receiver closes after the final
+        // stripe has been sent.
         drop(tx);
-        let _ = n; // suppress unused warning
         rx
     }
 
@@ -2191,5 +2228,85 @@ mod tests {
             let want = &write_reqs[i].1;
             assert_eq!(r.unwrap().as_slice(), want.as_ref());
         }
+    }
+
+    #[test]
+    fn stream_read_populates_each_aligned_destination() {
+        let tmp = TempDir::new().unwrap();
+        let exec = setup_executor(&tmp, 2);
+        let payloads: Vec<Vec<u8>> = (0..4)
+            .map(|index| vec![index as u8 + 1; DIRECT_IO_ALIGN])
+            .collect();
+        let paths: Vec<PathBuf> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let path = tmp.path().join(format!("nvme{}/stripe-{}.bin", index % 2, index));
+                std::fs::write(&path, payload).unwrap();
+                path
+            })
+            .collect();
+        let mut buffers: Vec<AlignedBuffer> = (0..paths.len())
+            .map(|_| AlignedBuffer::new(DIRECT_IO_ALIGN, DIRECT_IO_ALIGN))
+            .collect();
+        let requests = paths
+            .iter()
+            .zip(buffers.iter_mut())
+            .map(|(path, buffer)| {
+                (
+                    IORequest {
+                        path: path.clone(),
+                        offset: 0,
+                        length: 0,
+                    },
+                    buffer.as_mut_ptr(),
+                    buffer.capacity(),
+                )
+            })
+            .collect();
+
+        let completions = exec.read_aligned_into_ptr_stream(requests);
+        let mut seen = vec![false; payloads.len()];
+        for _ in 0..payloads.len() {
+            let (index, bytes_read) = completions
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("stream completion");
+            assert_eq!(bytes_read.unwrap(), DIRECT_IO_ALIGN);
+            assert!(!seen[index], "duplicate completion for stripe {}", index);
+            seen[index] = true;
+            let actual = unsafe {
+                std::slice::from_raw_parts(buffers[index].as_mut_ptr(), DIRECT_IO_ALIGN)
+            };
+            assert_eq!(actual, payloads[index].as_slice());
+        }
+        assert_eq!(seen, vec![true; payloads.len()]);
+    }
+
+    #[test]
+    fn stream_read_honors_aligned_range() {
+        let tmp = TempDir::new().unwrap();
+        let exec = setup_executor(&tmp, 1);
+        let path = tmp.path().join("nvme0/range.bin");
+        let mut payload = vec![0x11; DIRECT_IO_ALIGN];
+        payload.extend(vec![0x22; DIRECT_IO_ALIGN]);
+        std::fs::write(&path, &payload).unwrap();
+
+        let mut buffer = AlignedBuffer::new(DIRECT_IO_ALIGN, DIRECT_IO_ALIGN);
+        let completions = exec.read_aligned_into_ptr_stream(vec![(
+            IORequest {
+                path,
+                offset: DIRECT_IO_ALIGN as u64,
+                length: DIRECT_IO_ALIGN,
+            },
+            buffer.as_mut_ptr(),
+            buffer.capacity(),
+        )]);
+        let (index, bytes_read) = completions
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("range stream completion");
+        assert_eq!(index, 0);
+        assert_eq!(bytes_read.unwrap(), DIRECT_IO_ALIGN);
+        let actual = unsafe { std::slice::from_raw_parts(buffer.as_mut_ptr(), DIRECT_IO_ALIGN) };
+        assert_eq!(actual, vec![0x22; DIRECT_IO_ALIGN].as_slice());
     }
 }
