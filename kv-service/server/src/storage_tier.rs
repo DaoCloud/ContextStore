@@ -1005,6 +1005,33 @@ impl StorageTier {
         Ok(out)
     }
 
+    /// Read a single stripe of a striped object by index (O_DIRECT aligned path). Used by the
+    /// streaming GET pipeline: each stripe is fetched independently so encoding/sending can
+    /// overlap with reads of later stripes, instead of waiting for the whole
+    /// read_striped_chunks batch.
+    pub fn read_striped_chunk_at(&self, stripe: &StripingInfo, index: usize) -> Result<Bytes> {
+        let path = stripe
+            .chunk_paths
+            .get(index)
+            .ok_or_else(|| KVError::Internal(format!("stripe index {index} out of range")))?;
+        let req = IORequest {
+            path: std::path::PathBuf::from(path),
+            offset: 0,
+            length: 0,
+        };
+        let results = self.executor.read_aligned_batch(std::slice::from_ref(&req));
+        let chunk = results
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(KVError::Internal("read_aligned_batch empty result".into())))
+            .map_err(|e| KVError::Internal(format!("read striped chunk {index}: {e}")))?;
+        if let Some(device_id) = stripe.chunk_devices.get(index) {
+            self.record_device_read(*device_id as usize, chunk.len() as u64);
+        }
+        self.bytes_read.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        Ok(chunk)
+    }
+
     /// Read an object using metadata supplied by the caller; do not re-lookup by logical key.
     ///
     /// This is the core path for descriptor reads: the server first validates the descriptor with

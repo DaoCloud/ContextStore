@@ -171,13 +171,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut handles = Vec::new();
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(args.concurrency));
             for p in 0..args.combined_count {
-                let mut cc = c.clone();
+                // Independent connection per task, same as the PUT side: c.clone() shares
+                // one HTTP/2 connection and caps aggregate GET at single-connection
+                // throughput.
+                let endpoint = args.endpoint.clone();
                 let sem = sem.clone();
                 let stream = args.stream;
                 let pb_name = prefix_base.clone();
                 let bp = bytes_pass;
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
+                    let mut cc = KvClient::connect(endpoint)
+                        .await
+                        .map_err(|e| tonic::Status::unavailable(format!("connect: {}", e)))?;
                     if bp && stream {
                         // Zero-copy passthrough: returns Vec<Bytes>; client only totals
                         // the bytes without concatenating.
@@ -188,9 +194,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await
                         {
-                            Ok(Some(segs)) => Ok::<Option<usize>, tonic::Status>(Some(
-                                segs.iter().map(|s| s.len()).sum(),
-                            )),
+                            Ok(Some(segs)) => {
+                                // Sampled correctness check: data pattern is byte[o] = o % 251.
+                                // Verify the first/last byte of every segment against its
+                                // running offset (catches reordering / wrong stripe bugs).
+                                let mut off: usize = 0;
+                                for s in &segs {
+                                    if !s.is_empty() {
+                                        let expect_first = (off % 251) as u8;
+                                        let expect_last = ((off + s.len() - 1) % 251) as u8;
+                                        if s[0] != expect_first || s[s.len() - 1] != expect_last
+                                        {
+                                            return Err(tonic::Status::data_loss(format!(
+                                                "verify failed at offset {off}: got ({}, {}) want ({expect_first}, {expect_last})",
+                                                s[0], s[s.len() - 1]
+                                            )));
+                                        }
+                                    }
+                                    off += s.len();
+                                }
+                                Ok::<Option<usize>, tonic::Status>(Some(off))
+                            }
                             Ok(None) => Ok(None),
                             Err(e) => Err(e),
                         }

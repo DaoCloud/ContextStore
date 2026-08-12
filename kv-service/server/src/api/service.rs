@@ -1836,7 +1836,116 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 }
             }
             let ctx = self.ctx.clone();
-            // Grab Vec<Bytes> directly (typically 8 × 64MB segments), zero-copy throughout — no more 480MB concatenation.
+            // L1 hit: serve straight from the chunks cache (Arc clones, zero-copy).
+            if let Some((segments, _meta)) = ctx.memory.peek_chunks(&internal) {
+                let total: i64 = segments.iter().map(|s| s.len() as i64).sum();
+                const SUB_CHUNK: usize = 4 * 1024 * 1024;
+                let mut chunks: Vec<pb::DataChunk> = Vec::new();
+                let mut running_offset: i64 = 0;
+                for seg in segments {
+                    let seg_len = seg.len();
+                    let n_sub = seg_len.div_ceil(SUB_CHUNK);
+                    for i in 0..n_sub {
+                        let start = i * SUB_CHUNK;
+                        let end = (start + SUB_CHUNK).min(seg_len);
+                        chunks.push(pb::DataChunk {
+                            data: seg.slice(start..end),
+                            offset: running_offset + start as i64,
+                            total_size: total,
+                            is_last: false,
+                        });
+                    }
+                    running_offset += seg_len as i64;
+                }
+                if let Some(last) = chunks.last_mut() {
+                    last.is_last = true;
+                }
+                let stream = tokio_stream::iter(chunks.into_iter().map(Ok));
+                return Ok(Response::new(Box::pin(stream) as Self::GetStreamStream));
+            }
+
+            // Local striped object, L1 miss: streaming stripe pipeline. Read stripes with
+            // bounded read-ahead and stream sub-chunks as each stripe lands, so disk reads of
+            // stripe N+1..N+RA overlap with encoding/sending of stripe N. The old path waited
+            // for ALL stripes (read_striped_chunks barrier) before sending the first byte.
+            if let Some(meta) = meta.filter(|m| m.striping.is_some()) {
+                let stripe_info = meta.striping.clone().unwrap();
+                let stripe_count = stripe_info.chunk_paths.len();
+                let total: i64 = stripe_info.total_size as i64;
+                const SUB_CHUNK: usize = 4 * 1024 * 1024;
+                const READ_AHEAD: usize = 4;
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::DataChunk, Status>>(64);
+                let read_start = Instant::now();
+                tokio::spawn(async move {
+                    let stripe_info = Arc::new(stripe_info);
+                    let chunk_size = stripe_info.chunk_size as usize;
+                    let mut pending: std::collections::VecDeque<
+                        tokio::task::JoinHandle<Result<Bytes, Status>>,
+                    > = std::collections::VecDeque::new();
+                    let mut next_read = 0usize;
+                    let mut next_send = 0usize;
+                    let mut sent_bytes: u64 = 0;
+                    'outer: while next_send < stripe_count {
+                        while next_read < stripe_count && pending.len() < READ_AHEAD {
+                            let storage = ctx.storage.clone();
+                            let info = stripe_info.clone();
+                            let idx = next_read;
+                            pending.push_back(tokio::task::spawn_blocking(move || {
+                                storage
+                                    .read_striped_chunk_at(&info, idx)
+                                    .map_err(Status::from)
+                            }));
+                            next_read += 1;
+                        }
+                        let handle = match pending.pop_front() {
+                            Some(h) => h,
+                            None => break,
+                        };
+                        let seg = match handle.await {
+                            Ok(Ok(seg)) => seg,
+                            Ok(Err(status)) => {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                return;
+                            }
+                        };
+                        let base = (next_send * chunk_size) as i64;
+                        let seg_len = seg.len();
+                        let n_sub = seg_len.div_ceil(SUB_CHUNK);
+                        for i in 0..n_sub {
+                            let start = i * SUB_CHUNK;
+                            let end = (start + SUB_CHUNK).min(seg_len);
+                            sent_bytes += (end - start) as u64;
+                            let is_last =
+                                next_send + 1 == stripe_count && i + 1 == n_sub;
+                            let chunk = pb::DataChunk {
+                                data: seg.slice(start..end),
+                                offset: base + start as i64,
+                                total_size: total,
+                                is_last,
+                            };
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                break 'outer; // client went away
+                            }
+                        }
+                        next_send += 1;
+                    }
+                    tracing::debug!(
+                        event = "grpc_get_stream_pipeline",
+                        status = "ok",
+                        bytes = sent_bytes,
+                        stripe_count,
+                        total_us = read_start.elapsed().as_micros(),
+                    );
+                });
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                return Ok(Response::new(Box::pin(stream) as Self::GetStreamStream));
+            }
+
+            // Non-striped (small) object: old buffered path.
             let opt = tokio::task::spawn_blocking(move || ctx.memory.get_chunks(&internal))
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
