@@ -4,7 +4,7 @@
 # should always be invoked from the repository root with `make build`.
 
 .PHONY: all build deploy check-deploy-config server server-debug run-server client-rs rdma-ffi meta proto proto-rust \
-	proto-python test test-server test-integration bench fmt lint docker docker-push clean help
+	proto-python test test-server test-integration e2e bench fmt lint docker docker-push clean help
 
 KV_SERVICE_DIR := kv-service
 CONFIG ?= kv-service/configs/server.toml
@@ -67,6 +67,9 @@ test-server:
 test-integration:
 	$(MAKE) -C $(KV_SERVICE_DIR) test-integration
 
+e2e:
+	$(MAKE) -C $(KV_SERVICE_DIR) e2e
+
 fmt:
 	$(MAKE) -C $(KV_SERVICE_DIR) fmt
 
@@ -96,6 +99,7 @@ help:
 	@echo "  make meta             Build the Redis metadata inspection CLI"
 	@echo "  make proto            Regenerate Rust and Python protobuf code"
 	@echo "  make test             Run KVService server and integration tests"
+	@echo "  make e2e              Run the isolated two-node local-cluster E2E suite"
 	@echo "  make bench            Run KVService benchmarks"
 	@echo "  make docker           Build the KVService Docker image"
 	@echo "  make fmt / lint       Format or statically check KVService code"

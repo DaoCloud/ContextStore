@@ -1433,8 +1433,11 @@ fn select_data_node(ctx: &KVServiceContext, key: &InternalKey, stripe_index: usi
 
 /// Return a stripe's zero-based ordinal among stripes assigned to this data node.
 ///
-/// This derives the ordinal from the actual data-node routing sequence, so duplicate
-/// local data-node entries retain the same per-device rotation as a single local entry.
+/// Data-node placement alternates globally across nodes. Selecting a local device
+/// from the global stripe index would pin each node to one device whenever the
+/// node and device counts share a factor. The local ordinal preserves the same
+/// deterministic routing while rotating disks independently on every node, and
+/// duplicate local data-node entries retain the same rotation as a single entry.
 fn local_device_stripe_index(
     ctx: &KVServiceContext,
     key: &InternalKey,
@@ -1451,6 +1454,8 @@ fn local_device_stripe_index(
         return None;
     }
 
+    // Count local assignments before this stripe by whole node-list cycles, then
+    // count the remaining partial cycle. This also handles duplicate local entries.
     let full_cycles = stripe_index / nodes.len();
     let remainder = stripe_index % nodes.len();
     let local_in_partial_cycle = (0..=remainder)
