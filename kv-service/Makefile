@@ -128,7 +128,7 @@ test-integration:
 # ports, metadata keys, and data directories and requires no pre-existing service.
 e2e: check-e2e-tools e2e-server
 	cd $(CLIENT_RS) && CS_E2E_SERVER_BIN="$(CURDIR)/../target/$(BUILD_TYPE)/contextstore-server" \
-		$(CARGO) test $(CARGO_RELEASE_FLAG) --test local_cluster_e2e -- --nocapture
+		$(CARGO) test $(CARGO_RELEASE_FLAG) --test local_cluster_e2e -- --nocapture --test-threads=1
 
 check-e2e-tools:
 	@command -v redis-server >/dev/null 2>&1 || { echo "error: redis-server is required for make e2e"; exit 1; }

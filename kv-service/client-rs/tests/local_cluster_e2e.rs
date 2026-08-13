@@ -12,6 +12,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+const TEST_NAMESPACE: &str = "e2e";
+const TEST_OBJECT_KEY: &str = "striped-object";
+const STREAM_CHUNK_BYTES: usize = 128 * 1024;
+const STRIPED_OBJECT_BYTES: usize = 4 * 1024 * 1024;
+
 fn ports() -> [u16; 3] {
     let listeners: Vec<TcpListener> = (0..3)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
@@ -46,6 +51,7 @@ fn stop(child: &mut Child) {
 }
 
 struct Cluster {
+    scenario: &'static str,
     root: TempDir,
     server: PathBuf,
     redis_port: u16,
@@ -57,7 +63,7 @@ struct Cluster {
 }
 
 impl Cluster {
-    async fn start() -> Self {
+    async fn start(scenario: &'static str) -> Self {
         let server = PathBuf::from(env::var("CS_E2E_SERVER_BIN").expect("CS_E2E_SERVER_BIN"));
         assert!(
             server.is_file(),
@@ -87,6 +93,7 @@ impl Cluster {
             .unwrap();
         wait_for_redis(redis_port);
         let mut cluster = Self {
+            scenario,
             root,
             server,
             redis_port,
@@ -98,7 +105,20 @@ impl Cluster {
         };
         cluster.a = Some(cluster.start_node("node-a").await);
         cluster.b = Some(cluster.start_node("node-b").await);
+        cluster.log("cluster_ready");
         cluster
+    }
+
+    fn log(&self, event: &str) {
+        eprintln!(
+            "e2e scenario={} event={} redis=127.0.0.1:{} node_a={} node_b={} root={}",
+            self.scenario,
+            event,
+            self.redis_port,
+            self.endpoint("node-a"),
+            self.endpoint("node-b"),
+            self.root.path().display(),
+        );
     }
 
     fn endpoint(&self, node: &str) -> String {
@@ -213,8 +233,10 @@ rdma_endpoint = ""
     }
 
     async fn restart_b(&mut self) {
+        self.log("node_b_restart_begin");
         stop(self.b.as_mut().unwrap());
         self.b = Some(self.start_node("node-b").await);
+        self.log("node_b_restart_complete");
     }
 
     fn file_count(&self, node: &str, device: usize) -> usize {
@@ -244,6 +266,21 @@ rdma_endpoint = ""
                 .join("data"),
         )
     }
+
+    fn diagnostics(&self) -> String {
+        let read_log = |name: &str| {
+            fs::read_to_string(self.root.path().join(name))
+                .unwrap_or_else(|err| format!("<failed to read {name}: {err}>"))
+        };
+        format!(
+            "e2e scenario={} root={}\n--- redis.log ---\n{}\n--- node-a.log ---\n{}\n--- node-b.log ---\n{}",
+            self.scenario,
+            self.root.path().display(),
+            read_log("redis.log"),
+            read_log("node-a.log"),
+            read_log("node-b.log"),
+        )
+    }
 }
 
 impl Drop for Cluster {
@@ -255,33 +292,55 @@ impl Drop for Cluster {
             stop(child);
         }
         stop(&mut self.redis);
+        if std::thread::panicking() {
+            eprintln!("{}", self.diagnostics());
+        }
     }
 }
 
-#[tokio::test]
-async fn two_node_streaming_placement_restart_and_delete() {
-    let mut cluster = Cluster::start().await;
-    let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-    let mut a = KvClient::connect(format!("http://{}", cluster.endpoint("node-a")))
+fn striped_payload() -> Vec<u8> {
+    (0..STRIPED_OBJECT_BYTES)
+        .map(|index| (index % 251) as u8)
+        .collect()
+}
+
+async fn connect(cluster: &Cluster, node: &str) -> KvClient {
+    cluster.log(&format!("{node}_client_connect"));
+    KvClient::connect(format!("http://{}", cluster.endpoint(node)))
         .await
-        .unwrap();
-    assert!(a
-        .put_stream("e2e", "striped-object", payload.clone(), 128 * 1024)
+        .unwrap_or_else(|err| panic!("connect {node}: {err}"))
+}
+
+async fn write_striped_object(cluster: &Cluster, client: &mut KvClient, payload: &[u8]) {
+    cluster.log("streaming_put_begin");
+    let inserted = client
+        .put_stream(
+            TEST_NAMESPACE,
+            TEST_OBJECT_KEY,
+            payload.to_vec(),
+            STREAM_CHUNK_BYTES,
+        )
         .await
-        .unwrap());
-    let lookup = a
-        .lookup_object("e2e", "striped-object")
+        .expect("streaming put");
+    assert!(inserted, "streaming put must insert a new object");
+    cluster.log("streaming_put_complete");
+}
+
+async fn assert_four_way_placement(cluster: &Cluster, client: &mut KvClient) {
+    cluster.log("placement_lookup_begin");
+    let lookup = client
+        .lookup_object(TEST_NAMESPACE, TEST_OBJECT_KEY)
         .await
-        .unwrap()
-        .unwrap();
-    assert!(lookup.descriptor.is_striped);
-    assert_eq!(lookup.descriptor.stripe_count, 4);
+        .expect("lookup object")
+        .expect("object metadata must exist after put");
+    assert!(lookup.descriptor.is_striped, "object must use striped placement");
+    assert_eq!(lookup.descriptor.stripe_count, 4, "expected four stripes");
     let locations: HashSet<(String, u32)> = lookup
         .placement
-        .unwrap()
+        .expect("placement must be materialized")
         .chunks
         .into_iter()
-        .map(|c| (c.node_id, c.device_id))
+        .map(|chunk| (chunk.node_id, chunk.device_id))
         .collect();
     assert_eq!(
         locations,
@@ -289,30 +348,94 @@ async fn two_node_streaming_placement_restart_and_delete() {
             ("node-a".into(), 0),
             ("node-a".into(), 1),
             ("node-b".into(), 0),
-            ("node-b".into(), 1)
-        ])
+            ("node-b".into(), 1),
+        ]),
+        "stripes must cover both devices on both nodes",
     );
     for node in ["node-a", "node-b"] {
         for device in 0..2 {
-            assert_eq!(cluster.file_count(node, device), 1);
+            assert_eq!(
+                cluster.file_count(node, device),
+                1,
+                "expected one stripe on {node}/nvme{device}",
+            );
         }
     }
-    let mut b = KvClient::connect(format!("http://{}", cluster.endpoint("node-b")))
+    cluster.log("placement_verified");
+}
+
+#[tokio::test]
+async fn two_node_streaming_put_places_stripes_on_all_devices() {
+    let cluster = Cluster::start("four_way_placement").await;
+    let payload = striped_payload();
+    let mut client = connect(&cluster, "node-a").await;
+
+    write_striped_object(&cluster, &mut client, &payload).await;
+    assert_four_way_placement(&cluster, &mut client).await;
+}
+
+#[tokio::test]
+async fn two_node_cross_node_get_returns_original_payload() {
+    let cluster = Cluster::start("cross_node_get").await;
+    let payload = striped_payload();
+    let mut writer = connect(&cluster, "node-a").await;
+    write_striped_object(&cluster, &mut writer, &payload).await;
+
+    let mut reader = connect(&cluster, "node-b").await;
+    cluster.log("cross_node_get_begin");
+    let read = reader
+        .get_stream(TEST_NAMESPACE, TEST_OBJECT_KEY)
         .await
-        .unwrap();
-    assert_eq!(
-        b.get_stream("e2e", "striped-object").await.unwrap(),
-        Some(payload.clone())
-    );
+        .expect("cross-node get");
+    assert_eq!(read, Some(payload));
+    cluster.log("cross_node_get_verified");
+}
+
+#[tokio::test]
+async fn two_node_restart_recovers_shared_metadata_and_stripes() {
+    let mut cluster = Cluster::start("node_restart_recovery").await;
+    let payload = striped_payload();
+    let mut client = connect(&cluster, "node-a").await;
+
+    write_striped_object(&cluster, &mut client, &payload).await;
+    assert_four_way_placement(&cluster, &mut client).await;
     cluster.restart_b().await;
+    cluster.log("post_restart_get_begin");
     assert_eq!(
-        a.get_stream("e2e", "striped-object").await.unwrap(),
-        Some(payload)
+        client
+            .get_stream(TEST_NAMESPACE, TEST_OBJECT_KEY)
+            .await
+            .expect("get after node-b restart"),
+        Some(payload),
+        "shared metadata and remote stripes must survive node restart",
     );
-    assert!(a.delete("e2e", "striped-object").await.unwrap());
+    cluster.log("post_restart_get_verified");
+}
+
+#[tokio::test]
+async fn two_node_distributed_delete_removes_all_stripe_files() {
+    let cluster = Cluster::start("distributed_delete").await;
+    let payload = striped_payload();
+    let mut client = connect(&cluster, "node-a").await;
+
+    write_striped_object(&cluster, &mut client, &payload).await;
+    assert_four_way_placement(&cluster, &mut client).await;
+    cluster.log("distributed_delete_begin");
+    assert!(
+        client
+            .delete(TEST_NAMESPACE, TEST_OBJECT_KEY)
+            .await
+            .expect("distributed delete"),
+        "delete must remove the existing object",
+    );
     for node in ["node-a", "node-b"] {
         for device in 0..2 {
-            assert_eq!(cluster.file_count(node, device), 0);
+            assert_eq!(
+                cluster.file_count(node, device),
+                0,
+                "distributed delete must remove stripe from {node}/nvme{device}",
+            );
         }
     }
+    cluster.log("distributed_delete_verified");
 }
