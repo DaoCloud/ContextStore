@@ -195,6 +195,49 @@ mod tests {
     }
 
     #[test]
+    fn local_stripe_indices_rotate_devices_per_data_node() {
+        let nodes = vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-b", "10.0.0.2:50051"),
+        ];
+        let ctx_a = ctx_with_local_and_nodes("node-a", "10.0.0.1:50051", nodes.clone());
+        let ctx_b = ctx_with_local_and_nodes("node-b", "10.0.0.2:50051", nodes);
+        let key = key();
+        let mut node_a_seen = 0;
+        let mut node_b_seen = 0;
+
+        for stripe_index in 0..8 {
+            let node = select_data_node(&ctx_a, &key, stripe_index);
+            let (ctx, seen) = if node.node_id == "node-a" {
+                (&ctx_a, &mut node_a_seen)
+            } else {
+                (&ctx_b, &mut node_b_seen)
+            };
+            assert_eq!(
+                local_device_stripe_index(ctx, &key, stripe_index),
+                Some(*seen)
+            );
+            *seen += 1;
+        }
+    }
+
+    #[test]
+    fn local_stripe_indices_handle_duplicate_local_data_nodes() {
+        let nodes = vec![
+            data_node("node-a", "10.0.0.1:50051"),
+            data_node("node-a", "10.0.0.1:50051"),
+        ];
+        let ctx = ctx_with_local_and_nodes("node-a", "10.0.0.1:50051", nodes);
+
+        for stripe_index in 0..8 {
+            assert_eq!(
+                local_device_stripe_index(&ctx, &key(), stripe_index),
+                Some(stripe_index)
+            );
+        }
+    }
+
+    #[test]
     fn placement_validation_accepts_current_descriptor() {
         let ctx = ctx_with_nodes(vec![data_node("node-a", "10.0.0.1:50051")]);
         let meta = meta();
@@ -445,6 +488,8 @@ impl KVServiceImpl {
         data: Bytes,
     ) -> Result<ChunkLocation, Status> {
         if is_local_node(&ctx, &node) {
+            let device_stripe_index = local_device_stripe_index(&ctx, &key, stripe_index)
+                .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
             let key_for_write = key.clone();
             let data_len = data.len() as u64;
             let storage = ctx.storage.clone();
@@ -454,6 +499,7 @@ impl KVServiceImpl {
                 storage.put_placement_chunk(
                     &key_for_write,
                     stripe_index,
+                    device_stripe_index,
                     generation,
                     layout_version,
                     data,
@@ -943,6 +989,38 @@ fn select_data_node(ctx: &KVServiceContext, key: &InternalKey, stripe_index: usi
     let nodes = configured_data_nodes(ctx);
     let base = (hash64(key.to_string_key().as_bytes()) as usize) % nodes.len();
     nodes[(base + stripe_index) % nodes.len()].clone()
+}
+
+/// Return a stripe's zero-based ordinal among stripes assigned to this data node.
+///
+/// Data-node placement alternates globally across nodes. Selecting a local device
+/// from the global stripe index would pin each node to one device whenever the
+/// node and device counts share a factor. The local ordinal preserves the same
+/// deterministic routing while rotating disks independently on every node.
+fn local_device_stripe_index(
+    ctx: &KVServiceContext,
+    key: &InternalKey,
+    stripe_index: usize,
+) -> Option<usize> {
+    let nodes = configured_data_nodes(ctx);
+    let local_count = nodes.iter().filter(|node| is_local_node(ctx, node)).count();
+    if local_count == 0 {
+        return None;
+    }
+    let base = (hash64(key.to_string_key().as_bytes()) as usize) % nodes.len();
+    let slot = (base + stripe_index) % nodes.len();
+    if !is_local_node(ctx, &nodes[slot]) {
+        return None;
+    }
+
+    // Count local assignments before this stripe by whole node-list cycles, then
+    // count the remaining partial cycle. This also handles duplicate local entries.
+    let full_cycles = stripe_index / nodes.len();
+    let remainder = stripe_index % nodes.len();
+    let local_in_partial_cycle = (0..=remainder)
+        .filter(|offset| is_local_node(ctx, &nodes[(base + offset) % nodes.len()]))
+        .count();
+    Some(full_cycles * local_count + local_in_partial_cycle - 1)
 }
 
 fn placement_policy_id(ctx: &KVServiceContext) -> String {
@@ -1479,6 +1557,8 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let data_len = req.data.len() as u64;
         let stripe_index_u32 = req.stripe_index;
         let stripe_index = stripe_index_u32 as usize;
+        let device_stripe_index = local_device_stripe_index(&self.ctx, &internal, stripe_index)
+            .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
         let offset = stripe_index as u64 * req.chunk_size;
         let local = local_node(&self.ctx);
         let ctx = self.ctx.clone();
@@ -1486,6 +1566,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             ctx.storage.put_placement_chunk(
                 &internal,
                 stripe_index,
+                device_stripe_index,
                 descriptor.object_generation,
                 descriptor.layout_version,
                 req.data,
