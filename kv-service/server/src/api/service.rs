@@ -1180,12 +1180,15 @@ impl KVServiceImpl {
             return Ok((stripe_index, data));
         }
 
-        let mut client =
-            pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
-                .await
-                .map_err(|e| {
-                    Status::unavailable(format!("connect data node {}: {}", node.node_id, e))
-                })?;
+        let mut client = connect_data_node(&node.grpc_endpoint)
+            .await
+            .map_err(|status| {
+                Status::unavailable(format!(
+                    "connect data node {}: {}",
+                    node.node_id,
+                    status.message()
+                ))
+            })?;
         let mut stream = client
             .read_placement_chunk(pb::ReadPlacementChunkRequest {
                 descriptor: Some(descriptor),
@@ -1252,12 +1255,15 @@ impl KVServiceImpl {
             return Ok(());
         }
 
-        let mut client =
-            pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
-                .await
-                .map_err(|e| {
-                    Status::unavailable(format!("connect data node {}: {}", node.node_id, e))
-                })?;
+        let mut client = connect_data_node(&node.grpc_endpoint)
+            .await
+            .map_err(|status| {
+                Status::unavailable(format!(
+                    "connect data node {}: {}",
+                    node.node_id,
+                    status.message()
+                ))
+            })?;
         client
             .delete_placement_chunk(pb::DeletePlacementChunkRequest { chunk: Some(chunk) })
             .await

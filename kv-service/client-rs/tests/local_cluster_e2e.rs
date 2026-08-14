@@ -15,7 +15,10 @@ use tempfile::TempDir;
 const TEST_NAMESPACE: &str = "e2e";
 const TEST_OBJECT_KEY: &str = "striped-object";
 const STREAM_CHUNK_BYTES: usize = 128 * 1024;
-const STRIPED_OBJECT_BYTES: usize = 4 * 1024 * 1024;
+// Each stripe is 5 MiB, so the remote `ReadPlacementChunk` stream contains a
+// 4 MiB frame plus protobuf framing. This guards the data-node client's custom
+// message-size configuration instead of only exercising tonic's 4 MiB default.
+const STRIPED_OBJECT_BYTES: usize = 20 * 1024 * 1024;
 
 fn ports() -> [u16; 3] {
     let listeners: Vec<TcpListener> = (0..3)
@@ -154,7 +157,7 @@ max_connections = 100
 devices = ["{}", "{}"]
 data_subdir = "data"
 striping_threshold = 1048576
-striping_chunk_size = 1048576
+striping_chunk_size = 5242880
 [memory_tier]
 capacity_mb = 0
 slab_size_mb = 1
