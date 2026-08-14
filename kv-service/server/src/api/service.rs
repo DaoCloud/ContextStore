@@ -2,13 +2,15 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures::{future::join_all, Stream};
 use prost::bytes::{Bytes, BytesMut};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use super::generated::contextstore::kv::v1 as pb;
@@ -23,6 +25,46 @@ struct DataNode {
     node_id: String,
     grpc_endpoint: String,
     rdma_endpoint: String,
+}
+
+const DATA_NODE_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024 * 1024;
+const DATA_NODE_STREAM_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+const DATA_NODE_CONNECTION_WINDOW_SIZE: u32 = 128 * 1024 * 1024;
+
+/// Connect to a data node with the same large-payload HTTP/2 settings as the public API.
+async fn connect_data_node(
+    endpoint: &str,
+) -> Result<pb::kv_service_client::KvServiceClient<Channel>, Status> {
+    let channel = Channel::from_shared(grpc_uri(endpoint))
+        .map_err(|err| Status::unavailable(format!("invalid data node endpoint: {err}")))?
+        .initial_stream_window_size(Some(DATA_NODE_STREAM_WINDOW_SIZE))
+        .initial_connection_window_size(Some(DATA_NODE_CONNECTION_WINDOW_SIZE))
+        .connect()
+        .await
+        .map_err(|err| Status::unavailable(format!("connect data node: {err}")))?;
+    Ok(pb::kv_service_client::KvServiceClient::new(channel)
+        .max_decoding_message_size(DATA_NODE_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(DATA_NODE_MAX_MESSAGE_SIZE))
+}
+
+struct ChunkWriteResult {
+    location: ChunkLocation,
+    is_local: bool,
+    connect_elapsed: Duration,
+    transfer_elapsed: Duration,
+    total_elapsed: Duration,
+}
+
+/// Timing/counters for the streaming distributed PUT pipeline.
+#[derive(Default)]
+struct StreamPutStats {
+    local_stripes: usize,
+    remote_stripes: usize,
+    slowest_stripe: Duration,
+    receive_elapsed: Duration,
+    backpressure_wait: Duration,
+    drain_wait: Duration,
+    metadata_elapsed: Duration,
 }
 
 pub struct KVServiceImpl {
@@ -486,12 +528,13 @@ impl KVServiceImpl {
         chunk_size: u64,
         total_size: u64,
         data: Bytes,
-    ) -> Result<ChunkLocation, Status> {
+    ) -> Result<ChunkWriteResult, Status> {
+        let chunk_start = Instant::now();
+        let data_len = data.len() as u64;
         if is_local_node(&ctx, &node) {
             let device_stripe_index = local_device_stripe_index(&ctx, &key, stripe_index)
                 .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
             let key_for_write = key.clone();
-            let data_len = data.len() as u64;
             let storage = ctx.storage.clone();
             let generation = descriptor.object_generation;
             let layout_version = descriptor.layout_version;
@@ -508,25 +551,46 @@ impl KVServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(Status::from)?;
-            return Ok(ChunkLocation {
-                stripe_index: stripe_index as u32,
-                node_id: node.node_id,
-                grpc_endpoint: node.grpc_endpoint,
-                rdma_endpoint: node.rdma_endpoint,
-                device_id,
-                storage_handle,
-                offset,
-                length: data_len,
-                checksum,
+            let total_elapsed = chunk_start.elapsed();
+            tracing::debug!(
+                event = "grpc_placement_chunk_write",
+                status = "ok",
+                target = "local",
+                stripe_index,
+                bytes = data_len,
+                storage_us = total_elapsed.as_micros(),
+            );
+            return Ok(ChunkWriteResult {
+                location: ChunkLocation {
+                    stripe_index: stripe_index as u32,
+                    node_id: node.node_id,
+                    grpc_endpoint: node.grpc_endpoint,
+                    rdma_endpoint: node.rdma_endpoint,
+                    device_id,
+                    storage_handle,
+                    offset,
+                    length: data_len,
+                    checksum,
+                },
+                is_local: true,
+                connect_elapsed: Duration::ZERO,
+                transfer_elapsed: Duration::ZERO,
+                total_elapsed,
             });
         }
 
-        let mut client =
-            pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
-                .await
-                .map_err(|e| {
-                    Status::unavailable(format!("connect data node {}: {}", node.node_id, e))
-                })?;
+        let connect_start = Instant::now();
+        let mut client = connect_data_node(&node.grpc_endpoint)
+            .await
+            .map_err(|status| {
+                Status::unavailable(format!(
+                    "connect data node {}: {}",
+                    node.node_id,
+                    status.message()
+                ))
+            })?;
+        let connect_elapsed = connect_start.elapsed();
+        let transfer_start = Instant::now();
         let resp = client
             .put_placement_chunk(pb::PutPlacementChunkRequest {
                 key: Some(internal_key_to_pb(&key)),
@@ -539,6 +603,7 @@ impl KVServiceImpl {
             .await
             .map_err(|e| Status::unavailable(format!("put chunk to {}: {}", node.node_id, e)))?
             .into_inner();
+        let transfer_elapsed = transfer_start.elapsed();
         if !resp.success {
             return Err(Status::internal(format!(
                 "data node {} rejected placement chunk",
@@ -548,7 +613,24 @@ impl KVServiceImpl {
         let chunk = resp
             .chunk
             .ok_or_else(|| Status::internal("missing placement chunk in response"))?;
-        Ok(pb_chunk_to_location(&chunk))
+        let total_elapsed = chunk_start.elapsed();
+        tracing::debug!(
+            event = "grpc_placement_chunk_write",
+            status = "ok",
+            target = "remote",
+            stripe_index,
+            bytes = data_len,
+            connect_us = connect_elapsed.as_micros(),
+            transfer_us = transfer_elapsed.as_micros(),
+            total_us = total_elapsed.as_micros(),
+        );
+        Ok(ChunkWriteResult {
+            location: pb_chunk_to_location(&chunk),
+            is_local: false,
+            connect_elapsed,
+            transfer_elapsed,
+            total_elapsed,
+        })
     }
 
     async fn put_distributed_bytes_impl(
@@ -558,14 +640,17 @@ impl KVServiceImpl {
         meta: BlockMeta,
         if_absent: bool,
     ) -> Result<bool, Status> {
+        let operation_start = Instant::now();
         let total = data.len();
         let chunk_size = self.ctx.storage.striping_chunk_size().max(1) as usize;
         let stripe_count = total.div_ceil(chunk_size);
+        let prepare_start = Instant::now();
         let prepared_meta = self
             .ctx
             .storage
             .prepare_write_meta(&key, meta, total as u64)
             .map_err(Status::from)?;
+        let prepare_elapsed = prepare_start.elapsed();
         let descriptor =
             self.make_distributed_descriptor(&key, &prepared_meta, stripe_count, chunk_size as u64);
 
@@ -587,10 +672,26 @@ impl KVServiceImpl {
                 chunk,
             ));
         }
+        let stripe_write_start = Instant::now();
         let mut locations = Vec::with_capacity(stripe_count);
+        let mut local_stripes = 0usize;
+        let mut remote_stripes = 0usize;
+        let mut slowest_stripe = Duration::ZERO;
+        let mut remote_connect_total = Duration::ZERO;
+        let mut remote_transfer_total = Duration::ZERO;
         for result in join_all(tasks).await {
-            locations.push(result?);
+            let result = result?;
+            if result.is_local {
+                local_stripes += 1;
+            } else {
+                remote_stripes += 1;
+                remote_connect_total += result.connect_elapsed;
+                remote_transfer_total += result.transfer_elapsed;
+            }
+            slowest_stripe = slowest_stripe.max(result.total_elapsed);
+            locations.push(result.location);
         }
+        let stripe_write_elapsed = stripe_write_start.elapsed();
         locations.sort_by_key(|loc| loc.stripe_index);
 
         let rollback_chunks = locations
@@ -632,6 +733,7 @@ impl KVServiceImpl {
         let metadata = self.ctx.metadata.clone();
         let str_key = key.to_string_key();
         let committed_meta = committed.clone();
+        let metadata_start = Instant::now();
         let committed_result = tokio::task::spawn_blocking(move || {
             if if_absent {
                 metadata.put_block_if_absent(&str_key, &committed_meta)
@@ -655,12 +757,28 @@ impl KVServiceImpl {
                 return Err(Status::internal(e.to_string()));
             }
         };
+        let metadata_elapsed = metadata_start.elapsed();
         if !committed {
             for chunk in rollback_chunks {
                 let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
             }
             return Ok(false);
         }
+        tracing::debug!(
+            event = "grpc_distributed_put",
+            status = "ok",
+            bytes = total,
+            stripe_count,
+            local_stripes,
+            remote_stripes,
+            prepare_us = prepare_elapsed.as_micros(),
+            stripe_write_us = stripe_write_elapsed.as_micros(),
+            slowest_stripe_us = slowest_stripe.as_micros(),
+            remote_connect_total_us = remote_connect_total.as_micros(),
+            remote_transfer_total_us = remote_transfer_total.as_micros(),
+            metadata_us = metadata_elapsed.as_micros(),
+            total_us = operation_start.elapsed().as_micros(),
+        );
         Ok(true)
     }
 
@@ -702,6 +820,328 @@ impl KVServiceImpl {
         self.put_distributed_bytes_impl(key, data, meta, true).await
     }
 
+    /// Streaming stripe write task: local stripes go through the vectored (writev) path with the
+    /// segments as-is — no per-stripe concat; remote stripes flatten only their own 64MB before
+    /// the wire call (unavoidable: protobuf field is a single `bytes`).
+    async fn put_stripe_segments_on_node(
+        ctx: Arc<KVServiceContext>,
+        node: DataNode,
+        key: InternalKey,
+        descriptor: pb::ObjectDescriptor,
+        stripe_index: usize,
+        offset: u64,
+        chunk_size: u64,
+        total_size: u64,
+        segments: Vec<Bytes>,
+    ) -> Result<ChunkWriteResult, Status> {
+        if is_local_node(&ctx, &node) {
+            let chunk_start = Instant::now();
+            let data_len: u64 = segments.iter().map(|s| s.len() as u64).sum();
+            let device_stripe_index = local_device_stripe_index(&ctx, &key, stripe_index)
+                .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
+            let key_for_write = key.clone();
+            let storage = ctx.storage.clone();
+            let generation = descriptor.object_generation;
+            let layout_version = descriptor.layout_version;
+            let (device_id, storage_handle, checksum) = tokio::task::spawn_blocking(move || {
+                storage.put_placement_chunk_segments(
+                    &key_for_write,
+                    stripe_index,
+                    device_stripe_index,
+                    generation,
+                    layout_version,
+                    segments,
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::from)?;
+            let total_elapsed = chunk_start.elapsed();
+            tracing::debug!(
+                event = "grpc_placement_chunk_write",
+                status = "ok",
+                target = "local_streamed",
+                stripe_index,
+                bytes = data_len,
+                storage_us = total_elapsed.as_micros(),
+            );
+            return Ok(ChunkWriteResult {
+                location: ChunkLocation {
+                    stripe_index: stripe_index as u32,
+                    node_id: node.node_id,
+                    grpc_endpoint: node.grpc_endpoint,
+                    rdma_endpoint: node.rdma_endpoint,
+                    device_id,
+                    storage_handle,
+                    offset,
+                    length: data_len,
+                    checksum,
+                },
+                is_local: true,
+                connect_elapsed: Duration::ZERO,
+                transfer_elapsed: Duration::ZERO,
+                total_elapsed,
+            });
+        }
+        // Remote node: the wire format needs one contiguous Bytes — flatten just this stripe.
+        let data = Self::flatten_segments(segments);
+        Self::put_chunk_on_node(
+            ctx,
+            node,
+            key,
+            descriptor,
+            stripe_index,
+            offset,
+            chunk_size,
+            total_size,
+            data,
+        )
+        .await
+    }
+
+    /// Distributed streaming PUT pipeline: receive gRPC chunks, aggregate on stripe boundaries,
+    /// and dispatch each stripe's disk write as soon as it fills — receive / stripe aggregation /
+    /// dual-NVMe I/O all overlap. Memory bound is `MAX_INFLIGHT_STRIPES` stripes, not the full
+    /// object. Metadata is committed once after every stripe succeeds; on failure all written
+    /// stripes are rolled back (same semantics as `put_distributed_bytes_impl`).
+    #[allow(clippy::too_many_arguments)]
+    async fn put_distributed_stream_impl(
+        &self,
+        stream: &mut tonic::Streaming<pb::PutChunk>,
+        key: InternalKey,
+        meta: BlockMeta,
+        declared_total: usize,
+        first_data: Bytes,
+        first_is_last: bool,
+        if_absent: bool,
+    ) -> Result<(bool, StreamPutStats), Status> {
+        const MAX_INFLIGHT_STRIPES: usize = 4;
+
+        let operation_start = Instant::now();
+        let chunk_size = self.ctx.storage.striping_chunk_size().max(1) as usize;
+        let stripe_count = declared_total.div_ceil(chunk_size);
+
+        let prepare_start = Instant::now();
+        let prepared_meta = self
+            .ctx
+            .storage
+            .prepare_write_meta(&key, meta, declared_total as u64)
+            .map_err(Status::from)?;
+        let prepare_elapsed = prepare_start.elapsed();
+        let descriptor = self.make_distributed_descriptor(
+            &key,
+            &prepared_meta,
+            stripe_count,
+            chunk_size as u64,
+        );
+
+        let mut inflight: JoinSet<Result<ChunkWriteResult, Status>> = JoinSet::new();
+        let mut locations: Vec<ChunkLocation> = Vec::with_capacity(stripe_count);
+        let mut stats = StreamPutStats::default();
+        let mut first_err: Option<Status> = None;
+
+        let mut cur_segments: Vec<Bytes> = Vec::new();
+        let mut cur_filled: usize = 0;
+        let mut next_stripe: usize = 0;
+        let mut received_total: usize = 0;
+
+        // Drain one completed stripe write, folding its outcome into locations / first_err.
+        fn absorb(
+            joined: Result<Result<ChunkWriteResult, Status>, tokio::task::JoinError>,
+            locations: &mut Vec<ChunkLocation>,
+            stats: &mut StreamPutStats,
+            first_err: &mut Option<Status>,
+        ) {
+            match joined {
+                Ok(Ok(result)) => {
+                    if result.is_local {
+                        stats.local_stripes += 1;
+                    } else {
+                        stats.remote_stripes += 1;
+                    }
+                    stats.slowest_stripe = stats.slowest_stripe.max(result.total_elapsed);
+                    locations.push(result.location);
+                }
+                Ok(Err(status)) => {
+                    if first_err.is_none() {
+                        *first_err = Some(status);
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        *first_err = Some(Status::internal(join_err.to_string()));
+                    }
+                }
+            }
+        }
+
+        macro_rules! dispatch_stripe {
+            ($segments:expr, $len:expr) => {{
+                let stripe_index = next_stripe;
+                #[allow(unused_assignments)]
+                {
+                    next_stripe += 1;
+                }
+                let node = select_data_node(&self.ctx, &key, stripe_index);
+                let offset = (stripe_index * chunk_size) as u64;
+                // Backpressure: keep at most MAX_INFLIGHT_STRIPES buffered + writing.
+                let wait_start = Instant::now();
+                while inflight.len() >= MAX_INFLIGHT_STRIPES {
+                    if let Some(joined) = inflight.join_next().await {
+                        absorb(joined, &mut locations, &mut stats, &mut first_err);
+                    } else {
+                        break;
+                    }
+                }
+                stats.backpressure_wait += wait_start.elapsed();
+                if first_err.is_none() {
+                    inflight.spawn(Self::put_stripe_segments_on_node(
+                        self.ctx.clone(),
+                        node,
+                        key.clone(),
+                        descriptor.clone(),
+                        stripe_index,
+                        offset,
+                        chunk_size as u64,
+                        declared_total as u64,
+                        $segments,
+                    ));
+                }
+                let _ = $len;
+            }};
+        }
+
+        // Feed one gRPC chunk into the stripe aggregator, dispatching every stripe it completes.
+        macro_rules! feed {
+            ($data:expr) => {{
+                let mut data: Bytes = $data;
+                received_total += data.len();
+                while !data.is_empty() {
+                    let need = chunk_size - cur_filled;
+                    if data.len() < need {
+                        cur_filled += data.len();
+                        cur_segments.push(data);
+                        break;
+                    }
+                    let head = data.split_to(need);
+                    cur_segments.push(head);
+                    let segments = std::mem::take(&mut cur_segments);
+                    cur_filled = 0;
+                    dispatch_stripe!(segments, chunk_size);
+                }
+            }};
+        }
+
+        let receive_start = Instant::now();
+        feed!(first_data);
+        let mut saw_last = first_is_last;
+        while !saw_last && first_err.is_none() {
+            match stream.next().await {
+                Some(chunk) => {
+                    let chunk = chunk?;
+                    saw_last = chunk.is_last;
+                    feed!(chunk.data);
+                }
+                None => break,
+            }
+        }
+        // Flush the trailing partial stripe.
+        if first_err.is_none() && !cur_segments.is_empty() {
+            let segments = std::mem::take(&mut cur_segments);
+            let len = cur_filled;
+            dispatch_stripe!(segments, len);
+        }
+        stats.receive_elapsed = receive_start.elapsed();
+
+        // Drain remaining in-flight stripe writes.
+        let drain_start = Instant::now();
+        while let Some(joined) = inflight.join_next().await {
+            absorb(joined, &mut locations, &mut stats, &mut first_err);
+        }
+        stats.drain_wait = drain_start.elapsed();
+
+        if first_err.is_none() && received_total != declared_total {
+            first_err = Some(Status::invalid_argument(format!(
+                "stream length mismatch: declared {declared_total} received {received_total}"
+            )));
+        }
+
+        if let Some(status) = first_err {
+            // Roll back every stripe that made it to disk.
+            for loc in &locations {
+                let chunk = chunk_location_to_pb(&key, loc);
+                let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+            }
+            return Err(status);
+        }
+
+        locations.sort_by_key(|loc| loc.stripe_index);
+        let rollback_chunks = locations
+            .iter()
+            .map(|loc| chunk_location_to_pb(&key, loc))
+            .collect::<Vec<_>>();
+        let chunk_devices = locations.iter().map(|loc| loc.device_id).collect();
+        let chunk_paths = locations
+            .iter()
+            .map(|loc| loc.storage_handle.clone())
+            .collect();
+        let chunk_checksums = locations
+            .iter()
+            .map(|loc| loc.checksum.clone())
+            .collect();
+        let mut committed_meta = prepared_meta;
+        committed_meta.size = declared_total as u64;
+        committed_meta.file_path = String::new();
+        committed_meta.device_id = locations.first().map(|loc| loc.device_id).unwrap_or(0);
+        committed_meta.striping = Some(StripingInfo {
+            chunk_size: chunk_size as u64,
+            chunk_devices,
+            chunk_paths,
+            total_size: declared_total as u64,
+            chunk_locations: locations,
+            chunk_checksums,
+        });
+        self.ctx.memory.invalidate(&key);
+        let metadata = self.ctx.metadata.clone();
+        let str_key = key.to_string_key();
+        let meta_for_commit = committed_meta.clone();
+        let metadata_start = Instant::now();
+        let committed = tokio::task::spawn_blocking(move || {
+            if if_absent {
+                metadata.put_block_if_absent(&str_key, &meta_for_commit)
+            } else {
+                metadata.put_block(&str_key, &meta_for_commit).map(|_| true)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::from)?;
+        stats.metadata_elapsed = metadata_start.elapsed();
+        if !committed {
+            for chunk in rollback_chunks {
+                let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+            }
+            return Ok((false, stats));
+        }
+        tracing::debug!(
+            event = "grpc_distributed_put",
+            status = "ok",
+            mode = "streamed",
+            bytes = declared_total,
+            stripe_count,
+            local_stripes = stats.local_stripes,
+            remote_stripes = stats.remote_stripes,
+            prepare_us = prepare_elapsed.as_micros(),
+            receive_us = stats.receive_elapsed.as_micros(),
+            backpressure_wait_us = stats.backpressure_wait.as_micros(),
+            drain_wait_us = stats.drain_wait.as_micros(),
+            slowest_stripe_us = stats.slowest_stripe.as_micros(),
+            metadata_us = stats.metadata_elapsed.as_micros(),
+            total_us = operation_start.elapsed().as_micros(),
+        );
+        Ok((true, stats))
+    }
+
     fn placement_has_remote_chunks(&self, placement: &pb::PlacementDescriptor) -> bool {
         placement.chunks.iter().any(|chunk| {
             let node = DataNode {
@@ -740,12 +1180,15 @@ impl KVServiceImpl {
             return Ok((stripe_index, data));
         }
 
-        let mut client =
-            pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
-                .await
-                .map_err(|e| {
-                    Status::unavailable(format!("connect data node {}: {}", node.node_id, e))
-                })?;
+        let mut client = connect_data_node(&node.grpc_endpoint)
+            .await
+            .map_err(|status| {
+                Status::unavailable(format!(
+                    "connect data node {}: {}",
+                    node.node_id,
+                    status.message()
+                ))
+            })?;
         let mut stream = client
             .read_placement_chunk(pb::ReadPlacementChunkRequest {
                 descriptor: Some(descriptor),
@@ -812,12 +1255,15 @@ impl KVServiceImpl {
             return Ok(());
         }
 
-        let mut client =
-            pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
-                .await
-                .map_err(|e| {
-                    Status::unavailable(format!("connect data node {}: {}", node.node_id, e))
-                })?;
+        let mut client = connect_data_node(&node.grpc_endpoint)
+            .await
+            .map_err(|status| {
+                Status::unavailable(format!(
+                    "connect data node {}: {}",
+                    node.node_id,
+                    status.message()
+                ))
+            })?;
         client
             .delete_placement_chunk(pb::DeletePlacementChunkRequest { chunk: Some(chunk) })
             .await
@@ -996,7 +1442,8 @@ fn select_data_node(ctx: &KVServiceContext, key: &InternalKey, stripe_index: usi
 /// Data-node placement alternates globally across nodes. Selecting a local device
 /// from the global stripe index would pin each node to one device whenever the
 /// node and device counts share a factor. The local ordinal preserves the same
-/// deterministic routing while rotating disks independently on every node.
+/// deterministic routing while rotating disks independently on every node, and
+/// duplicate local data-node entries retain the same rotation as a single entry.
 fn local_device_stripe_index(
     ctx: &KVServiceContext,
     key: &InternalKey,
@@ -1805,7 +2252,116 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 }
             }
             let ctx = self.ctx.clone();
-            // Grab Vec<Bytes> directly (typically 8 × 64MB segments), zero-copy throughout — no more 480MB concatenation.
+            // L1 hit: serve straight from the chunks cache (Arc clones, zero-copy).
+            if let Some((segments, _meta)) = ctx.memory.peek_chunks(&internal) {
+                let total: i64 = segments.iter().map(|s| s.len() as i64).sum();
+                const SUB_CHUNK: usize = 4 * 1024 * 1024;
+                let mut chunks: Vec<pb::DataChunk> = Vec::new();
+                let mut running_offset: i64 = 0;
+                for seg in segments {
+                    let seg_len = seg.len();
+                    let n_sub = seg_len.div_ceil(SUB_CHUNK);
+                    for i in 0..n_sub {
+                        let start = i * SUB_CHUNK;
+                        let end = (start + SUB_CHUNK).min(seg_len);
+                        chunks.push(pb::DataChunk {
+                            data: seg.slice(start..end),
+                            offset: running_offset + start as i64,
+                            total_size: total,
+                            is_last: false,
+                        });
+                    }
+                    running_offset += seg_len as i64;
+                }
+                if let Some(last) = chunks.last_mut() {
+                    last.is_last = true;
+                }
+                let stream = tokio_stream::iter(chunks.into_iter().map(Ok));
+                return Ok(Response::new(Box::pin(stream) as Self::GetStreamStream));
+            }
+
+            // Local striped object, L1 miss: streaming stripe pipeline. Read stripes with
+            // bounded read-ahead and stream sub-chunks as each stripe lands, so disk reads of
+            // stripe N+1..N+RA overlap with encoding/sending of stripe N. The old path waited
+            // for ALL stripes (read_striped_chunks barrier) before sending the first byte.
+            if let Some(meta) = meta.filter(|m| m.striping.is_some()) {
+                let stripe_info = meta.striping.clone().unwrap();
+                let stripe_count = stripe_info.chunk_paths.len();
+                let total: i64 = stripe_info.total_size as i64;
+                const SUB_CHUNK: usize = 4 * 1024 * 1024;
+                const READ_AHEAD: usize = 4;
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::DataChunk, Status>>(64);
+                let read_start = Instant::now();
+                tokio::spawn(async move {
+                    let stripe_info = Arc::new(stripe_info);
+                    let chunk_size = stripe_info.chunk_size as usize;
+                    let mut pending: std::collections::VecDeque<
+                        tokio::task::JoinHandle<Result<Bytes, Status>>,
+                    > = std::collections::VecDeque::new();
+                    let mut next_read = 0usize;
+                    let mut next_send = 0usize;
+                    let mut sent_bytes: u64 = 0;
+                    'outer: while next_send < stripe_count {
+                        while next_read < stripe_count && pending.len() < READ_AHEAD {
+                            let storage = ctx.storage.clone();
+                            let info = stripe_info.clone();
+                            let idx = next_read;
+                            pending.push_back(tokio::task::spawn_blocking(move || {
+                                storage
+                                    .read_striped_chunk_at(&info, idx)
+                                    .map_err(Status::from)
+                            }));
+                            next_read += 1;
+                        }
+                        let handle = match pending.pop_front() {
+                            Some(h) => h,
+                            None => break,
+                        };
+                        let seg = match handle.await {
+                            Ok(Ok(seg)) => seg,
+                            Ok(Err(status)) => {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                return;
+                            }
+                        };
+                        let base = (next_send * chunk_size) as i64;
+                        let seg_len = seg.len();
+                        let n_sub = seg_len.div_ceil(SUB_CHUNK);
+                        for i in 0..n_sub {
+                            let start = i * SUB_CHUNK;
+                            let end = (start + SUB_CHUNK).min(seg_len);
+                            sent_bytes += (end - start) as u64;
+                            let is_last =
+                                next_send + 1 == stripe_count && i + 1 == n_sub;
+                            let chunk = pb::DataChunk {
+                                data: seg.slice(start..end),
+                                offset: base + start as i64,
+                                total_size: total,
+                                is_last,
+                            };
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                break 'outer; // client went away
+                            }
+                        }
+                        next_send += 1;
+                    }
+                    tracing::debug!(
+                        event = "grpc_get_stream_pipeline",
+                        status = "ok",
+                        bytes = sent_bytes,
+                        stripe_count,
+                        total_us = read_start.elapsed().as_micros(),
+                    );
+                });
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                return Ok(Response::new(Box::pin(stream) as Self::GetStreamStream));
+            }
+
+            // Non-striped (small) object: old buffered path.
             let opt = tokio::task::spawn_blocking(move || ctx.memory.get_chunks(&internal))
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
@@ -1981,63 +2537,190 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let request_start = Instant::now();
         let t0 = std::time::Instant::now();
         let mut stream = req.into_inner();
-        let mut key: Option<pb::ObjectKey> = None;
-        let mut meta_opt: Option<pb::KvMetadata> = None;
-        let mut options_opt: Option<pb::PutOptions> = None;
-        let mut segments: Vec<Bytes> = Vec::new();
-        let mut declared_total: i64 = 0;
-        let mut got_first = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if !got_first {
-                key = chunk.key;
-                meta_opt = chunk.metadata;
-                options_opt = chunk.options;
-                declared_total = chunk.total_size;
-                if declared_total > 0 {
-                    segments.reserve(((declared_total as usize) / (2 * 1024 * 1024)).max(8));
-                }
-                got_first = true;
+        // Pull the first chunk eagerly: it carries key/meta/options/total_size, and total_size
+        // decides whether we can enter the streaming stripe pipeline without buffering the
+        // whole object.
+        let first = match stream.next().await {
+            Some(chunk) => chunk?,
+            None => {
+                let result = Err(Status::invalid_argument("empty stream"));
+                self.record_request("put_stream", request_start, &result, "ok");
+                return result;
             }
-            // chunk.data is Bytes (a refcounted view decoded by gRPC, zero-copy)
-            segments.push(chunk.data);
-            if chunk.is_last {
-                break;
+        };
+        let first_chunk_elapsed = t0.elapsed();
+        let key = first
+            .key
+            .ok_or_else(|| Status::invalid_argument("first chunk must include key"))?;
+        let internal = pb_key_to_internal(&key);
+        let m = meta_from_pb(first.metadata.as_ref(), first.options.as_ref());
+        let if_not_exists = put_options_if_not_exists(first.options.as_ref());
+        let declared_total = first.total_size;
+
+        // Streaming stripe pipeline: declared size is known and large enough for distributed
+        // placement — receive, stripe aggregation, and disk I/O overlap; memory is bounded by
+        // in-flight stripes instead of the full object. flatten_segments is never called for
+        // local stripes.
+        if declared_total > 0 && self.should_use_distributed_placement(declared_total as usize) {
+            let write_lock = self.key_write_lock(&internal);
+            let _guard = write_lock.lock().await;
+            if if_not_exists {
+                // TTL-aware existence gate, same semantics as put_distributed_bytes_if_absent:
+                // a live object refuses the write; an expired one is purged then overwritten.
+                let metadata = self.ctx.metadata.clone();
+                let str_key = internal.to_string_key();
+                let existing =
+                    tokio::task::spawn_blocking(move || metadata.get_block(&str_key))
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(Status::from)?;
+                if let Some(existing) = existing {
+                    if !existing.is_expired() {
+                        let result = Ok(Response::new(pb::PutResponse {
+                            success: false,
+                            message: "already exists".to_string(),
+                        }));
+                        self.record_request("put_stream", request_start, &result, "ok");
+                        return result;
+                    }
+                    self.purge_expired_object_locked(&internal, &existing).await?;
+                }
+            }
+            let first_is_last = first.is_last;
+            let outcome = self
+                .put_distributed_stream_impl(
+                    &mut stream,
+                    internal,
+                    m,
+                    declared_total as usize,
+                    first.data,
+                    first_is_last,
+                    if_not_exists,
+                )
+                .await;
+            let t_total = t0.elapsed();
+            let (inserted, stats) = match outcome {
+                Ok(v) => v,
+                Err(status) => {
+                    tracing::debug!(
+                        event = "grpc_put_stream",
+                        status = "error",
+                        mode = "distributed_streamed",
+                        declared_bytes = declared_total,
+                        total_us = t_total.as_micros(),
+                        error = %status,
+                    );
+                    let result = Err(status);
+                    self.record_request("put_stream", request_start, &result, "ok");
+                    return result;
+                }
+            };
+            tracing::debug!(
+                event = "grpc_put_stream",
+                status = "ok",
+                mode = "distributed_streamed",
+                bytes = declared_total,
+                first_chunk_us = first_chunk_elapsed.as_micros(),
+                receive_us = stats.receive_elapsed.as_micros(),
+                backpressure_wait_us = stats.backpressure_wait.as_micros(),
+                drain_wait_us = stats.drain_wait.as_micros(),
+                slowest_stripe_us = stats.slowest_stripe.as_micros(),
+                metadata_us = stats.metadata_elapsed.as_micros(),
+                total_us = t_total.as_micros(),
+                throughput_gib_s =
+                    declared_total as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
+            );
+            let result = Ok(Response::new(pb::PutResponse {
+                success: inserted,
+                message: if inserted {
+                    String::new()
+                } else {
+                    "already exists".to_string()
+                },
+            }));
+            self.record_request("put_stream", request_start, &result, "ok");
+            return result;
+        }
+
+        // Buffered path: unknown declared size or small object — accumulate segments as before.
+        let mut segments: Vec<Bytes> = Vec::new();
+        if declared_total > 0 {
+            segments.reserve(((declared_total as usize) / (2 * 1024 * 1024)).max(8));
+        }
+        let mut saw_last = first.is_last;
+        segments.push(first.data);
+        while !saw_last {
+            match stream.next().await {
+                Some(chunk) => {
+                    let chunk = chunk?;
+                    saw_last = chunk.is_last;
+                    segments.push(chunk.data);
+                }
+                None => break,
             }
         }
         let t_recv_done = t0.elapsed();
 
-        if segments.is_empty() {
-            let result = Err(Status::invalid_argument("empty stream"));
-            self.record_request("put_stream", request_start, &result, "ok");
-            return result;
-        }
-        let key = key.ok_or_else(|| Status::invalid_argument("first chunk must include key"))?;
-        let internal = pb_key_to_internal(&key);
-        let m = meta_from_pb(meta_opt.as_ref(), options_opt.as_ref());
-        let if_not_exists = put_options_if_not_exists(options_opt.as_ref());
         let ctx = self.ctx.clone();
         let total_bytes: usize = segments.iter().map(|s| s.len()).sum();
         let n_segs = segments.len();
+        tracing::debug!(
+            event = "grpc_put_stream_receive",
+            status = "ok",
+            bytes = total_bytes,
+            chunk_count = n_segs,
+            declared_bytes = declared_total,
+            first_chunk_us = first_chunk_elapsed.as_micros(),
+            receive_us = t_recv_done.as_micros(),
+        );
+        // A client that never declared total_size can still cross the placement threshold once
+        // fully received — keep the old flatten + distributed path for that case.
         if self.should_use_distributed_placement(total_bytes) {
+            let flatten_start = Instant::now();
             let data = Self::flatten_segments(segments);
+            let flatten_elapsed = flatten_start.elapsed();
+            let placement_start = Instant::now();
             let inserted = if if_not_exists {
                 self.put_distributed_bytes_if_absent(internal, data, m)
-                    .await?
+                    .await
             } else {
-                self.put_distributed_bytes(internal, data, m).await?;
-                true
+                self.put_distributed_bytes(internal, data, m)
+                    .await
+                    .map(|_| true)
+            };
+            let placement_elapsed = placement_start.elapsed();
+            let inserted = match inserted {
+                Ok(inserted) => inserted,
+                Err(status) => {
+                    tracing::debug!(
+                        event = "grpc_put_stream",
+                        status = "error",
+                        mode = "distributed",
+                        bytes = total_bytes,
+                        chunk_count = n_segs,
+                        receive_us = t_recv_done.as_micros(),
+                        flatten_us = flatten_elapsed.as_micros(),
+                        placement_us = placement_elapsed.as_micros(),
+                        error = %status,
+                    );
+                    let result = Err(status);
+                    self.record_request("put_stream", request_start, &result, "ok");
+                    return result;
+                }
             };
             let t_total = t0.elapsed();
-            tracing::trace!(
-                "PUT_PERF bytes={} n_segs={} recv_ms={} put_ms={} total_ms={} BW={:.2}GB/s mode=distributed",
-                total_bytes,
-                n_segs,
-                t_recv_done.as_millis(),
-                (t_total - t_recv_done).as_millis(),
-                t_total.as_millis(),
-                total_bytes as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
+            tracing::debug!(
+                event = "grpc_put_stream",
+                status = "ok",
+                mode = "distributed",
+                bytes = total_bytes,
+                chunk_count = n_segs,
+                receive_us = t_recv_done.as_micros(),
+                flatten_us = flatten_elapsed.as_micros(),
+                placement_us = placement_elapsed.as_micros(),
+                total_us = t_total.as_micros(),
+                throughput_gib_s = total_bytes as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
             );
             let result = Ok(Response::new(pb::PutResponse {
                 success: inserted,
@@ -2051,6 +2734,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             return result;
         }
         // Pass-through put_chunks: no concatenation; the storage layer rebuckets on stripe boundaries and flushes via writev
+        let storage_start = Instant::now();
         let inserted = tokio::task::spawn_blocking(move || {
             if if_not_exists {
                 ctx.memory.put_chunks_if_absent(&internal, segments, m)
@@ -2061,16 +2745,37 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(Status::from)?;
+        .map_err(Status::from);
+        let storage_elapsed = storage_start.elapsed();
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(status) => {
+                tracing::debug!(
+                    event = "grpc_put_stream",
+                    status = "error",
+                    mode = "local",
+                    bytes = total_bytes,
+                    chunk_count = n_segs,
+                    receive_us = t_recv_done.as_micros(),
+                    storage_us = storage_elapsed.as_micros(),
+                    error = %status,
+                );
+                let result = Err(status);
+                self.record_request("put_stream", request_start, &result, "ok");
+                return result;
+            }
+        };
         let t_total = t0.elapsed();
-        tracing::trace!(
-            "PUT_PERF bytes={} n_segs={} recv_ms={} put_ms={} total_ms={} BW={:.2}GB/s",
-            total_bytes,
-            n_segs,
-            t_recv_done.as_millis(),
-            (t_total - t_recv_done).as_millis(),
-            t_total.as_millis(),
-            total_bytes as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
+        tracing::debug!(
+            event = "grpc_put_stream",
+            status = "ok",
+            mode = "local",
+            bytes = total_bytes,
+            chunk_count = n_segs,
+            receive_us = t_recv_done.as_micros(),
+            storage_us = storage_elapsed.as_micros(),
+            total_us = t_total.as_micros(),
+            throughput_gib_s = total_bytes as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
         );
         let _ = declared_total; // silence unused
         let result = Ok(Response::new(pb::PutResponse {

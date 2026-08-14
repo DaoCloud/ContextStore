@@ -48,6 +48,17 @@ pub struct DescriptorReadChunks {
     pub placement: Option<pb::PlacementDescriptor>,
 }
 
+/// Result of `read_by_descriptor_stream_into`: chunk data has already been copied to the
+/// caller's destination buffer during the receive loop.
+pub struct DescriptorReadInto {
+    /// Total bytes copied into the destination.
+    pub bytes_written: usize,
+    /// Fresh descriptor returned by the server.
+    pub descriptor: pb::ObjectDescriptor,
+    /// Fresh placement returned by the server.
+    pub placement: Option<pb::PlacementDescriptor>,
+}
+
 /// Rust gRPC client wrapper for the KV Service.
 #[derive(Clone)]
 pub struct KvClient {
@@ -486,6 +497,71 @@ impl KvClient {
         let descriptor = fresh_descriptor.unwrap_or(descriptor);
         Ok(Some(DescriptorReadChunks {
             segments,
+            descriptor,
+            placement: fresh_placement.or(placement),
+        }))
+    }
+
+    /// Read an object by descriptor, copying each chunk into `dst` as it arrives.
+    ///
+    /// Unlike `read_by_descriptor_stream_chunks`, no `Vec<Bytes>` is accumulated: every
+    /// chunk is written to `dst[chunk.offset..]` inside the receive loop, so the memcpy
+    /// overlaps network receive instead of running serially after it. For a 256MB object
+    /// this hides the entire copy (and any destination page-fault first-touch) behind the
+    /// stream. Returns the number of bytes written, plus the fresh descriptor/placement.
+    ///
+    /// `dst` must be at least the object size; chunks outside `dst` bounds are an error.
+    pub async fn read_by_descriptor_stream_into(
+        &mut self,
+        descriptor: pb::ObjectDescriptor,
+        placement: Option<pb::PlacementDescriptor>,
+        dst: &mut [u8],
+    ) -> Result<Option<DescriptorReadInto>, tonic::Status> {
+        use tokio_stream::StreamExt;
+
+        let req = pb::ReadByDescriptorRequest {
+            descriptor: Some(descriptor.clone()),
+            placement: placement.clone(),
+        };
+        let mut stream = match self.inner.read_by_descriptor_stream(req).await {
+            Ok(s) => s.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(status),
+        };
+
+        let mut written: usize = 0;
+        let mut fresh_descriptor: Option<pb::ObjectDescriptor> = None;
+        let mut fresh_placement: Option<pb::PlacementDescriptor> = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if fresh_descriptor.is_none() {
+                fresh_descriptor = chunk.descriptor;
+            }
+            if fresh_placement.is_none() {
+                fresh_placement = chunk.placement;
+            }
+            let offset = usize::try_from(chunk.offset).map_err(|_| {
+                tonic::Status::internal(format!("negative chunk offset {}", chunk.offset))
+            })?;
+            let end = offset.checked_add(chunk.data.len()).ok_or_else(|| {
+                tonic::Status::internal("chunk offset + length overflows usize")
+            })?;
+            if end > dst.len() {
+                return Err(tonic::Status::internal(format!(
+                    "chunk [{offset}, {end}) exceeds destination buffer of {} bytes",
+                    dst.len()
+                )));
+            }
+            dst[offset..end].copy_from_slice(&chunk.data);
+            written += chunk.data.len();
+            if chunk.is_last {
+                break;
+            }
+        }
+
+        let descriptor = fresh_descriptor.unwrap_or(descriptor);
+        Ok(Some(DescriptorReadInto {
+            bytes_written: written,
             descriptor,
             placement: fresh_placement.or(placement),
         }))

@@ -96,6 +96,111 @@ impl Drop for AlignedBuffer {
     }
 }
 
+// ===== Pooled aligned buffers =====
+//
+// O_DIRECT DMA into a freshly-allocated anonymous buffer forces the kernel to fault-in and
+// zero every page inside get_user_pages before the device can write (measured: a 64MB
+// first-touch costs 50-180ms on the profiling host — far more than the 18ms the NVMe read
+// itself takes). Reusing already-touched buffers removes that tax on every read after the
+// first. The pool is bounded, so steady-state memory is (pool cap × slot size); overflow
+// buffers are simply dropped (freed).
+
+use std::sync::Mutex;
+
+/// Global bounded pool of 4K-aligned buffers, bucketed by capacity.
+pub struct AlignedBufferPool {
+    /// (capacity, buffers) — small fixed set of capacity classes; linear scan is fine.
+    buckets: Mutex<Vec<(usize, Vec<AlignedBuffer>)>>,
+    /// Max buffers retained per capacity class.
+    per_class_cap: usize,
+}
+
+impl AlignedBufferPool {
+    pub const fn new(per_class_cap: usize) -> Self {
+        Self {
+            buckets: Mutex::new(Vec::new()),
+            per_class_cap,
+        }
+    }
+
+    /// Fetch a pooled buffer with capacity ≥ min_size (exact capacity-class match), or
+    /// allocate a fresh one. The returned buffer's len is reset to 0.
+    pub fn acquire(&self, min_size: usize, align: usize) -> AlignedBuffer {
+        let want_cap = ((min_size + align - 1) & !(align - 1)).max(align);
+        {
+            let mut buckets = self.buckets.lock().unwrap();
+            if let Some((_, bufs)) = buckets.iter_mut().find(|(cap, _)| *cap == want_cap) {
+                if let Some(mut buf) = bufs.pop() {
+                    buf.set_len(0);
+                    return buf;
+                }
+            }
+        }
+        AlignedBuffer::new(min_size, align)
+    }
+
+    /// Return a buffer to the pool. Buffers beyond per_class_cap are dropped (freed).
+    pub fn release(&self, buf: AlignedBuffer) {
+        let cap = buf.capacity();
+        let mut buckets = self.buckets.lock().unwrap();
+        if let Some((_, bufs)) = buckets.iter_mut().find(|(c, _)| *c == cap) {
+            if bufs.len() < self.per_class_cap {
+                bufs.push(buf);
+            }
+            return;
+        }
+        buckets.push((cap, vec![buf]));
+    }
+}
+
+/// Global pool for the O_DIRECT read path. 32 slots per capacity class: with the default
+/// 64MB stripe size that bounds steady-state pool memory at 2GB while covering
+/// 8 objects × 4-stripe read-ahead of concurrent GET traffic.
+pub static READ_BUFFER_POOL: AlignedBufferPool = AlignedBufferPool::new(32);
+
+/// An AlignedBuffer that returns itself to a pool on drop instead of freeing.
+/// Wrap in `Bytes::from_owner` so the buffer rejoins the pool as soon as the last
+/// Bytes clone is gone.
+pub struct PooledAlignedBuffer {
+    buf: Option<AlignedBuffer>,
+    pool: &'static AlignedBufferPool,
+}
+
+impl PooledAlignedBuffer {
+    pub fn acquire(pool: &'static AlignedBufferPool, min_size: usize, align: usize) -> Self {
+        Self {
+            buf: Some(pool.acquire(min_size, align)),
+            pool,
+        }
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buf.as_mut().unwrap().as_mut_ptr()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.as_ref().unwrap().capacity()
+    }
+
+    pub fn set_len(&mut self, len: usize) {
+        self.buf.as_mut().unwrap().set_len(len);
+    }
+}
+
+impl AsRef<[u8]> for PooledAlignedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref().unwrap().as_ref()
+    }
+}
+
+impl Drop for PooledAlignedBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.release(buf);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +237,61 @@ mod tests {
         // truncate does not grow length
         buf.truncate(5000);
         assert_eq!(buf.len(), 1000);
+    }
+
+    #[test]
+    fn pool_reuses_same_capacity() {
+        static POOL: AlignedBufferPool = AlignedBufferPool::new(2);
+        let mut a = POOL.acquire(8192, 4096);
+        let ptr_a = a.as_mut_ptr() as usize;
+        POOL.release(a);
+        let mut b = POOL.acquire(8192, 4096);
+        assert_eq!(b.as_mut_ptr() as usize, ptr_a, "expected pooled buffer reuse");
+        assert_eq!(b.len(), 0, "reused buffer len must be reset");
+        POOL.release(b);
+    }
+
+    #[test]
+    fn pool_bounded_per_class() {
+        static POOL: AlignedBufferPool = AlignedBufferPool::new(1);
+        POOL.release(AlignedBuffer::new(4096, 4096));
+        POOL.release(AlignedBuffer::new(4096, 4096)); // beyond cap → dropped, must not panic
+        let _ = POOL.acquire(4096, 4096);
+        let _ = POOL.acquire(4096, 4096); // pool empty → fresh alloc
+    }
+
+    #[test]
+    fn pooled_buffer_returns_on_drop() {
+        static POOL: AlignedBufferPool = AlignedBufferPool::new(4);
+        let mut p = PooledAlignedBuffer::acquire(&POOL, 4096, 4096);
+        let ptr = p.as_mut_ptr() as usize;
+        drop(p);
+        let mut q = PooledAlignedBuffer::acquire(&POOL, 4096, 4096);
+        assert_eq!(q.as_mut_ptr() as usize, ptr);
+    }
+
+    #[test]
+    fn pooled_buffer_via_bytes_from_owner() {
+        static POOL: AlignedBufferPool = AlignedBufferPool::new(4);
+        let mut p = PooledAlignedBuffer::acquire(&POOL, 4096, 4096);
+        let ptr = p.as_mut_ptr() as usize;
+        unsafe { *p.as_mut_ptr() = 42 };
+        p.set_len(1);
+        let b = prost::bytes::Bytes::from_owner(p);
+        assert_eq!(b[0], 42);
+        let b2 = b.clone();
+        drop(b);
+        drop(b2); // last clone gone → buffer back in pool
+        let mut q = PooledAlignedBuffer::acquire(&POOL, 4096, 4096);
+        assert_eq!(q.as_mut_ptr() as usize, ptr);
+    }
+
+    #[test]
+    fn pool_distinct_capacity_classes() {
+        static POOL: AlignedBufferPool = AlignedBufferPool::new(2);
+        POOL.release(AlignedBuffer::new(4096, 4096));
+        POOL.release(AlignedBuffer::new(8192, 4096));
+        assert_eq!(POOL.acquire(8192, 4096).capacity(), 8192);
+        assert_eq!(POOL.acquire(4096, 4096).capacity(), 4096);
     }
 }

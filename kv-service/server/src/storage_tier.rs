@@ -664,6 +664,54 @@ impl StorageTier {
         Ok((device_id as u32, path.to_string_lossy().to_string(), checksum))
     }
 
+    /// Data-node internal API: write an object stripe from multiple `Bytes` segments without
+    /// flattening. Used by the streaming PUT pipeline — a stripe accumulated as N gRPC chunk
+    /// segments is handed to `write_batch_vectored` (writev fast path on tier_a) directly, so no
+    /// 64MB intermediate concat buffer is ever allocated.
+    pub fn put_placement_chunk_segments(
+        &self,
+        key: &ObjectKey,
+        stripe_index: usize,
+        device_stripe_index: usize,
+        generation: u64,
+        layout_version: u64,
+        segments: Vec<Bytes>,
+    ) -> Result<(u32, String, String)> {
+        let device_id = self.router.chunk_device(key, device_stripe_index);
+        let path = self.router.chunk_versioned_path(
+            key,
+            stripe_index,
+            device_id,
+            generation,
+            layout_version,
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let checksum = self
+            .verify_stripe_checksums
+            .then(|| Self::checksum_segments(&segments))
+            .unwrap_or_default();
+        let total: usize = segments.iter().map(|s| s.len()).sum();
+        let req = IORequest {
+            path: path.clone(),
+            offset: 0,
+            length: total,
+        };
+        let results = self.executor.write_batch_vectored(vec![(req, segments)]);
+        results
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(KVError::Internal("write_batch_vectored empty result".into())))?;
+        self.writes_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written.fetch_add(total as u64, Ordering::Relaxed);
+        Ok((
+            device_id as u32,
+            path.to_string_lossy().to_string(),
+            checksum,
+        ))
+    }
+
     /// Validate that a placement chunk handle matches the descriptor identity and router layout.
     pub fn validate_placement_chunk_handle(
         &self,
@@ -1576,6 +1624,33 @@ impl StorageTier {
             out.push(chunk);
         }
         Ok(out)
+    }
+
+    /// Read a single stripe of a striped object by index (O_DIRECT aligned path). Used by the
+    /// streaming GET pipeline: each stripe is fetched independently so encoding/sending can
+    /// overlap with reads of later stripes, instead of waiting for the whole
+    /// read_striped_chunks batch.
+    pub fn read_striped_chunk_at(&self, stripe: &StripingInfo, index: usize) -> Result<Bytes> {
+        let path = stripe
+            .chunk_paths
+            .get(index)
+            .ok_or_else(|| KVError::Internal(format!("stripe index {index} out of range")))?;
+        let req = IORequest {
+            path: std::path::PathBuf::from(path),
+            offset: 0,
+            length: 0,
+        };
+        let results = self.executor.read_aligned_batch(std::slice::from_ref(&req));
+        let chunk = results
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(KVError::Internal("read_aligned_batch empty result".into())))
+            .map_err(|e| KVError::Internal(format!("read striped chunk {index}: {e}")))?;
+        if let Some(device_id) = stripe.chunk_devices.get(index) {
+            self.record_device_read(*device_id as usize, chunk.len() as u64);
+        }
+        self.bytes_read.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        Ok(chunk)
     }
 
     /// Read an object using metadata supplied by the caller; do not re-lookup by logical key.

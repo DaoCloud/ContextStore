@@ -350,6 +350,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rdma-sys",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

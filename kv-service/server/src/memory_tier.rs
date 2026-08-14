@@ -210,6 +210,20 @@ impl MemoryTier {
         }
     }
 
+    /// L1-only probe: return cached segments if present, never fall through to L2. Used by the
+    /// streaming GET pipeline to decide between serving from memory and streaming stripes straight
+    /// from disk (which bypasses the L1 fill to avoid buffering the whole object).
+    pub fn peek_chunks(&self, key: &ObjectKey) -> Option<(Vec<Bytes>, BlockMeta)> {
+        let str_key = key.to_string_key();
+        let mut cache = self.chunks_cache.lock();
+        if let Some(entry) = cache.get(&str_key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            let segments = entry.segments.iter().cloned().collect();
+            return Some((segments, entry.meta.clone()));
+        }
+        None
+    }
+
     /// GET: check L1 first, fall through to L2 on miss.
     pub fn get(&self, key: &ObjectKey) -> Result<Option<(Bytes, BlockMeta)>> {
         let str_key = key.to_string_key();

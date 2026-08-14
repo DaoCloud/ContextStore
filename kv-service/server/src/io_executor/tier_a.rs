@@ -496,7 +496,16 @@ fn read_aligned_impl(path: &Path) -> Result<Bytes> {
         return Ok(Bytes::new());
     }
     let aligned_len = (file_size + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
-    let mut buf = AlignedBuffer::new(aligned_len, DIRECT_IO_ALIGN);
+    // Pooled buffer: O_DIRECT DMA into a fresh anonymous allocation pays a page-fault
+    // first-touch of 50-180ms per 64MB on this class of host; a reused buffer's pages are
+    // already resident. The buffer returns to READ_BUFFER_POOL when the last Bytes clone
+    // drops (from_owner keeps it alive through slicing/encoding).
+    let mut buf = crate::io_executor::PooledAlignedBuffer::acquire(
+        &crate::io_executor::READ_BUFFER_POOL,
+        aligned_len,
+        DIRECT_IO_ALIGN,
+    );
+    let buf_cap = buf.capacity();
     let t_alloc = t0.elapsed();
 
     let f = std::fs::OpenOptions::new()
@@ -512,10 +521,10 @@ fn read_aligned_impl(path: &Path) -> Result<Bytes> {
         Err(e) => return Err(KVError::Io(e)),
     };
 
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), aligned_len) };
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf_cap) };
     let mut total = 0usize;
     while total < aligned_len {
-        match f.read_at(&mut slice[total..], total as u64) {
+        match f.read_at(&mut slice[total..aligned_len], total as u64) {
             Ok(0) => break,
             Ok(n) => {
                 total += n;

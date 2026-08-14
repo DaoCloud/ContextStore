@@ -10,7 +10,7 @@
 mod aligned_buffer;
 mod tier_a;
 
-pub use aligned_buffer::AlignedBuffer;
+pub use aligned_buffer::{AlignedBuffer, PooledAlignedBuffer, READ_BUFFER_POOL};
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 mod tier_b;
