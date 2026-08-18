@@ -20,8 +20,9 @@ use crate::rdma::context::RdmaContext;
 use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
-    self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, MSG_GET_DESCRIPTOR_REQ,
-    MSG_GET_DESCRIPTOR_STRIPES_REQ,
+    self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, PutStripeLocation,
+    PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ,
+    MSG_PUT_STRIPES_REQ,
     MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ,
     MSG_PUT_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
     PUT_RESULT_STORED,
@@ -295,6 +296,10 @@ fn handle_client(
             let with_options =
                 tag == MSG_PUT_WITH_OPTIONS_REQ || tag == MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ;
             handle_put(&mut stream, &kv_ctx, nic_idx, if_not_exists, with_options)?;
+            continue;
+        }
+        if tag == MSG_PUT_STRIPES_REQ {
+            handle_put_stripes(&mut stream, &kv_ctx, nic_idx)?;
             continue;
         }
         if tag == MSG_GET_DESCRIPTOR_REQ || tag == MSG_GET_DESCRIPTOR_STRIPES_REQ {
@@ -1221,6 +1226,144 @@ fn handle_descriptor_get(
             num_chunks,
         },
     )?;
+    Ok(())
+}
+
+/// Handle a stripe-subset PUT (tag MSG_PUT_STRIPES_REQ already consumed).
+///
+/// Multi-endpoint direct writes: the coordinator prepared the object identity
+/// (generation / layout) via gRPC PrepareDistributedPut; the client pushes
+/// this node's stripes back-to-back into one slab extent over RDMA, and this
+/// handler pwrites each stripe as a placement chunk, answering with the
+/// per-stripe storage handles the coordinator needs for its commit.
+///
+/// No metadata is written here — commit happens exactly once, at the
+/// coordinator, after every node acknowledged its stripes. A crashed client
+/// leaves only unreferenced chunk files (reaped by rollback/TTL), never a
+/// visible half-object.
+fn handle_put_stripes(
+    stream: &mut TcpStream,
+    kv_ctx: &Arc<KVServiceContext>,
+    nic_idx: usize,
+) -> Result<()> {
+    let req = wire::recv_put_stripes_req_body(stream)?;
+    let total: u64 = req.stripes.iter().map(|(_, len)| *len).sum();
+    let size = total as usize;
+    let fail = |stream: &mut TcpStream| -> Result<()> {
+        wire::send_put_ready(
+            stream,
+            &PutReadyMsg {
+                ok: false,
+                dst_addr: 0,
+                dst_rkey: 0,
+            },
+        )?;
+        wire::send_put_stripes_resp(
+            stream,
+            &PutStripesRespMsg {
+                ok: false,
+                stripes: Vec::new(),
+            },
+        )?;
+        Ok(())
+    };
+    if req.stripes.is_empty() || size == 0 || size > 4 * 1024 * 1024 * 1024 {
+        tracing::warn!("RDMA stripe PUT rejected: invalid size {}", size);
+        return fail(stream);
+    }
+    for (idx, len) in &req.stripes {
+        if *len == 0 || *len > req.chunk_size {
+            tracing::warn!("RDMA stripe PUT rejected: stripe {} has bad len {}", idx, len);
+            return fail(stream);
+        }
+    }
+
+    // Slab extent sized for just this node's stripes (packed back-to-back).
+    let extent: SlabExtent = {
+        let slab_opt = kv_ctx.memory.rdma_slab_get();
+        match slab_opt.as_ref().and_then(|s| s.alloc(size)) {
+            Some(e) => e,
+            None => {
+                tracing::warn!("RDMA stripe PUT rejected: slab full (size={})", size);
+                return fail(stream);
+            }
+        }
+    };
+    wire::send_put_ready(
+        stream,
+        &PutReadyMsg {
+            ok: true,
+            dst_addr: extent.addr(),
+            dst_rkey: extent.rkey(nic_idx),
+        },
+    )?;
+
+    // Client RDMA-WRITEs, then commits.
+    let commit_tag = wire::read_exact(stream, 1)?[0];
+    if commit_tag != MSG_PUT_COMMIT {
+        return Err(anyhow!(
+            "expected MSG_PUT_COMMIT={}, got {}",
+            MSG_PUT_COMMIT,
+            commit_tag
+        ));
+    }
+
+    // pwrite each stripe from its slab offset as a placement chunk.
+    let kv_key = parse_string_key(&req.key)?;
+    let mut locations = Vec::with_capacity(req.stripes.len());
+    let mut offset: usize = 0;
+    let mut write_err = false;
+    for (idx, len) in &req.stripes {
+        let stripe = unsafe {
+            std::slice::from_raw_parts(extent.as_ptr().add(offset), *len as usize)
+        };
+        offset += *len as usize;
+        // Device rotation uses this node's local ordinal among its own
+        // stripes (mirrors the gRPC placement path).
+        let device_stripe_index = locations.len();
+        match kv_ctx.storage.put_placement_chunk(
+            &kv_key,
+            *idx as usize,
+            device_stripe_index,
+            req.object_generation,
+            req.layout_version,
+            prost::bytes::Bytes::copy_from_slice(stripe),
+        ) {
+            Ok((device_id, storage_handle, checksum)) => locations.push(PutStripeLocation {
+                stripe_index: *idx,
+                device_id,
+                storage_handle,
+                checksum,
+            }),
+            Err(e) => {
+                tracing::warn!("RDMA stripe PUT: stripe {} write failed: {}", idx, e);
+                write_err = true;
+                break;
+            }
+        }
+    }
+    if write_err {
+        // Roll back stripes already written on this node.
+        for loc in &locations {
+            let _ = kv_ctx.storage.delete_placement_chunk(&loc.storage_handle);
+        }
+        wire::send_put_stripes_resp(
+            stream,
+            &PutStripesRespMsg {
+                ok: false,
+                stripes: Vec::new(),
+            },
+        )?;
+        return Ok(());
+    }
+    tracing::debug!(
+        target: "contextstore_server::storage_io",
+        event = "rdma_put_stripes_complete",
+        status = "ok",
+        bytes = total,
+        stripes = locations.len(),
+    );
+    wire::send_put_stripes_resp(stream, &PutStripesRespMsg { ok: true, stripes: locations })?;
     Ok(())
 }
 

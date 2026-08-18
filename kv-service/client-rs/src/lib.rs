@@ -458,6 +458,58 @@ impl KvClient {
         Ok(Some(segments))
     }
 
+    /// Multi-endpoint direct writes, phase 1: reserve a striped layout on the
+    /// coordinator. Returns None when the object does not qualify for
+    /// distributed placement (or already exists under if_not_exists) — the
+    /// caller should fall back to a regular PUT.
+    pub async fn prepare_distributed_put(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        size: u64,
+        options: Option<pb::PutOptions>,
+    ) -> Result<Option<(pb::ObjectDescriptor, pb::PlacementDescriptor)>, tonic::Status> {
+        let req = pb::PrepareDistributedPutRequest {
+            key: Some(Self::key(namespace, object_key)),
+            size,
+            metadata: None,
+            options,
+        };
+        let resp = self.inner.prepare_distributed_put(req).await?.into_inner();
+        if !resp.accepted {
+            return Ok(None);
+        }
+        match (resp.descriptor, resp.placement) {
+            (Some(descriptor), Some(placement)) => Ok(Some((descriptor, placement))),
+            _ => Err(tonic::Status::internal(
+                "prepare_distributed_put accepted without descriptor/placement",
+            )),
+        }
+    }
+
+    /// Multi-endpoint direct writes, phase 3: publish the assembled metadata.
+    /// `chunks` are the per-stripe locations returned by each node's
+    /// stripe-subset PUT. Returns false when an if_not_exists race was lost
+    /// (the server already rolled back the written stripes).
+    pub async fn commit_distributed_put(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        descriptor: pb::ObjectDescriptor,
+        chunks: Vec<pb::PlacementChunk>,
+        options: Option<pb::PutOptions>,
+    ) -> Result<bool, tonic::Status> {
+        let req = pb::CommitDistributedPutRequest {
+            key: Some(Self::key(namespace, object_key)),
+            descriptor: Some(descriptor),
+            chunks,
+            options,
+            metadata: None,
+        };
+        let resp = self.inner.commit_distributed_put(req).await?.into_inner();
+        Ok(resp.committed)
+    }
+
     /// Read an object using a client-held descriptor. The server validates generation / etag /
     /// layout first. A stale descriptor returns `FAILED_PRECONDITION`; callers should lookup again.
     pub async fn read_by_descriptor_stream_chunks(

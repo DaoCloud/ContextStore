@@ -23,6 +23,11 @@ service KVService {
   // The coordinator uses these RPCs to write / read different stripes of an object to
   // and from multiple KVService data nodes.
   rpc PutPlacementChunk(PutPlacementChunkRequest) returns (PutPlacementChunkResponse);
+  // Multi-endpoint direct writes: reserve a striped layout (descriptor +
+  // per-stripe owning nodes), push stripe data node-by-node over RDMA
+  // (wire tag MSG_PUT_STRIPES_REQ), then commit the assembled metadata.
+  rpc PrepareDistributedPut(PrepareDistributedPutRequest) returns (PrepareDistributedPutResponse);
+  rpc CommitDistributedPut(CommitDistributedPutRequest) returns (CommitDistributedPutResponse);
   rpc ReadPlacementChunk(ReadPlacementChunkRequest) returns (stream DataChunk);
   rpc DeletePlacementChunk(DeletePlacementChunkRequest) returns (DeletePlacementChunkResponse);
 
@@ -172,6 +177,33 @@ message DataReadResponse {
   KVMetadata metadata = 3;
   ObjectDescriptor descriptor = 4;
   PlacementDescriptor placement = 5;
+}
+
+message PrepareDistributedPutRequest {
+  ObjectKey key = 1;
+  uint64 size = 2;
+  KVMetadata metadata = 3;
+  PutOptions options = 4;        // ttl_seconds / if_not_exists honored at commit
+}
+
+message PrepareDistributedPutResponse {
+  bool accepted = 1;             // false: object exists (if_not_exists) or size below striping threshold
+  string message = 2;
+  ObjectDescriptor descriptor = 3;   // prepared identity (generation/handle/etag) for the stripe writes
+  PlacementDescriptor placement = 4; // stripe_index -> owning node (rdma_endpoint filled)
+}
+
+message CommitDistributedPutRequest {
+  ObjectKey key = 1;
+  ObjectDescriptor descriptor = 2;      // must match the prepared identity
+  repeated PlacementChunk chunks = 3;   // locations returned by each node's stripe write
+  PutOptions options = 4;
+  KVMetadata metadata = 5;              // same metadata passed at prepare time
+}
+
+message CommitDistributedPutResponse {
+  bool committed = 1;            // false: lost an if_not_exists race; written stripes were rolled back
+  string message = 2;
 }
 
 message PutPlacementChunkRequest {

@@ -56,6 +56,14 @@ pub const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
 /// so N nodes can fill disjoint regions of one destination buffer in
 /// parallel — the multi-endpoint direct-read building block.
 pub const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
+/// Stripe-subset PUT: push a set of stripes to the node that owns them.
+/// Flow mirrors the whole-object PUT (req -> ready -> RDMA WRITE -> commit ->
+/// result), but the slab region carries the listed stripes back-to-back and
+/// the server pwrites each as a placement chunk, answering with per-stripe
+/// storage handles for the coordinator commit.
+pub const MSG_PUT_STRIPES_REQ: u8 = 13;
+/// Server -> client: per-stripe locations after a stripe-subset PUT.
+pub const MSG_PUT_STRIPES_RESP: u8 = 14;
 const MSG_BYE: u8 = 99;
 
 /// Synchronous read of exactly N bytes (TCP control plane messages are small; blocking read is fine).
@@ -496,6 +504,141 @@ pub fn recv_put_resp(stream: &mut TcpStream) -> Result<PutRespMsg> {
 #[allow(dead_code)]
 fn _assert_gid_used(_g: ibv_gid) {}
 
+// ===================== Stripe-subset PUT (multi-endpoint writes) =====================
+
+/// Stripe-subset PUT request (client -> server).
+/// wire: tag(1) + key_len(2) + key + handle_len(2) + object_handle +
+///       generation(8) + layout_version(8) + chunk_size(8) + total_size(8) +
+///       stripe_count(2) + [stripe_index(4) + stripe_len(8)]*
+/// The client then RDMA-WRITEs the stripes back-to-back (request order) into
+/// the slab region granted by PutReady, and sends MSG_PUT_COMMIT.
+pub struct PutStripesReqMsg {
+    pub key: String,
+    pub object_handle: String,
+    pub object_generation: u64,
+    pub layout_version: u64,
+    pub chunk_size: u64,
+    pub total_size: u64,
+    pub stripes: Vec<(u32, u64)>,
+}
+
+pub fn send_put_stripes_req(stream: &mut TcpStream, msg: &PutStripesReqMsg) -> Result<()> {
+    let mut frame = Vec::with_capacity(64 + msg.key.len() + msg.object_handle.len() + msg.stripes.len() * 12);
+    frame.push(MSG_PUT_STRIPES_REQ);
+    write_string_u16(&mut frame, &msg.key, "key")?;
+    write_string_u16(&mut frame, &msg.object_handle, "object_handle")?;
+    frame.extend_from_slice(&msg.object_generation.to_le_bytes());
+    frame.extend_from_slice(&msg.layout_version.to_le_bytes());
+    frame.extend_from_slice(&msg.chunk_size.to_le_bytes());
+    frame.extend_from_slice(&msg.total_size.to_le_bytes());
+    let count = u16::try_from(msg.stripes.len())
+        .map_err(|_| anyhow!("too many stripes: {}", msg.stripes.len()))?;
+    frame.extend_from_slice(&count.to_le_bytes());
+    for (idx, len) in &msg.stripes {
+        frame.extend_from_slice(&idx.to_le_bytes());
+        frame.extend_from_slice(&len.to_le_bytes());
+    }
+    stream
+        .write_all(&frame)
+        .map_err(|e| anyhow!("tcp write put_stripes_req failed: {}", e))?;
+    stream.flush().ok();
+    Ok(())
+}
+
+/// Receive PutStripesReq body (tag already consumed).
+pub fn recv_put_stripes_req_body(stream: &mut TcpStream) -> Result<PutStripesReqMsg> {
+    let key = read_string_u16(stream, "key")?;
+    let object_handle = read_string_u16(stream, "object_handle")?;
+    let gen_b = read_exact(stream, 8)?;
+    let object_generation = u64::from_le_bytes(gen_b.try_into().unwrap());
+    let layout_b = read_exact(stream, 8)?;
+    let layout_version = u64::from_le_bytes(layout_b.try_into().unwrap());
+    let cs_b = read_exact(stream, 8)?;
+    let chunk_size = u64::from_le_bytes(cs_b.try_into().unwrap());
+    let ts_b = read_exact(stream, 8)?;
+    let total_size = u64::from_le_bytes(ts_b.try_into().unwrap());
+    let count_b = read_exact(stream, 2)?;
+    let count = u16::from_le_bytes([count_b[0], count_b[1]]) as usize;
+    let mut stripes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let idx_b = read_exact(stream, 4)?;
+        let idx = u32::from_le_bytes(idx_b.try_into().unwrap());
+        let len_b = read_exact(stream, 8)?;
+        let len = u64::from_le_bytes(len_b.try_into().unwrap());
+        stripes.push((idx, len));
+    }
+    Ok(PutStripesReqMsg {
+        key,
+        object_handle,
+        object_generation,
+        layout_version,
+        chunk_size,
+        total_size,
+        stripes,
+    })
+}
+
+/// Per-stripe write result (server -> client) after a stripe-subset PUT.
+/// wire: tag(1) + ok(1) + stripe_count(2) +
+///       [stripe_index(4) + device_id(4) + handle_len(2) + storage_handle + checksum_len(2) + checksum]*
+pub struct PutStripesRespMsg {
+    pub ok: bool,
+    pub stripes: Vec<PutStripeLocation>,
+}
+
+pub struct PutStripeLocation {
+    pub stripe_index: u32,
+    pub device_id: u32,
+    pub storage_handle: String,
+    pub checksum: String,
+}
+
+pub fn send_put_stripes_resp(stream: &mut TcpStream, msg: &PutStripesRespMsg) -> Result<()> {
+    let mut frame = Vec::with_capacity(8 + msg.stripes.len() * 64);
+    frame.push(MSG_PUT_STRIPES_RESP);
+    frame.push(u8::from(msg.ok));
+    let count = u16::try_from(msg.stripes.len())
+        .map_err(|_| anyhow!("too many stripe results: {}", msg.stripes.len()))?;
+    frame.extend_from_slice(&count.to_le_bytes());
+    for loc in &msg.stripes {
+        frame.extend_from_slice(&loc.stripe_index.to_le_bytes());
+        frame.extend_from_slice(&loc.device_id.to_le_bytes());
+        write_string_u16(&mut frame, &loc.storage_handle, "storage_handle")?;
+        write_string_u16(&mut frame, &loc.checksum, "checksum")?;
+    }
+    stream
+        .write_all(&frame)
+        .map_err(|e| anyhow!("tcp write put_stripes_resp failed: {}", e))?;
+    stream.flush().ok();
+    Ok(())
+}
+
+pub fn recv_put_stripes_resp(stream: &mut TcpStream) -> Result<PutStripesRespMsg> {
+    let tag = read_exact(stream, 1)?[0];
+    if tag != MSG_PUT_STRIPES_RESP {
+        return Err(anyhow!("expected MSG_PUT_STRIPES_RESP, got {}", tag));
+    }
+    let ok = read_exact(stream, 1)?[0] != 0;
+    let count_b = read_exact(stream, 2)?;
+    let count = u16::from_le_bytes([count_b[0], count_b[1]]) as usize;
+    let mut stripes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let idx_b = read_exact(stream, 4)?;
+        let stripe_index = u32::from_le_bytes(idx_b.try_into().unwrap());
+        let dev_b = read_exact(stream, 4)?;
+        let device_id = u32::from_le_bytes(dev_b.try_into().unwrap());
+        let storage_handle = read_string_u16(stream, "storage_handle")?;
+        let checksum = read_string_u16(stream, "checksum")?;
+        stripes.push(PutStripeLocation {
+            stripe_index,
+            device_id,
+            storage_handle,
+            checksum,
+        });
+    }
+    Ok(PutStripesRespMsg { ok, stripes })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +735,64 @@ mod tests {
         assert_eq!(tag, MSG_GET_DESCRIPTOR_REQ, "no stripes = legacy wire form");
         let parsed = recv_descriptor_get_req_body(&mut server, false).unwrap();
         assert!(parsed.stripes.is_empty());
+    }
+
+    #[test]
+    fn put_stripes_req_round_trips() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let msg = PutStripesReqMsg {
+            key: "ns/obj".into(),
+            object_handle: "ctxobj-v1-x".into(),
+            object_generation: 5,
+            layout_version: 1,
+            chunk_size: 1 << 26,
+            total_size: 1 << 28,
+            stripes: vec![(0, 1 << 26), (2, 1 << 26), (4, 12345)],
+        };
+        send_put_stripes_req(&mut client, &msg).unwrap();
+        client.flush().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let tag = read_exact(&mut server, 1).unwrap()[0];
+        assert_eq!(tag, MSG_PUT_STRIPES_REQ);
+        let parsed = recv_put_stripes_req_body(&mut server).unwrap();
+        assert_eq!(parsed.stripes, vec![(0, 1 << 26), (2, 1 << 26), (4, 12345)]);
+        assert_eq!(parsed.object_generation, 5);
+        assert_eq!(parsed.object_handle, "ctxobj-v1-x");
+    }
+
+    #[test]
+    fn put_stripes_resp_round_trips() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let msg = PutStripesRespMsg {
+            ok: true,
+            stripes: vec![
+                PutStripeLocation {
+                    stripe_index: 0,
+                    device_id: 1,
+                    storage_handle: "/dev0/a.chunk0.bin".into(),
+                    checksum: "abcd".into(),
+                },
+                PutStripeLocation {
+                    stripe_index: 2,
+                    device_id: 0,
+                    storage_handle: "/dev1/a.chunk2.bin".into(),
+                    checksum: String::new(),
+                },
+            ],
+        };
+        send_put_stripes_resp(&mut client, &msg).unwrap();
+        client.flush().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let parsed = recv_put_stripes_resp(&mut server).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.stripes.len(), 2);
+        assert_eq!(parsed.stripes[0].storage_handle, "/dev0/a.chunk0.bin");
+        assert_eq!(parsed.stripes[1].stripe_index, 2);
+        assert_eq!(parsed.stripes[1].checksum, "");
     }
 
     #[test]
