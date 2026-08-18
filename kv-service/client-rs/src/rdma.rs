@@ -34,6 +34,8 @@ const MSG_PUT_IF_ABSENT_REQ: u8 = 9;
 /// callers pass ttl_seconds=0 to stay on the legacy tags for compatibility.
 const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
 const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
+/// Descriptor GET restricted to a stripe subset (multi-endpoint direct reads).
+const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
 const MSG_BYE: u8 = 99;
 const PUT_RESULT_FAILED: u8 = 0;
 const PUT_RESULT_STORED: u8 = 1;
@@ -358,6 +360,52 @@ impl RdmaClient {
             rkey,
             available as u64,
         )?;
+        self.stream.write_all(&request)?;
+        self.stream.flush()?;
+        read_get_response(&mut self.stream)
+    }
+
+    /// Read only `stripes` of a striped object into `buffer[offset..]`.
+    ///
+    /// Every stripe is written by the server at
+    /// `offset + stripe_index * descriptor.chunk_size`, i.e. its natural
+    /// position within the whole object. Callers running multi-endpoint
+    /// direct reads issue one call per owning node (with that node's stripe
+    /// subset) against the same registered buffer; the disjoint target
+    /// regions let all nodes transfer concurrently.
+    ///
+    /// The buffer must span the whole object (`descriptor.size`) so that
+    /// stripe offsets are valid. Requires a server with tag-12 support.
+    pub fn get_descriptor_stripes_into(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        buffer: &RegisteredBuffer<'_>,
+        offset: usize,
+    ) -> Result<RdmaReadResult> {
+        if stripes.is_empty() {
+            return self.get_descriptor_into(descriptor, buffer, offset);
+        }
+        let key = descriptor
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("RDMA descriptor is missing its object key"))?;
+        let (dst_addr, rkey, available) = buffer.destination(offset)?;
+        let mut request = build_descriptor_get_request(
+            &canonical_key(&key.namespace, &key.object_key),
+            descriptor,
+            dst_addr,
+            rkey,
+            available as u64,
+        )?;
+        // Rewrite the tag and append the stripe list (tag-12 body).
+        request[0] = MSG_GET_DESCRIPTOR_STRIPES_REQ;
+        let count = u16::try_from(stripes.len())
+            .map_err(|_| anyhow!("too many stripes: {}", stripes.len()))?;
+        request.extend_from_slice(&count.to_le_bytes());
+        for idx in stripes {
+            request.extend_from_slice(&idx.to_le_bytes());
+        }
         self.stream.write_all(&request)?;
         self.stream.flush()?;
         read_get_response(&mut self.stream)

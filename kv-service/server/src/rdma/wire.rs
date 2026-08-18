@@ -50,6 +50,12 @@ pub const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
 /// Immutable PUT with options. `MSG_PUT_WITH_OPTIONS_REQ`'s SET-NX variant,
 /// mirroring the tag-4 / tag-9 pairing.
 pub const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
+/// Descriptor GET restricted to a caller-selected stripe subset. Body = the
+/// classic descriptor-GET body + stripe_count(u16) + stripe_index(u32)*.
+/// Each served stripe is RDMA-written at `dst_addr + index * chunk_size`,
+/// so N nodes can fill disjoint regions of one destination buffer in
+/// parallel — the multi-endpoint direct-read building block.
+pub const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
 const MSG_BYE: u8 = 99;
 
 /// Synchronous read of exactly N bytes (TCP control plane messages are small; blocking read is fine).
@@ -177,6 +183,10 @@ pub struct DescriptorGetReqMsg {
     pub dst_addr: u64,
     pub dst_rkey: u32,
     pub max_size: u64,
+    /// Stripe indices to serve. Empty = whole object (legacy tag 8).
+    /// Non-empty = tag 12; the server reads only these stripes and writes
+    /// each at `dst_addr + index * chunk_size`.
+    pub stripes: Vec<u32>,
 }
 
 pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg) -> Result<()> {
@@ -197,7 +207,11 @@ pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg
             + 4
             + 8,
     );
-    frame.push(MSG_GET_DESCRIPTOR_REQ);
+    frame.push(if msg.stripes.is_empty() {
+        MSG_GET_DESCRIPTOR_REQ
+    } else {
+        MSG_GET_DESCRIPTOR_STRIPES_REQ
+    });
     write_string_u16(&mut frame, &msg.key, "key")?;
     write_string_u16(&mut frame, &msg.object_handle, "object_handle")?;
     frame.extend_from_slice(&msg.object_generation.to_le_bytes());
@@ -210,6 +224,14 @@ pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg
     frame.extend_from_slice(&msg.dst_addr.to_le_bytes());
     frame.extend_from_slice(&msg.dst_rkey.to_le_bytes());
     frame.extend_from_slice(&msg.max_size.to_le_bytes());
+    if !msg.stripes.is_empty() {
+        let count = u16::try_from(msg.stripes.len())
+            .map_err(|_| anyhow!("too many stripes: {}", msg.stripes.len()))?;
+        frame.extend_from_slice(&count.to_le_bytes());
+        for idx in &msg.stripes {
+            frame.extend_from_slice(&idx.to_le_bytes());
+        }
+    }
     stream
         .write_all(&frame)
         .map_err(|e| anyhow!("tcp write descriptor_get_req failed: {}", e))?;
@@ -217,8 +239,12 @@ pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg
     Ok(())
 }
 
-/// Receive DescriptorGetReq body (the tag has already been consumed by the caller).
-pub fn recv_descriptor_get_req_body(stream: &mut TcpStream) -> Result<DescriptorGetReqMsg> {
+/// Receive DescriptorGetReq body (the tag has already been consumed by the
+/// caller). `with_stripes` selects the tag-12 body carrying a stripe list.
+pub fn recv_descriptor_get_req_body(
+    stream: &mut TcpStream,
+    with_stripes: bool,
+) -> Result<DescriptorGetReqMsg> {
     let key = read_string_u16(stream, "key")?;
     let object_handle = read_string_u16(stream, "object_handle")?;
     let generation_b = read_exact(stream, 8)?;
@@ -239,6 +265,18 @@ pub fn recv_descriptor_get_req_body(stream: &mut TcpStream) -> Result<Descriptor
     let dst_rkey = u32::from_le_bytes(dst_rkey_b.try_into().unwrap());
     let max_size_b = read_exact(stream, 8)?;
     let max_size = u64::from_le_bytes(max_size_b.try_into().unwrap());
+    let stripes = if with_stripes {
+        let count_b = read_exact(stream, 2)?;
+        let count = u16::from_le_bytes([count_b[0], count_b[1]]) as usize;
+        let mut stripes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx_b = read_exact(stream, 4)?;
+            stripes.push(u32::from_le_bytes(idx_b.try_into().unwrap()));
+        }
+        stripes
+    } else {
+        Vec::new()
+    };
     Ok(DescriptorGetReqMsg {
         key,
         object_handle,
@@ -252,6 +290,7 @@ pub fn recv_descriptor_get_req_body(stream: &mut TcpStream) -> Result<Descriptor
         dst_addr,
         dst_rkey,
         max_size,
+        stripes,
     })
 }
 
@@ -493,6 +532,66 @@ mod tests {
         assert_eq!(parsed.key, "ns/obj");
         assert_eq!(parsed.size, 4096);
         assert_eq!(parsed.ttl_seconds, 0);
+    }
+
+    #[test]
+    fn descriptor_get_req_stripe_subset_round_trips() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let msg = DescriptorGetReqMsg {
+            key: "ns/obj".into(),
+            object_handle: "h1".into(),
+            object_generation: 7,
+            content_etag: "etag".into(),
+            layout_version: 1,
+            size: 1 << 28,
+            is_striped: true,
+            stripe_count: 8,
+            chunk_size: 1 << 25,
+            dst_addr: 0xdead_beef,
+            dst_rkey: 42,
+            max_size: 1 << 28,
+            stripes: vec![1, 3, 5],
+        };
+        send_descriptor_get_req(&mut client, &msg).unwrap();
+        client.flush().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let tag = read_exact(&mut server, 1).unwrap()[0];
+        assert_eq!(tag, MSG_GET_DESCRIPTOR_STRIPES_REQ);
+        let parsed = recv_descriptor_get_req_body(&mut server, true).unwrap();
+        assert_eq!(parsed.stripes, vec![1, 3, 5]);
+        assert_eq!(parsed.chunk_size, 1 << 25);
+        assert_eq!(parsed.dst_addr, 0xdead_beef);
+    }
+
+    #[test]
+    fn descriptor_get_req_empty_stripes_keeps_legacy_tag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let msg = DescriptorGetReqMsg {
+            key: "ns/obj".into(),
+            object_handle: String::new(),
+            object_generation: 1,
+            content_etag: String::new(),
+            layout_version: 1,
+            size: 64,
+            is_striped: false,
+            stripe_count: 0,
+            chunk_size: 0,
+            dst_addr: 1,
+            dst_rkey: 2,
+            max_size: 64,
+            stripes: Vec::new(),
+        };
+        send_descriptor_get_req(&mut client, &msg).unwrap();
+        client.flush().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let tag = read_exact(&mut server, 1).unwrap()[0];
+        assert_eq!(tag, MSG_GET_DESCRIPTOR_REQ, "no stripes = legacy wire form");
+        let parsed = recv_descriptor_get_req_body(&mut server, false).unwrap();
+        assert!(parsed.stripes.is_empty());
     }
 
     #[test]
