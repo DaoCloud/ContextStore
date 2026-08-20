@@ -661,7 +661,11 @@ impl StorageTier {
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        Ok((device_id as u32, path.to_string_lossy().to_string(), checksum))
+        Ok((
+            device_id as u32,
+            path.to_string_lossy().to_string(),
+            checksum,
+        ))
     }
 
     /// Data-node internal API: write an object stripe from multiple `Bytes` segments without
@@ -699,12 +703,14 @@ impl StorageTier {
             length: total,
         };
         let results = self.executor.write_batch_vectored(vec![(req, segments)]);
-        results
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Err(KVError::Internal("write_batch_vectored empty result".into())))?;
+        results.into_iter().next().unwrap_or_else(|| {
+            Err(KVError::Internal(
+                "write_batch_vectored empty result".into(),
+            ))
+        })?;
         self.writes_total.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(total as u64, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(total as u64, Ordering::Relaxed);
         Ok((
             device_id as u32,
             path.to_string_lossy().to_string(),
@@ -1626,31 +1632,315 @@ impl StorageTier {
         Ok(out)
     }
 
-    /// Read a single stripe of a striped object by index (O_DIRECT aligned path). Used by the
-    /// streaming GET pipeline: each stripe is fetched independently so encoding/sending can
-    /// overlap with reads of later stripes, instead of waiting for the whole
-    /// read_striped_chunks batch.
+    /// Read a subset of stripes in one executor batch while preserving the requested order.
+    ///
+    /// Multi-endpoint RDMA uses this path to issue all stripes owned by one node concurrently.
+    /// Returned indices remain global object stripe indices so callers can place each segment at
+    /// the correct offset in the destination buffer.
+    pub fn read_striped_chunks_at(
+        &self,
+        stripe: &StripingInfo,
+        indices: &[usize],
+    ) -> Result<Vec<(usize, Bytes)>> {
+        let mut reqs = Vec::with_capacity(indices.len());
+        let mut device_ids = Vec::with_capacity(indices.len());
+        let mut read_bytes = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let path = stripe
+                .chunk_paths
+                .get(index)
+                .ok_or_else(|| KVError::Internal(format!("stripe index {index} out of range")))?;
+            let device_id = stripe.chunk_devices.get(index).ok_or_else(|| {
+                KVError::Internal(format!("stripe device index {index} out of range"))
+            })?;
+            let offset = index as u64 * stripe.chunk_size;
+            reqs.push(IORequest {
+                path: std::path::PathBuf::from(path),
+                offset: 0,
+                length: 0,
+            });
+            device_ids.push(*device_id as usize);
+            read_bytes.push(
+                stripe
+                    .total_size
+                    .saturating_sub(offset)
+                    .min(stripe.chunk_size),
+            );
+        }
+
+        let results =
+            self.observe_io_batch("read", "aligned_subset", &device_ids, &read_bytes, || {
+                self.executor.read_aligned_batch(&reqs)
+            });
+        if results.len() != indices.len() {
+            return Err(KVError::Internal(format!(
+                "read stripe subset returned {} results for {} requests",
+                results.len(),
+                indices.len()
+            )));
+        }
+
+        let mut out = Vec::with_capacity(results.len());
+        for ((&index, device_id), result) in indices.iter().zip(device_ids).zip(results) {
+            let chunk = result.map_err(|error| {
+                if Self::is_not_found_error(&error) {
+                    KVError::NotFound(format!("striped object missing chunk {index}"))
+                } else {
+                    KVError::Internal(format!("read striped chunk {index}: {error}"))
+                }
+            })?;
+            self.record_device_read(device_id, chunk.len() as u64);
+            self.verify_stripe_bytes(stripe, index, &chunk)?;
+            self.bytes_read
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            out.push((index, chunk));
+        }
+        Ok(out)
+    }
+
+    /// Stream a subset of physical stripes into a compact caller-provided buffer.
+    ///
+    /// Each completion reports `(stripe_index, source_offset, object_offset, length, result)`.
+    /// `source_offset` addresses the compact staging buffer while `object_offset` preserves the
+    /// stripe's global position in the logical object. This lets multi-endpoint RDMA reads stage
+    /// only the bytes owned by the current node and immediately transfer completed ranges to the
+    /// correct client-buffer offset.
+    pub fn read_striped_subset_into_ptr_stream(
+        &self,
+        stripe: &StripingInfo,
+        indices: &[usize],
+        ptr: *mut u8,
+        capacity: usize,
+    ) -> Result<crossbeam_channel::Receiver<(usize, usize, usize, usize, Result<usize>)>> {
+        let chunk_size = stripe.chunk_size as usize;
+        let total = stripe.total_size as usize;
+        let stream_chunk_size = self.rdma_stream_chunk_size;
+        let mut staging_cursor = 0usize;
+        let mut reqs = Vec::new();
+        let mut stream_meta = Vec::new();
+
+        for &stripe_index in indices {
+            let path = stripe.chunk_paths.get(stripe_index).ok_or_else(|| {
+                KVError::Internal(format!("stripe index {stripe_index} out of range"))
+            })?;
+            let object_offset = stripe_index.checked_mul(chunk_size).ok_or_else(|| {
+                KVError::Internal(format!("stripe offset overflow for index {stripe_index}"))
+            })?;
+            if object_offset >= total {
+                return Err(KVError::Internal(format!(
+                    "stripe index {stripe_index} starts beyond object size {total}"
+                )));
+            }
+            let stripe_len = (total - object_offset).min(chunk_size);
+            let staging_base = staging_cursor;
+            staging_cursor = staging_cursor.checked_add(stripe_len).ok_or_else(|| {
+                KVError::Internal("stripe subset staging size overflow".to_string())
+            })?;
+            if staging_cursor > capacity {
+                return Err(KVError::Internal(format!(
+                    "stripe subset staging capacity {capacity} < required {staging_cursor}"
+                )));
+            }
+
+            for offset_in_stripe in (0..stripe_len).step_by(stream_chunk_size) {
+                let stream_len = (stripe_len - offset_in_stripe).min(stream_chunk_size);
+                let aligned_len =
+                    (stream_len + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
+                let source_offset = staging_base + offset_in_stripe;
+                if source_offset + aligned_len > capacity {
+                    return Err(KVError::Internal(format!(
+                        "stripe {stripe_index} stream range exceeds staging capacity"
+                    )));
+                }
+                let stream_ptr = unsafe { ptr.add(source_offset) };
+                reqs.push((
+                    IORequest {
+                        path: std::path::PathBuf::from(path),
+                        offset: offset_in_stripe as u64,
+                        length: stream_len,
+                    },
+                    stream_ptr,
+                    aligned_len,
+                ));
+                stream_meta.push((
+                    stripe_index,
+                    source_offset,
+                    object_offset + offset_in_stripe,
+                    stream_len,
+                ));
+            }
+        }
+
+        debug!(
+            target: "contextstore_server::storage_io",
+            event = "storage_io_plan",
+            operation = "read",
+            mode = "striped_subset_stream",
+            staged_bytes = staging_cursor,
+            stripe_count = indices.len(),
+            request_count = reqs.len(),
+            stream_chunk_size_bytes = stream_chunk_size,
+        );
+
+        let raw_rx = self.executor.read_aligned_into_ptr_stream(reqs);
+        let (tx_out, rx_out) = crossbeam_channel::unbounded();
+        let device_read_bytes = self.device_read_bytes_total.clone();
+        let chunk_devices = stripe.chunk_devices.clone();
+        let chunk_checksums = stripe.chunk_checksums.clone();
+        let integrity_enabled = self.verify_stripe_checksums;
+        let ptr_addr = ptr as usize;
+        std::thread::spawn(move || {
+            if integrity_enabled {
+                let mut per_stripe: Vec<Vec<(usize, Result<usize>)>> =
+                    (0..chunk_devices.len()).map(|_| Vec::new()).collect();
+                let mut expected_counts = vec![0usize; chunk_devices.len()];
+                for (stripe_index, _, _, _) in &stream_meta {
+                    if let Some(count) = expected_counts.get_mut(*stripe_index) {
+                        *count += 1;
+                    }
+                }
+
+                while let Ok((event_index, result)) = raw_rx.recv() {
+                    let Some(&(stripe_index, _, _, _)) = stream_meta.get(event_index) else {
+                        continue;
+                    };
+                    let Some(events) = per_stripe.get_mut(stripe_index) else {
+                        continue;
+                    };
+                    events.push((event_index, result));
+                    if events.len() != expected_counts[stripe_index] {
+                        continue;
+                    }
+
+                    let stripe_start = stripe_index * chunk_size;
+                    let stripe_len = (total - stripe_start).min(chunk_size);
+                    let staging_base = events
+                        .iter()
+                        .map(|(index, _)| stream_meta[*index].1)
+                        .min()
+                        .unwrap_or(0);
+                    let mut integrity_error = events.iter().find_map(|(index, result)| {
+                        let expected_len = stream_meta[*index].3;
+                        match result {
+                            Ok(bytes) if *bytes == expected_len => None,
+                            Ok(bytes) => Some(KVError::NotFound(format!(
+                                "striped object short read for stripe {stripe_index}: expected {expected_len}, got {bytes}"
+                            ))),
+                            Err(error) if StorageTier::is_not_found_error(error) => Some(
+                                KVError::NotFound(format!(
+                                    "striped object missing chunk {stripe_index}"
+                                )),
+                            ),
+                            Err(error) => Some(KVError::Internal(format!(
+                                "read striped chunk {stripe_index}: {error}"
+                            ))),
+                        }
+                    });
+                    if integrity_error.is_none() {
+                        integrity_error = match chunk_checksums
+                            .get(stripe_index)
+                            .filter(|checksum| !checksum.is_empty())
+                        {
+                            Some(expected) => {
+                                let data = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (ptr_addr + staging_base) as *const u8,
+                                        stripe_len,
+                                    )
+                                };
+                                let actual = StorageTier::checksum_bytes(data);
+                                if actual == *expected {
+                                    None
+                                } else {
+                                    tracing::warn!(
+                                        event = "stripe_integrity_check_failed",
+                                        stripe_index,
+                                        expected_checksum = %expected,
+                                        actual_checksum = %actual,
+                                        bytes = stripe_len,
+                                        "stripe checksum mismatch"
+                                    );
+                                    Some(KVError::NotFound(format!(
+                                        "striped object checksum mismatch for stripe {stripe_index}"
+                                    )))
+                                }
+                            }
+                            None => Some(KVError::NotFound(format!(
+                                "striped object has no checksum for stripe {stripe_index}; rewrite required"
+                            ))),
+                        };
+                    }
+
+                    if let Some(error) = integrity_error {
+                        let _ = tx_out.send((
+                            stripe_index,
+                            staging_base,
+                            stripe_start,
+                            stripe_len,
+                            Err(error),
+                        ));
+                        events.clear();
+                        continue;
+                    }
+
+                    for (index, result) in events.drain(..) {
+                        let (stripe_index, source_offset, object_offset, length) =
+                            stream_meta[index];
+                        if let Ok(bytes) = result.as_ref() {
+                            if let Some(device_id) = chunk_devices.get(stripe_index) {
+                                if let Some(counter) = device_read_bytes.get(*device_id as usize) {
+                                    counter.fetch_add(*bytes as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        let _ = tx_out.send((
+                            stripe_index,
+                            source_offset,
+                            object_offset,
+                            length,
+                            result,
+                        ));
+                    }
+                }
+                return;
+            }
+
+            while let Ok((event_index, result)) = raw_rx.recv() {
+                let Some(&(stripe_index, source_offset, object_offset, length)) =
+                    stream_meta.get(event_index)
+                else {
+                    continue;
+                };
+                let result = match result {
+                    Err(error) if StorageTier::is_not_found_error(&error) => Err(
+                        KVError::NotFound(format!("striped object missing chunk {stripe_index}")),
+                    ),
+                    other => other,
+                };
+                if let Ok(bytes) = result.as_ref() {
+                    if let Some(device_id) = chunk_devices.get(stripe_index) {
+                        if let Some(counter) = device_read_bytes.get(*device_id as usize) {
+                            counter.fetch_add(*bytes as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+                let _ = tx_out.send((stripe_index, source_offset, object_offset, length, result));
+            }
+        });
+
+        self.reads_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read
+            .fetch_add(staging_cursor as u64, Ordering::Relaxed);
+        Ok(rx_out)
+    }
+
+    /// Read a single stripe of a striped object by index.
     pub fn read_striped_chunk_at(&self, stripe: &StripingInfo, index: usize) -> Result<Bytes> {
-        let path = stripe
-            .chunk_paths
-            .get(index)
-            .ok_or_else(|| KVError::Internal(format!("stripe index {index} out of range")))?;
-        let req = IORequest {
-            path: std::path::PathBuf::from(path),
-            offset: 0,
-            length: 0,
-        };
-        let results = self.executor.read_aligned_batch(std::slice::from_ref(&req));
-        let chunk = results
+        self.read_striped_chunks_at(stripe, &[index])?
             .into_iter()
             .next()
-            .unwrap_or_else(|| Err(KVError::Internal("read_aligned_batch empty result".into())))
-            .map_err(|e| KVError::Internal(format!("read striped chunk {index}: {e}")))?;
-        if let Some(device_id) = stripe.chunk_devices.get(index) {
-            self.record_device_read(*device_id as usize, chunk.len() as u64);
-        }
-        self.bytes_read.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        Ok(chunk)
+            .map(|(_, chunk)| chunk)
+            .ok_or_else(|| KVError::Internal("read stripe subset returned no result".into()))
     }
 
     /// Read an object using metadata supplied by the caller; do not re-lookup by logical key.
@@ -2031,8 +2321,7 @@ impl StorageTier {
 
         let n_stripes = stripe.chunk_paths.len();
         let stream_chunk_size = self.rdma_stream_chunk_size;
-        let estimated_requests = n_stripes
-            .saturating_mul(chunk_size.div_ceil(stream_chunk_size));
+        let estimated_requests = n_stripes.saturating_mul(chunk_size.div_ceil(stream_chunk_size));
         let mut reqs: Vec<(IORequest, *mut u8, usize)> = Vec::with_capacity(estimated_requests);
         // Record each streamed subrange's logical value offset and length.
         let mut stream_meta: Vec<(usize, usize, usize)> = Vec::with_capacity(estimated_requests);
@@ -2042,8 +2331,8 @@ impl StorageTier {
             let stripe_len = stripe_end - stripe_offset;
             for offset_in_stripe in (0..stripe_len).step_by(stream_chunk_size) {
                 let stream_len = (stripe_len - offset_in_stripe).min(stream_chunk_size);
-                let aligned_len = (stream_len + DIRECT_IO_ALIGNMENT - 1)
-                    & !(DIRECT_IO_ALIGNMENT - 1);
+                let aligned_len =
+                    (stream_len + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
                 let offset_in_value = stripe_offset + offset_in_stripe;
                 let stream_ptr = unsafe { ptr.add(offset_in_value) };
                 let stream_cap = capacity - offset_in_value;
@@ -2126,9 +2415,8 @@ impl StorageTier {
 
                     let stripe_offset = stripe_idx * chunk_size;
                     let stripe_len = ((stripe_idx + 1) * chunk_size).min(total) - stripe_offset;
-                    let mut integrity_error = per_stripe[stripe_idx]
-                        .iter()
-                        .find_map(|(event_idx, result)| match result {
+                    let mut integrity_error = per_stripe[stripe_idx].iter().find_map(
+                        |(event_idx, result)| match result {
                             Ok(n) if *n == stream_meta[*event_idx].2 => None,
                             Ok(_) => Some(KVError::NotFound(format!(
                                 "striped object short read for stripe {}",
@@ -2144,7 +2432,8 @@ impl StorageTier {
                                 "read striped chunk {}: {}",
                                 stripe_idx, error
                             ))),
-                        });
+                        },
+                    );
                     if integrity_error.is_none() {
                         let expected = chunk_checksums
                             .get(stripe_idx)
@@ -2617,7 +2906,10 @@ mod tests {
             .unwrap();
         let stripe = meta.striping.as_ref().unwrap();
         assert_eq!(stripe.chunk_checksums.len(), 3);
-        assert!(stripe.chunk_checksums.iter().all(|checksum| checksum.len() == 16));
+        assert!(stripe
+            .chunk_checksums
+            .iter()
+            .all(|checksum| checksum.len() == 16));
 
         std::fs::write(&stripe.chunk_paths[1], b"XXXX").unwrap();
         assert!(st.get(&key).unwrap().is_none());
@@ -2654,6 +2946,42 @@ mod tests {
         std::fs::write(&stripe.chunk_paths[1], b"XXXX").unwrap();
         let (data, _) = st.get(&key).unwrap().unwrap();
         assert_eq!(data.as_ref(), b"abcdXXXXijkl");
+    }
+
+    #[test]
+    fn stripe_subset_read_preserves_indices_and_checks_integrity() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.storage.striping_threshold = 8;
+        cfg.storage.striping_chunk_size = 4;
+        cfg.storage.verify_stripe_checksums = true;
+        let router = Arc::new(ShardRouter::new(&cfg).unwrap());
+        let st = StorageTier::new(&cfg, router).unwrap();
+        let key = ObjectKey {
+            namespace: "test".into(),
+            object_key: "integrity/subset".into(),
+        };
+
+        st.put(&key, Bytes::from_static(b"abcdefghijkl"), mk_meta())
+            .unwrap();
+        let meta = st
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+        let stripe = meta.striping.as_ref().unwrap();
+
+        let chunks = st.read_striped_chunks_at(stripe, &[2, 0]).unwrap();
+        assert_eq!(chunks[0].0, 2);
+        assert_eq!(chunks[0].1.as_ref(), b"ijkl");
+        assert_eq!(chunks[1].0, 0);
+        assert_eq!(chunks[1].1.as_ref(), b"abcd");
+
+        std::fs::write(&stripe.chunk_paths[2], b"XXXX").unwrap();
+        assert!(matches!(
+            st.read_striped_chunks_at(stripe, &[2]),
+            Err(KVError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -2737,10 +3065,7 @@ mod tests {
 
         st.put(&key, Bytes::from_static(b"abcdefghijkl"), mk_meta())
             .unwrap();
-        let paths = mark_expired(&st, &key)
-            .striping
-            .unwrap()
-            .chunk_paths;
+        let paths = mark_expired(&st, &key).striping.unwrap().chunk_paths;
         assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
 
         assert!(st.get(&key).unwrap().is_none());

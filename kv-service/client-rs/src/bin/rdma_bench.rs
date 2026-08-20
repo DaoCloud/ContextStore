@@ -12,12 +12,16 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use contextstore_client_rs::rdma::canonical_key;
+use contextstore_client_rs::rdma::{canonical_key, RdmaClient, RdmaClientConfig};
+use contextstore_client_rs::KvClient;
 use rdma_sys::*;
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::ptr::{self, NonNull};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -25,6 +29,14 @@ struct Args {
     /// Server TCP address (RDMA control plane)
     #[arg(long, default_value = "127.0.0.1:50053")]
     server: String,
+
+    /// gRPC coordinator used to discover and read all RDMA placement endpoints.
+    ///
+    /// When set, the benchmark groups stripes by their owning node and issues
+    /// concurrent stripe-subset GETs instead of reading the whole object from
+    /// --server. Requires --namespace and --object-key.
+    #[arg(long, requires_all = ["namespace", "object_key"])]
+    coordinator: Option<String>,
 
     /// HCA device name (e.g. mlx5_0)
     #[arg(long, default_value = "mlx5_0")]
@@ -107,6 +119,13 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Result<Vec<u8>> {
 fn main() -> Result<()> {
     let args = Args::parse();
     let object_key = resolve_object_key(&args)?;
+    if let Some(coordinator) = &args.coordinator {
+        return run_multi_endpoint(&args, coordinator);
+    }
+    run_single_endpoint(&args, &object_key)
+}
+
+fn run_single_endpoint(args: &Args, object_key: &str) -> Result<()> {
     let buf_size = args.buf_mb * 1024 * 1024;
 
     // ===== 1. Open HCA + PD + CQ + register MR =====
@@ -411,6 +430,317 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+enum WorkerCommand {
+    Read,
+    Stop,
+}
+
+enum WorkerEvent {
+    Ready {
+        endpoint: String,
+        result: std::result::Result<(), String>,
+    },
+    ReadDone {
+        endpoint: String,
+        result: std::result::Result<usize, String>,
+    },
+}
+
+struct AlignedBuffer {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+impl AlignedBuffer {
+    fn new(size: usize) -> Result<Self> {
+        let layout = std::alloc::Layout::from_size_align(size, 4096)?;
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(anyhow!("failed to allocate {size} byte receive buffer"));
+        }
+        Ok(Self { ptr, layout })
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
+    let namespace = args
+        .namespace
+        .as_deref()
+        .ok_or_else(|| anyhow!("--coordinator requires --namespace"))?;
+    let object_key = args
+        .object_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("--coordinator requires --object-key"))?;
+    let coordinator = if coordinator.starts_with("http://") || coordinator.starts_with("https://") {
+        coordinator.to_string()
+    } else {
+        format!("http://{coordinator}")
+    };
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let lookup = runtime.block_on(async {
+        let mut client = KvClient::connect(coordinator)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let lookup = client.lookup_object(namespace, object_key).await?;
+        Ok::<_, anyhow::Error>(lookup)
+    })?;
+    let lookup = lookup.ok_or_else(|| anyhow!("object not found: {namespace}/{object_key}"))?;
+    let placement = lookup
+        .placement
+        .ok_or_else(|| anyhow!("object lookup returned no placement"))?;
+    if placement.chunks.is_empty() {
+        return Err(anyhow!("object placement contains no chunks"));
+    }
+
+    let mut endpoint_stripes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for chunk in &placement.chunks {
+        if chunk.rdma_endpoint.is_empty() {
+            return Err(anyhow!(
+                "stripe {} has no RDMA endpoint in placement",
+                chunk.stripe_index
+            ));
+        }
+        endpoint_stripes
+            .entry(chunk.rdma_endpoint.clone())
+            .or_default()
+            .push(chunk.stripe_index);
+    }
+    for stripes in endpoint_stripes.values_mut() {
+        stripes.sort_unstable();
+        stripes.dedup();
+    }
+
+    let buf_size = args.buf_mb * 1024 * 1024;
+    let object_size = usize::try_from(lookup.descriptor.size)
+        .map_err(|_| anyhow!("object size does not fit usize"))?;
+    if buf_size < object_size {
+        return Err(anyhow!(
+            "client buffer too small: {} bytes for {} byte object",
+            buf_size,
+            object_size
+        ));
+    }
+    let buffer = AlignedBuffer::new(buf_size)?;
+    let buffer_addr = buffer.ptr as usize;
+    let endpoint_count = endpoint_stripes.len();
+    let stripe_count = placement.chunks.len();
+
+    println!(
+        "[client] multi-endpoint placement: endpoints={} stripes={} bytes={}",
+        endpoint_count, stripe_count, lookup.descriptor.size
+    );
+    for (endpoint, stripes) in &endpoint_stripes {
+        println!("[client] endpoint {endpoint}: {} stripe(s)", stripes.len());
+    }
+
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut workers = Vec::with_capacity(endpoint_count);
+    for (endpoint, stripes) in endpoint_stripes {
+        let (command_tx, command_rx) = mpsc::channel();
+        let worker_events = event_tx.clone();
+        let worker_endpoint = endpoint.clone();
+        let descriptor = lookup.descriptor.clone();
+        let device = args.device.clone();
+        let port = args.port;
+        let gid_index = args.gid_index;
+        let handle = thread::spawn(move || {
+            let setup = (|| -> Result<_> {
+                let config = RdmaClientConfig::new(&worker_endpoint, device)
+                    .with_port(port)
+                    .with_gid_index(gid_index);
+                let client = RdmaClient::connect(config)?;
+                // SAFETY: the allocation remains alive until all workers are stopped.
+                // Each endpoint writes only the disjoint stripes assigned to it.
+                let registered =
+                    unsafe { client.register_raw_buffer(buffer_addr as *mut u8, buf_size)? };
+                Ok((client, registered))
+            })();
+            let (mut client, registered) = match setup {
+                Ok(resources) => {
+                    let _ = worker_events.send(WorkerEvent::Ready {
+                        endpoint: worker_endpoint.clone(),
+                        result: Ok(()),
+                    });
+                    resources
+                }
+                Err(error) => {
+                    let _ = worker_events.send(WorkerEvent::Ready {
+                        endpoint: worker_endpoint,
+                        result: Err(error.to_string()),
+                    });
+                    return;
+                }
+            };
+
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    WorkerCommand::Read => {
+                        let result = client
+                            .get_descriptor_stripes_into(&descriptor, &stripes, &registered, 0)
+                            .map(|bytes| bytes.unwrap_or(0))
+                            .map_err(|error| error.to_string());
+                        let _ = worker_events.send(WorkerEvent::ReadDone {
+                            endpoint: worker_endpoint.clone(),
+                            result,
+                        });
+                    }
+                    WorkerCommand::Stop => break,
+                }
+            }
+        });
+        workers.push((endpoint, command_tx, handle));
+    }
+    drop(event_tx);
+
+    let mut setup_error = None;
+    for _ in 0..endpoint_count {
+        match event_rx.recv()? {
+            WorkerEvent::Ready {
+                endpoint,
+                result: Ok(()),
+            } => println!("[client] RDMA endpoint ready: {endpoint}"),
+            WorkerEvent::Ready {
+                endpoint,
+                result: Err(error),
+            } => setup_error = Some(anyhow!("RDMA endpoint {endpoint} setup failed: {error}")),
+            WorkerEvent::ReadDone { .. } => {
+                setup_error = Some(anyhow!("worker returned data before setup completed"))
+            }
+        }
+    }
+
+    let benchmark_result = if let Some(error) = setup_error {
+        Err(error)
+    } else {
+        run_multi_endpoint_iterations(
+            args,
+            &workers,
+            &event_rx,
+            &buffer,
+            object_size,
+            stripe_count,
+        )
+    };
+
+    for (_, command_tx, _) in &workers {
+        let _ = command_tx.send(WorkerCommand::Stop);
+    }
+    for (endpoint, _, handle) in workers {
+        handle
+            .join()
+            .map_err(|_| anyhow!("RDMA endpoint worker panicked: {endpoint}"))?;
+    }
+    benchmark_result
+}
+
+fn run_multi_endpoint_iterations(
+    args: &Args,
+    workers: &[(String, mpsc::Sender<WorkerCommand>, thread::JoinHandle<()>)],
+    event_rx: &mpsc::Receiver<WorkerEvent>,
+    buffer: &AlignedBuffer,
+    object_size: usize,
+    stripe_count: usize,
+) -> Result<()> {
+    let mut latencies = Vec::with_capacity(args.iters);
+    for iteration in 0..args.iters {
+        unsafe {
+            if args.clear_buffer {
+                std::ptr::write_bytes(buffer.ptr, 0, buffer.layout.size());
+            } else {
+                std::ptr::write_bytes(buffer.ptr, 0xff, 64.min(buffer.layout.size()));
+            }
+        }
+
+        let started = Instant::now();
+        for (endpoint, command_tx, _) in workers {
+            command_tx
+                .send(WorkerCommand::Read)
+                .map_err(|_| anyhow!("RDMA endpoint worker stopped: {endpoint}"))?;
+        }
+
+        let mut bytes_written = 0usize;
+        for _ in workers {
+            match event_rx.recv()? {
+                WorkerEvent::ReadDone {
+                    endpoint: _,
+                    result: Ok(bytes),
+                } => bytes_written += bytes,
+                WorkerEvent::ReadDone {
+                    endpoint,
+                    result: Err(error),
+                } => return Err(anyhow!("RDMA endpoint {endpoint} read failed: {error}")),
+                WorkerEvent::Ready { endpoint, .. } => {
+                    return Err(anyhow!("duplicate ready event from {endpoint}"))
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        if bytes_written != object_size {
+            return Err(anyhow!(
+                "partial multi-endpoint read: {bytes_written} of {object_size} bytes"
+            ));
+        }
+        latencies.push(elapsed);
+
+        let head = unsafe { std::slice::from_raw_parts(buffer.ptr, 16.min(object_size)) };
+        let expected: Vec<u8> = (0..head.len()).map(|index| (index % 251) as u8).collect();
+        let data_ok = head == expected.as_slice();
+        let gib_per_second =
+            bytes_written as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0 * 1024.0);
+        let gbits_per_second = bytes_written as f64 * 8.0 / elapsed.as_secs_f64() / 1e9;
+        println!(
+            "[client] iter {}: bytes={} stripes={} endpoints={} time={:.2}ms BW={:.2} Gbps = {:.3} GiB/s data_ok={} head={:02x?}",
+            iteration + 1,
+            bytes_written,
+            stripe_count,
+            workers.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            gbits_per_second,
+            gib_per_second,
+            data_ok,
+            head
+        );
+        if !data_ok {
+            return Err(anyhow!("received data failed prefix validation"));
+        }
+    }
+
+    latencies.sort_unstable();
+    let min = latencies
+        .first()
+        .ok_or_else(|| anyhow!("--iters must be greater than zero"))?;
+    let median = latencies[latencies.len() / 2];
+    let max = latencies.last().expect("latencies is not empty");
+    let gib = object_size as f64 / (1024.0 * 1024.0 * 1024.0);
+    println!(
+        "\n[summary] mode=multi_endpoint_rdma iters={} bytes_per_iter={} endpoints={} stripes={}",
+        args.iters,
+        object_size,
+        workers.len(),
+        stripe_count
+    );
+    println!(
+        "  latency  min={:.2}ms med={:.2}ms max={:.2}ms",
+        min.as_secs_f64() * 1000.0,
+        median.as_secs_f64() * 1000.0,
+        max.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  BW       max={:.3} GiB/s med={:.3} GiB/s min={:.3} GiB/s",
+        gib / min.as_secs_f64(),
+        gib / median.as_secs_f64(),
+        gib / max.as_secs_f64()
+    );
+    Ok(())
+}
+
 fn resolve_object_key(args: &Args) -> Result<String> {
     match (&args.key, &args.namespace, &args.object_key) {
         (Some(key), None, None) => {
@@ -455,6 +785,7 @@ mod tests {
             namespace: Some("rust-bench".to_string()),
             object_key: Some("rdma-checksum0/__combined__".to_string()),
             server: "127.0.0.1:50053".to_string(),
+            coordinator: None,
             device: "mlx5_0".to_string(),
             port: 1,
             gid_index: 3,
