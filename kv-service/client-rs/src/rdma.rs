@@ -34,6 +34,11 @@ const MSG_PUT_IF_ABSENT_REQ: u8 = 9;
 /// callers pass ttl_seconds=0 to stay on the legacy tags for compatibility.
 const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
 const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
+/// Descriptor GET restricted to a stripe subset (multi-endpoint direct reads).
+const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
+/// Stripe-subset PUT (multi-endpoint direct writes).
+const MSG_PUT_STRIPES_REQ: u8 = 13;
+const MSG_PUT_STRIPES_RESP: u8 = 14;
 const MSG_BYE: u8 = 99;
 const PUT_RESULT_FAILED: u8 = 0;
 const PUT_RESULT_STORED: u8 = 1;
@@ -363,6 +368,52 @@ impl RdmaClient {
         read_get_response(&mut self.stream)
     }
 
+    /// Read only `stripes` of a striped object into `buffer[offset..]`.
+    ///
+    /// Every stripe is written by the server at
+    /// `offset + stripe_index * descriptor.chunk_size`, i.e. its natural
+    /// position within the whole object. Callers running multi-endpoint
+    /// direct reads issue one call per owning node (with that node's stripe
+    /// subset) against the same registered buffer; the disjoint target
+    /// regions let all nodes transfer concurrently.
+    ///
+    /// The buffer must span the whole object (`descriptor.size`) so that
+    /// stripe offsets are valid. Requires a server with tag-12 support.
+    pub fn get_descriptor_stripes_into(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        buffer: &RegisteredBuffer<'_>,
+        offset: usize,
+    ) -> Result<RdmaReadResult> {
+        if stripes.is_empty() {
+            return self.get_descriptor_into(descriptor, buffer, offset);
+        }
+        let key = descriptor
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("RDMA descriptor is missing its object key"))?;
+        let (dst_addr, rkey, available) = buffer.destination(offset)?;
+        let mut request = build_descriptor_get_request(
+            &canonical_key(&key.namespace, &key.object_key),
+            descriptor,
+            dst_addr,
+            rkey,
+            available as u64,
+        )?;
+        // Rewrite the tag and append the stripe list (tag-12 body).
+        request[0] = MSG_GET_DESCRIPTOR_STRIPES_REQ;
+        let count = u16::try_from(stripes.len())
+            .map_err(|_| anyhow!("too many stripes: {}", stripes.len()))?;
+        request.extend_from_slice(&count.to_le_bytes());
+        for idx in stripes {
+            request.extend_from_slice(&idx.to_le_bytes());
+        }
+        self.stream.write_all(&request)?;
+        self.stream.flush()?;
+        read_get_response(&mut self.stream)
+    }
+
     /// Write `buffer[offset..offset + size]` through the RDMA PUT data path.
     /// The operation only completes after the server confirms that it has
     /// persisted the slab contents to its storage tier.
@@ -437,6 +488,75 @@ impl RdmaClient {
             true,
             ttl_seconds,
         )
+    }
+
+    /// Push a set of stripes to the node that owns them (multi-endpoint
+    /// direct writes, phase 2).
+    ///
+    /// `stripes` lists `(stripe_index, offset_in_buffer, length)`; the data
+    /// for all stripes must already be inside `buffer` and is transferred
+    /// back-to-back in list order with a single RDMA WRITE per stripe into
+    /// the slab region granted by the server. The object identity
+    /// (generation / handle) must come from a prior
+    /// `KvClient::prepare_distributed_put`.
+    ///
+    /// Returns the per-stripe storage locations to pass to
+    /// `KvClient::commit_distributed_put`.
+    pub fn put_stripes_from(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[(u32, usize, usize)],
+        buffer: &RegisteredBuffer<'_>,
+    ) -> Result<Vec<PutStripeAck>> {
+        if stripes.is_empty() {
+            return Err(anyhow!("no stripes to put"));
+        }
+        let key = descriptor
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("RDMA descriptor is missing its object key"))?;
+        let canonical = canonical_key(&key.namespace, &key.object_key);
+
+        // Request frame (tag 13).
+        let mut request = Vec::with_capacity(96 + canonical.len() + stripes.len() * 12);
+        request.push(MSG_PUT_STRIPES_REQ);
+        push_string(&mut request, &canonical, "key")?;
+        push_string(&mut request, &descriptor.object_handle, "object_handle")?;
+        request.extend_from_slice(&descriptor.object_generation.to_le_bytes());
+        request.extend_from_slice(&descriptor.layout_version.to_le_bytes());
+        request.extend_from_slice(&descriptor.chunk_size.to_le_bytes());
+        request.extend_from_slice(&descriptor.size.to_le_bytes());
+        let count = u16::try_from(stripes.len())
+            .map_err(|_| anyhow!("too many stripes: {}", stripes.len()))?;
+        request.extend_from_slice(&count.to_le_bytes());
+        for (idx, _, len) in stripes {
+            request.extend_from_slice(&idx.to_le_bytes());
+            request.extend_from_slice(&(*len as u64).to_le_bytes());
+        }
+        self.stream.write_all(&request)?;
+        self.stream.flush()?;
+
+        let ready = read_put_ready(&mut self.stream)?;
+        if !ready.ok {
+            return Err(anyhow!("server rejected RDMA stripe PUT"));
+        }
+
+        // One RDMA WRITE per stripe, packed back-to-back at the server side.
+        let mut dst_offset: u64 = 0;
+        for (_, buf_offset, len) in stripes {
+            let (src_addr, lkey) = buffer.source(*buf_offset, *len)?;
+            self.write_remote(src_addr, lkey, ready.addr + dst_offset, ready.rkey, *len)?;
+            dst_offset += *len as u64;
+        }
+        self.stream.write_all(&[MSG_PUT_COMMIT])?;
+        self.stream.flush()?;
+
+        // Per-stripe locations (tag 14).
+        let resp = read_put_stripes_resp(&mut self.stream)?;
+        if !resp.0 {
+            return Err(anyhow!("server failed to persist RDMA stripe PUT"));
+        }
+        Ok(resp.1)
     }
 
     fn put_key_from(
@@ -788,6 +908,54 @@ fn push_string(target: &mut Vec<u8>, value: &str, field: &str) -> Result<()> {
     target.extend_from_slice(&length.to_le_bytes());
     target.extend_from_slice(bytes);
     Ok(())
+}
+
+/// Storage location of one stripe written through `put_stripes_from`.
+#[derive(Debug, Clone)]
+pub struct PutStripeAck {
+    pub stripe_index: u32,
+    pub device_id: u32,
+    pub storage_handle: String,
+    pub checksum: String,
+}
+
+fn read_put_stripes_resp(stream: &mut TcpStream) -> Result<(bool, Vec<PutStripeAck>)> {
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag)?;
+    if tag[0] != MSG_PUT_STRIPES_RESP {
+        return Err(anyhow!("expected RDMA stripe PUT response, got {}", tag[0]));
+    }
+    let mut ok_b = [0u8; 1];
+    stream.read_exact(&mut ok_b)?;
+    let ok = ok_b[0] != 0;
+    let mut count_b = [0u8; 2];
+    stream.read_exact(&mut count_b)?;
+    let count = u16::from_le_bytes(count_b) as usize;
+    let mut stripes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut idx_b = [0u8; 4];
+        stream.read_exact(&mut idx_b)?;
+        let mut dev_b = [0u8; 4];
+        stream.read_exact(&mut dev_b)?;
+        let storage_handle = read_string(stream, "storage_handle")?;
+        let checksum = read_string(stream, "checksum")?;
+        stripes.push(PutStripeAck {
+            stripe_index: u32::from_le_bytes(idx_b),
+            device_id: u32::from_le_bytes(dev_b),
+            storage_handle,
+            checksum,
+        });
+    }
+    Ok((ok, stripes))
+}
+
+fn read_string(stream: &mut TcpStream, field: &str) -> Result<String> {
+    let mut len_b = [0u8; 2];
+    stream.read_exact(&mut len_b)?;
+    let len = u16::from_le_bytes(len_b) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    String::from_utf8(buf).map_err(|e| anyhow!("RDMA {field} utf8: {e}"))
 }
 
 fn read_get_response(stream: &mut TcpStream) -> Result<RdmaReadResult> {

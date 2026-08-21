@@ -20,7 +20,9 @@ use crate::rdma::context::RdmaContext;
 use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
-    self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, MSG_GET_DESCRIPTOR_REQ,
+    self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, PutStripeLocation,
+    PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ,
+    MSG_PUT_STRIPES_REQ,
     MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ,
     MSG_PUT_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
     PUT_RESULT_STORED,
@@ -296,8 +298,20 @@ fn handle_client(
             handle_put(&mut stream, &kv_ctx, nic_idx, if_not_exists, with_options)?;
             continue;
         }
-        if tag == MSG_GET_DESCRIPTOR_REQ {
-            handle_descriptor_get(&mut stream, &kv_ctx, &rdma, &qp, client_cq, nic_idx)?;
+        if tag == MSG_PUT_STRIPES_REQ {
+            handle_put_stripes(&mut stream, &kv_ctx, nic_idx)?;
+            continue;
+        }
+        if tag == MSG_GET_DESCRIPTOR_REQ || tag == MSG_GET_DESCRIPTOR_STRIPES_REQ {
+            handle_descriptor_get(
+                &mut stream,
+                &kv_ctx,
+                &rdma,
+                &qp,
+                client_cq,
+                nic_idx,
+                tag == MSG_GET_DESCRIPTOR_STRIPES_REQ,
+            )?;
             continue;
         }
         if tag != MSG_GET_REQ {
@@ -961,6 +975,102 @@ fn descriptor_meta_from_req(
     Ok(meta)
 }
 
+/// Serve a stripe-subset descriptor GET (tag 12): read each requested stripe
+/// from local storage and RDMA-WRITE it at `dst_addr + index * chunk_size`.
+///
+/// Only stripes present on this node's devices can be served — a request for
+/// a stripe this node does not hold fails the whole request (found=false) so
+/// the client falls back to the gRPC path rather than receiving a hole.
+fn serve_get_stripes(
+    kv_ctx: &Arc<KVServiceContext>,
+    rdma: &Arc<RdmaContext>,
+    qp: &RcQp,
+    client_cq: NonNull<rdma_sys::ibv_cq>,
+    kv_key: &ObjectKey,
+    active_meta: &crate::metadata::BlockMeta,
+    req: &DescriptorGetReqMsg,
+) -> Result<(bool, u64, u32)> {
+    let _ = kv_key;
+    let Some(striping) = active_meta.striping.as_ref() else {
+        tracing::warn!("stripe-subset GET on a non-striped object");
+        return Ok((false, 0, 0));
+    };
+    let chunk_size = striping.chunk_size;
+    if chunk_size == 0 {
+        return Ok((false, 0, 0));
+    }
+    // Validate all indices and the destination window before any I/O.
+    for &idx in &req.stripes {
+        let idx = idx as usize;
+        if idx >= striping.chunk_paths.len() {
+            tracing::warn!("stripe-subset GET: index {} out of range", idx);
+            return Ok((false, 0, 0));
+        }
+        let end = (idx as u64) * chunk_size + chunk_size.min(striping.total_size - (idx as u64) * chunk_size);
+        if end > req.max_size {
+            tracing::warn!(
+                "stripe-subset GET: stripe {} ends at {} beyond client window {}",
+                idx,
+                end,
+                req.max_size
+            );
+            return Ok((false, 0, 0));
+        }
+    }
+
+    // Read the requested stripes from local storage (O_DIRECT pooled path).
+    let mut segments: Vec<(u32, prost::bytes::Bytes)> = Vec::with_capacity(req.stripes.len());
+    for &idx in &req.stripes {
+        match kv_ctx
+            .storage
+            .read_striped_chunk_at(striping, idx as usize)
+        {
+            Ok(seg) => segments.push((idx, seg)),
+            Err(e) => {
+                // Stripe not on this node (or read failed): fail the whole
+                // request; a partial fill would leave silent holes.
+                tracing::warn!("stripe-subset GET: read stripe {} failed: {}", idx, e);
+                return Ok((false, 0, 0));
+            }
+        }
+    }
+
+    // RDMA WRITE each stripe to its own offset. Register per-segment MRs
+    // (fallback-style); the slab fast path can be layered in later.
+    let n = segments.len();
+    let mut total: u64 = 0;
+    let mut mrs = Vec::with_capacity(n);
+    for (i, (idx, seg)) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        let mr = unsafe {
+            rdma.register_mr_raw(
+                seg.as_ptr() as *mut u8,
+                seg.len(),
+                ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
+            )?
+        };
+        let dst = req.dst_addr + (*idx as u64) * chunk_size;
+        let signaled = i + 1 == n;
+        qp.post_write(
+            i as u64,
+            mr.addr,
+            mr.lkey,
+            dst,
+            req.dst_rkey,
+            seg.len() as u32,
+            signaled,
+        )?;
+        total += seg.len() as u64;
+        mrs.push(mr);
+    }
+    if !mrs.is_empty() {
+        RcQp::poll_n(client_cq, 1)?;
+    }
+    Ok((true, total, n as u32))
+}
+
 fn handle_descriptor_get(
     stream: &mut TcpStream,
     kv_ctx: &Arc<KVServiceContext>,
@@ -968,8 +1078,9 @@ fn handle_descriptor_get(
     qp: &RcQp,
     client_cq: NonNull<rdma_sys::ibv_cq>,
     nic_idx: usize,
+    with_stripes: bool,
 ) -> Result<()> {
-    let req = wire::recv_descriptor_get_req_body(stream)?;
+    let req = wire::recv_descriptor_get_req_body(stream, with_stripes)?;
     let kv_key = parse_string_key(&req.key)?;
     // Validate descriptor layout fields before consulting the authoritative metadata. The actual
     // metadata is used for I/O so optional per-stripe checksums cannot be omitted by a client.
@@ -1010,6 +1121,36 @@ fn handle_descriptor_get(
                 num_chunks: 0,
             },
         )?;
+        return Ok(());
+    }
+
+    // ===== Stripe-subset path (tag 12): serve only the requested stripes =====
+    //
+    // Multi-endpoint direct reads: the client splits an object's stripes by
+    // owning node (from the gRPC placement) and asks each node for just its
+    // stripes. Every stripe lands at dst_addr + index * chunk_size, so N
+    // nodes fill disjoint regions of one client buffer concurrently with no
+    // coordinator forwarding.
+    if !req.stripes.is_empty() {
+        let (found, bytes_written, num_chunks) =
+            serve_get_stripes(kv_ctx, rdma, qp, client_cq, &kv_key, &active_meta, &req)?;
+        wire::send_get_resp(
+            stream,
+            &GetRespMsg {
+                found,
+                bytes_written,
+                num_chunks,
+            },
+        )?;
+        if found {
+            tracing::debug!(
+                target: "contextstore_server::storage_io",
+                event = "rdma_get_stripes_complete",
+                status = "ok",
+                bytes = bytes_written,
+                stripes = num_chunks,
+            );
+        }
         return Ok(());
     }
 
@@ -1085,6 +1226,144 @@ fn handle_descriptor_get(
             num_chunks,
         },
     )?;
+    Ok(())
+}
+
+/// Handle a stripe-subset PUT (tag MSG_PUT_STRIPES_REQ already consumed).
+///
+/// Multi-endpoint direct writes: the coordinator prepared the object identity
+/// (generation / layout) via gRPC PrepareDistributedPut; the client pushes
+/// this node's stripes back-to-back into one slab extent over RDMA, and this
+/// handler pwrites each stripe as a placement chunk, answering with the
+/// per-stripe storage handles the coordinator needs for its commit.
+///
+/// No metadata is written here — commit happens exactly once, at the
+/// coordinator, after every node acknowledged its stripes. A crashed client
+/// leaves only unreferenced chunk files (reaped by rollback/TTL), never a
+/// visible half-object.
+fn handle_put_stripes(
+    stream: &mut TcpStream,
+    kv_ctx: &Arc<KVServiceContext>,
+    nic_idx: usize,
+) -> Result<()> {
+    let req = wire::recv_put_stripes_req_body(stream)?;
+    let total: u64 = req.stripes.iter().map(|(_, len)| *len).sum();
+    let size = total as usize;
+    let fail = |stream: &mut TcpStream| -> Result<()> {
+        wire::send_put_ready(
+            stream,
+            &PutReadyMsg {
+                ok: false,
+                dst_addr: 0,
+                dst_rkey: 0,
+            },
+        )?;
+        wire::send_put_stripes_resp(
+            stream,
+            &PutStripesRespMsg {
+                ok: false,
+                stripes: Vec::new(),
+            },
+        )?;
+        Ok(())
+    };
+    if req.stripes.is_empty() || size == 0 || size > 4 * 1024 * 1024 * 1024 {
+        tracing::warn!("RDMA stripe PUT rejected: invalid size {}", size);
+        return fail(stream);
+    }
+    for (idx, len) in &req.stripes {
+        if *len == 0 || *len > req.chunk_size {
+            tracing::warn!("RDMA stripe PUT rejected: stripe {} has bad len {}", idx, len);
+            return fail(stream);
+        }
+    }
+
+    // Slab extent sized for just this node's stripes (packed back-to-back).
+    let extent: SlabExtent = {
+        let slab_opt = kv_ctx.memory.rdma_slab_get();
+        match slab_opt.as_ref().and_then(|s| s.alloc(size)) {
+            Some(e) => e,
+            None => {
+                tracing::warn!("RDMA stripe PUT rejected: slab full (size={})", size);
+                return fail(stream);
+            }
+        }
+    };
+    wire::send_put_ready(
+        stream,
+        &PutReadyMsg {
+            ok: true,
+            dst_addr: extent.addr(),
+            dst_rkey: extent.rkey(nic_idx),
+        },
+    )?;
+
+    // Client RDMA-WRITEs, then commits.
+    let commit_tag = wire::read_exact(stream, 1)?[0];
+    if commit_tag != MSG_PUT_COMMIT {
+        return Err(anyhow!(
+            "expected MSG_PUT_COMMIT={}, got {}",
+            MSG_PUT_COMMIT,
+            commit_tag
+        ));
+    }
+
+    // pwrite each stripe from its slab offset as a placement chunk.
+    let kv_key = parse_string_key(&req.key)?;
+    let mut locations = Vec::with_capacity(req.stripes.len());
+    let mut offset: usize = 0;
+    let mut write_err = false;
+    for (idx, len) in &req.stripes {
+        let stripe = unsafe {
+            std::slice::from_raw_parts(extent.as_ptr().add(offset), *len as usize)
+        };
+        offset += *len as usize;
+        // Device rotation uses this node's local ordinal among its own
+        // stripes (mirrors the gRPC placement path).
+        let device_stripe_index = locations.len();
+        match kv_ctx.storage.put_placement_chunk(
+            &kv_key,
+            *idx as usize,
+            device_stripe_index,
+            req.object_generation,
+            req.layout_version,
+            prost::bytes::Bytes::copy_from_slice(stripe),
+        ) {
+            Ok((device_id, storage_handle, checksum)) => locations.push(PutStripeLocation {
+                stripe_index: *idx,
+                device_id,
+                storage_handle,
+                checksum,
+            }),
+            Err(e) => {
+                tracing::warn!("RDMA stripe PUT: stripe {} write failed: {}", idx, e);
+                write_err = true;
+                break;
+            }
+        }
+    }
+    if write_err {
+        // Roll back stripes already written on this node.
+        for loc in &locations {
+            let _ = kv_ctx.storage.delete_placement_chunk(&loc.storage_handle);
+        }
+        wire::send_put_stripes_resp(
+            stream,
+            &PutStripesRespMsg {
+                ok: false,
+                stripes: Vec::new(),
+            },
+        )?;
+        return Ok(());
+    }
+    tracing::debug!(
+        target: "contextstore_server::storage_io",
+        event = "rdma_put_stripes_complete",
+        status = "ok",
+        bytes = total,
+        stripes = locations.len(),
+    );
+    wire::send_put_stripes_resp(stream, &PutStripesRespMsg { ok: true, stripes: locations })?;
     Ok(())
 }
 

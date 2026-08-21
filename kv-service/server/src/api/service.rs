@@ -1989,6 +1989,184 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         result
     }
 
+    /// Multi-endpoint direct writes, phase 1: reserve a striped layout.
+    ///
+    /// Returns the prepared object identity (generation / handle / etag) and a
+    /// placement mapping every stripe to its owning node (rdma_endpoint
+    /// filled), so the client can push each node's stripes over that node's
+    /// own RDMA connection. Nothing is visible until CommitDistributedPut.
+    async fn prepare_distributed_put(
+        &self,
+        req: Request<pb::PrepareDistributedPutRequest>,
+    ) -> Result<Response<pb::PrepareDistributedPutResponse>, Status> {
+        let req = req.into_inner();
+        let key = req
+            .key
+            .ok_or_else(|| Status::invalid_argument("missing key"))?;
+        let internal = pb_key_to_internal(&key);
+        let size = req.size as usize;
+        let reject = |message: &str| {
+            Ok(Response::new(pb::PrepareDistributedPutResponse {
+                accepted: false,
+                message: message.to_string(),
+                descriptor: None,
+                placement: None,
+            }))
+        };
+        if size == 0 {
+            return reject("empty object");
+        }
+        if !self.should_use_distributed_placement(size) {
+            return reject("below striping threshold or single data node");
+        }
+        let if_not_exists = put_options_if_not_exists(req.options.as_ref());
+        if if_not_exists && self.metadata_get_live(&internal).await?.is_some() {
+            return reject("already exists");
+        }
+
+        let meta = meta_from_pb(req.metadata.as_ref(), req.options.as_ref());
+        let chunk_size = self.ctx.storage.striping_chunk_size().max(1) as usize;
+        let stripe_count = size.div_ceil(chunk_size);
+        let prepared = self
+            .ctx
+            .storage
+            .prepare_write_meta(&internal, meta, size as u64)
+            .map_err(Status::from)?;
+        let descriptor =
+            self.make_distributed_descriptor(&internal, &prepared, stripe_count, chunk_size as u64);
+
+        // Stripe -> owning node, same deterministic routing the gRPC path uses.
+        let chunks = (0..stripe_count)
+            .map(|stripe_index| {
+                let node = select_data_node(&self.ctx, &internal, stripe_index);
+                let start = (stripe_index * chunk_size) as u64;
+                let length = ((start + chunk_size as u64).min(size as u64)) - start;
+                pb::PlacementChunk {
+                    stripe_index: stripe_index as u32,
+                    node_id: node.node_id,
+                    grpc_endpoint: node.grpc_endpoint,
+                    rdma_endpoint: node.rdma_endpoint,
+                    device_id: 0,
+                    storage_handle: String::new(),
+                    offset: start,
+                    length,
+                    checksum: String::new(),
+                }
+            })
+            .collect();
+        let local = local_node(&self.ctx);
+        let placement = pb::PlacementDescriptor {
+            key: Some(key),
+            placement_epoch: placement_epoch(&self.ctx),
+            placement_policy_id: placement_policy_id(&self.ctx),
+            layout_hash: String::new(),
+            primary_node_id: local.node_id,
+            primary_grpc_endpoint: local.grpc_endpoint,
+            primary_rdma_endpoint: local.rdma_endpoint,
+            chunks,
+        };
+        Ok(Response::new(pb::PrepareDistributedPutResponse {
+            accepted: true,
+            message: String::new(),
+            descriptor: Some(descriptor),
+            placement: Some(placement),
+        }))
+    }
+
+    /// Multi-endpoint direct writes, phase 3: publish the assembled metadata.
+    ///
+    /// The client supplies the per-stripe locations returned by each node's
+    /// stripe-subset PUT. The commit is atomic: on an if_not_exists race loss
+    /// every written stripe is rolled back on its owning node.
+    async fn commit_distributed_put(
+        &self,
+        req: Request<pb::CommitDistributedPutRequest>,
+    ) -> Result<Response<pb::CommitDistributedPutResponse>, Status> {
+        let req = req.into_inner();
+        let key = req
+            .key
+            .ok_or_else(|| Status::invalid_argument("missing key"))?;
+        let internal = pb_key_to_internal(&key);
+        let descriptor = req
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
+        if req.chunks.is_empty() {
+            return Err(Status::invalid_argument("no stripe locations"));
+        }
+        let stripe_count = descriptor.stripe_count as usize;
+        let mut chunks = req.chunks;
+        chunks.sort_by_key(|c| c.stripe_index);
+        if chunks.len() != stripe_count
+            || chunks
+                .iter()
+                .enumerate()
+                .any(|(i, c)| c.stripe_index as usize != i)
+        {
+            return Err(Status::invalid_argument(
+                "stripe locations do not cover the prepared layout",
+            ));
+        }
+        if self.ctx.storage.verify_stripe_checksums()
+            && chunks.iter().any(|c| c.checksum.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "stripe integrity is enabled but a stripe location lacks a checksum",
+            ));
+        }
+
+        let if_not_exists = put_options_if_not_exists(req.options.as_ref());
+        let total: u64 = chunks.iter().map(|c| c.length).sum();
+        let locations: Vec<ChunkLocation> = chunks.iter().map(pb_chunk_to_location).collect();
+        let rollback_chunks: Vec<pb::PlacementChunk> = chunks.clone();
+
+        let mut committed_meta = meta_from_pb(req.metadata.as_ref(), req.options.as_ref());
+        committed_meta.size = total;
+        committed_meta.object_generation = descriptor.object_generation;
+        committed_meta.layout_version = descriptor.layout_version;
+        committed_meta.object_handle = descriptor.object_handle.clone();
+        committed_meta.content_etag = descriptor.content_etag.clone();
+        committed_meta.file_path = String::new();
+        committed_meta.device_id = locations.first().map(|l| l.device_id).unwrap_or(0);
+        committed_meta.striping = Some(StripingInfo {
+            chunk_size: descriptor.chunk_size,
+            chunk_devices: locations.iter().map(|l| l.device_id).collect(),
+            chunk_paths: locations.iter().map(|l| l.storage_handle.clone()).collect(),
+            total_size: total,
+            chunk_locations: locations,
+            chunk_checksums: chunks.iter().map(|c| c.checksum.clone()).collect(),
+        });
+
+        self.ctx.memory.invalidate(&internal);
+        let metadata = self.ctx.metadata.clone();
+        let str_key = internal.to_string_key();
+        let meta_for_commit = committed_meta;
+        let committed = tokio::task::spawn_blocking(move || {
+            if if_not_exists {
+                metadata.put_block_if_absent(&str_key, &meta_for_commit)
+            } else {
+                metadata.put_block(&str_key, &meta_for_commit).map(|_| true)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::from)?;
+        if !committed {
+            for chunk in rollback_chunks {
+                let mut chunk = chunk;
+                chunk.node_id.clear(); // resolved via endpoint below
+                let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
+            }
+            return Ok(Response::new(pb::CommitDistributedPutResponse {
+                committed: false,
+                message: "already exists".to_string(),
+            }));
+        }
+        Ok(Response::new(pb::CommitDistributedPutResponse {
+            committed: true,
+            message: String::new(),
+        }))
+    }
+
     async fn put_placement_chunk(
         &self,
         req: Request<pb::PutPlacementChunkRequest>,
