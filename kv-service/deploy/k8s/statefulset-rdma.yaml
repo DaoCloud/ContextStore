@@ -1,0 +1,208 @@
+# ContextStore KVService — RDMA-enabled StatefulSet.
+#
+# 与 statefulset.yaml (仅 gRPC) 的区别: 本 manifest 打开 RDMA 数据面所需的全部
+# 宿主机资源. RDMA 数据面绕过 gRPC, 用 RDMA WRITE 直推客户端预注册 buffer,
+# 冷读带宽由磁盘上限决定 (实测 2 节点 4 NVMe 可达 ~25 GiB/s, 而 gRPC ~0.5 GB/s).
+#
+# 每个 RDMA pod 依赖四项宿主机能力, 缺一不可:
+#
+#   1. RDMA 设备可见 —— hostNetwork + /dev/infiniband 挂载 (下方默认), 或改用
+#      SR-IOV / macvlan 二级网卡 (Multus) + k8s-rdma-shared-dev-plugin 的
+#      rdma/hca 资源 (见文末注释).
+#   2. 锁页内存 —— slab 启动即 ibv_reg_mr 8GB, 需要 IPC_LOCK capability;
+#      memlock ulimit 由容器运行时放开 (privileged 或 runtime 配置).
+#   3. HugePages —— slab mmap 优先 MAP_HUGETLB, 宿主机需预留 2Mi hugepages
+#      (kubectl describe node 查看 hugepages-2Mi 容量; sysctl vm.nr_hugepages).
+#      分配失败会自动降级普通页, 性能略降但可用.
+#   4. io_uring —— tier_b executor 需要运行时 seccomp 放行 io_uring 系统调用
+#      (下方 seccompProfile: Unconfined). 受限运行时把 io_executor.kind 改
+#      "tier_a" (线程池 O_DIRECT), 冷读吞吐下降.
+#
+# RoCE v2 说明: GID 从承载 IP 派生. hostNetwork 下 pod IP = 宿主机 IP, 服务端
+# CS_RDMA_DEVICES 里的 listen IP 与 RDMA GID 天然一致, 客户端 gid-index 3
+# (RoCE v2 IPv4) 直接可用 —— 这是选择 hostNetwork 而非 overlay 的原因.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: contextstore-kv-rdma
+  labels:
+    app: contextstore-kv-rdma
+spec:
+  serviceName: contextstore-kv-rdma
+  replicas: 2
+  selector:
+    matchLabels:
+      app: contextstore-kv-rdma
+  template:
+    metadata:
+      labels:
+        app: contextstore-kv-rdma
+    spec:
+      # RDMA NIC / NVMe 是节点资源: 一节点一 pod.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["contextstore-kv-rdma"]
+              topologyKey: kubernetes.io/hostname
+        # 只调度到有 RDMA NIC 的节点: 用 label 标注, 例如
+        #   kubectl label node <node> contextstore.io/rdma=true
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: contextstore.io/rdma
+                    operator: In
+                    values: ["true"]
+      # hostNetwork: RDMA listener 直接绑宿主机 IP, RoCE GID 与 advertise 地址一致.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: kv-service
+          image: contextstore/kv-service:latest
+          imagePullPolicy: IfNotPresent
+          # HOST_IP 注入后在 CS_RDMA_DEVICES 中用 $(HOST_IP) 引用展开,
+          # 每个 pod 自动 advertise 本节点地址.
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # 格式: <ibv设备名>:<listen_ip>:<tcp控制端口>[,更多NIC]
+            # 设备名按节点实际 HCA 调整 (ibdev2netdev 查看).
+            - name: CS_RDMA_DEVICES
+              value: "mlx5_1:$(HOST_IP):50053"
+          ports:
+            - containerPort: 50051
+              name: grpc
+            - containerPort: 50053
+              name: rdma-ctl
+          securityContext:
+            capabilities:
+              add:
+                # ibv_reg_mr 锁页 (slab 8GB + 客户端 MR)
+                - IPC_LOCK
+            # io_uring: RuntimeDefault seccomp 在部分运行时拦截 io_uring_setup.
+            # 收紧方案: 自定义 profile 放行 io_uring_{setup,enter,register}.
+            seccompProfile:
+              type: Unconfined
+          volumeMounts:
+            - name: config
+              mountPath: /etc/contextstore
+              readOnly: true
+            - name: infiniband
+              mountPath: /dev/infiniband
+            - name: hugepages
+              mountPath: /dev/hugepages
+            - name: nvme-0
+              mountPath: /data/nvme0
+            - name: nvme-1
+              mountPath: /data/nvme1
+          resources:
+            requests:
+              memory: "24Gi"
+              cpu: "8"
+              hugepages-2Mi: "10Gi"   # slab 8GB + 余量; 宿主机需预留
+            limits:
+              memory: "24Gi"
+              cpu: "16"
+              hugepages-2Mi: "10Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 50053            # RDMA 控制面就绪 = slab 注册完成
+            initialDelaySeconds: 10  # 8GB ibv_reg_mr 需要数秒
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: contextstore-kv-rdma-config
+        # RDMA verbs 设备节点. 配合 IPC_LOCK 即可, 无需 privileged.
+        # (设备 cgroup 拦截时的备选: securityContext.privileged: true,
+        #  或部署 k8s-rdma-shared-dev-plugin 并请求 rdma/hca 资源, 见文末.)
+        - name: infiniband
+          hostPath: {path: /dev/infiniband, type: Directory}
+        - name: hugepages
+          emptyDir:
+            medium: HugePages-2Mi
+        - name: nvme-0
+          hostPath: {path: /mnt/contextstore/nvme0, type: Directory}
+        - name: nvme-1
+          hostPath: {path: /mnt/contextstore/nvme1, type: Directory}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: contextstore-kv-rdma
+spec:
+  clusterIP: None
+  selector:
+    app: contextstore-kv-rdma
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: contextstore-kv-rdma-config
+data:
+  server.toml: |
+    [api]
+    listen = "0.0.0.0:50051"
+    max_connections = 2000
+
+    [storage]
+    devices = ["/data/nvme0", "/data/nvme1"]
+    data_subdir = "data"
+    striping_threshold = 268435456
+    striping_chunk_size = 67108864
+    # rdma_stream_chunk_size 默认 4MB (实测甜点), 无需显式配置.
+
+    [memory_tier]
+    capacity_mb = 4096
+    slab_size_mb = 64
+    use_pinned_memory = false
+
+    [io_executor]
+    kind = "tier_b"          # io_uring; seccomp 受限运行时改 "tier_a"
+    thread_pool_size = 32
+    io_uring_depth = 256
+
+    [router]
+    strategy = "object_hash"
+
+    [metadata]
+    redis_url = "redis://contextstore-redis:6379/"
+    redis_key_prefix = "contextstore:k8s:"
+    redis_connect_timeout_ms = 1000
+    redis_command_timeout_ms = 1000
+
+    [metrics]
+    enabled = true
+    listen = "0.0.0.0:9090"
+
+    # 多节点 placement (multi-endpoint 直读/直写) 需要 [cluster] 段:
+    # node_id / advertise 因节点而异, hostNetwork 下 ConfigMap 无法逐 pod 渲染.
+    # 两种做法:
+    #   a) 每节点一个 ConfigMap + 按 pod 序号挂载 (kustomize/helm 渲染);
+    #   b) 用 init container 依据 HOST_IP 生成 [cluster] 段追加到 server.toml.
+    # 单节点独立运行 (无 coordinator) 时省略 [cluster] 即可.
+#
+# ── 备选: SR-IOV / rdma-shared-dev-plugin (替代 hostNetwork + hostPath) ──
+# 集群若已部署 Multus + k8s-rdma-shared-dev-plugin, 去掉 hostNetwork 与
+# infiniband hostPath, 在容器 resources 中加:
+#     limits:
+#       rdma/hca_shared_devices_a: 1
+# 并通过 Multus annotation 附加 RoCE 网卡; CS_RDMA_DEVICES 的 IP 改为该
+# 二级网卡地址. GID 表随二级网卡 IP 生成, 客户端 gid-index 仍为 3 (RoCE v2 IPv4).

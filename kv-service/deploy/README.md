@@ -20,7 +20,8 @@ deploy/
 │   │                            ships as part of the main pip package)
 │   └── docker-compose.yml     # single-host compose
 ├── k8s/
-│   └── statefulset.yaml       # StatefulSet + Service + ConfigMap (gRPC path only)
+│   ├── statefulset.yaml       # StatefulSet + Service + ConfigMap (gRPC path only)
+│   └── statefulset-rdma.yaml  # RDMA-enabled variant (hostNetwork + hugepages + IPC_LOCK)
 └── jbof/
     ├── spdk_target.sh         # JBOF side: start SPDK NVMe-oF target
     ├── initiator_connect.sh   # Storage host: attach + mount remote namespaces
@@ -53,26 +54,66 @@ The Dockerfile expects the repository root as its build context (it copies both 
 
 ## Shape 3 — Kubernetes
 
+Two manifests, by data path:
+
+| manifest | data path | typical read BW | host prerequisites |
+|---|---|---|---|
+| `k8s/statefulset.yaml` | gRPC/TCP only | ~0.5 GB/s | none beyond NVMe mounts |
+| `k8s/statefulset-rdma.yaml` | gRPC + RDMA | disk-bound (25 GiB/s-class on 2 nodes x 2 NVMe) | RDMA NIC, hugepages, labeled nodes |
+
+**gRPC-only:**
+
 ```bash
 kubectl apply -f kv-service/deploy/k8s/statefulset.yaml
 kubectl get pods -l app=contextstore-kv
 ```
 
-Edit the ConfigMap section of `statefulset.yaml` (or replace it with a mounted `configs/server.toml`) before applying to a real cluster.
+**RDMA-enabled** — per storage node, once:
+
+```bash
+# 1. Reserve 2Mi hugepages for the 8 GB pre-registered slab (+ headroom)
+echo 5632 > /proc/sys/vm/nr_hugepages        # 11 GiB; persist via sysctl.d
+
+# 2. Verify the RDMA stack: device present and RoCE v2 GID for the host IP
+ibdev2netdev                                  # note the device name (e.g. mlx5_1)
+show_gids | grep v2                           # gid-index 3 = RoCE v2 IPv4
+
+# 3. Label the node so the StatefulSet schedules onto it
+kubectl label node <node> contextstore.io/rdma=true
+```
+
+Then edit `statefulset-rdma.yaml` (HCA device name in `CS_RDMA_DEVICES`,
+NVMe hostPath mounts, Redis URL in the ConfigMap) and apply:
+
+```bash
+kubectl apply -f kv-service/deploy/k8s/statefulset-rdma.yaml
+kubectl get pods -l app=contextstore-kv-rdma
+# readiness gates on the RDMA control port: Ready means the slab is registered
+```
+
+Design notes (also inlined as comments in the manifest):
+
+- **hostNetwork** so the RDMA listener binds the host IP and RoCE v2 GIDs
+  match the advertised address; clients keep using `--gid-index 3`.
+- **IPC_LOCK** capability for `ibv_reg_mr` of the slab; **hugepages-2Mi**
+  resource requests back its `MAP_HUGETLB` allocation (falls back to normal
+  pages with a warning if unavailable).
+- **seccomp Unconfined** because default profiles on some runtimes block
+  io_uring; harden with a custom profile allowing
+  `io_uring_setup/enter/register`, or set `io_executor.kind = "tier_a"`.
+- `/dev/infiniband` is mounted via hostPath; no `privileged` needed. On
+  clusters with Multus + `k8s-rdma-shared-dev-plugin`, swap hostNetwork and
+  the hostPath for an `rdma/hca` resource request and a secondary RoCE NIC
+  (see the comment block at the end of the manifest).
+- Multi-node placement (`[cluster]`, coordinator-routed multi-endpoint
+  reads) needs per-node `node_id`/advertise values: render per-node
+  ConfigMaps with kustomize/helm, or generate the `[cluster]` section in an
+  init container from `HOST_IP`. Without `[cluster]` each pod serves
+  standalone.
+
 The manifest expects Redis to be reachable at the URL configured in the
 `[metadata]` section; deploy Redis separately or point the ConfigMap at an
 existing Redis service.
-
-**Scope: the manifest deploys the gRPC/TCP data path only.** The RDMA data
-path is not yet wired for Kubernetes — enabling it requires host RDMA device
-access (`hostNetwork` or a secondary RDMA CNI such as Multus + SR-IOV /
-macvlan with RoCE), `IPC_LOCK` capability plus hugepage requests for the
-pre-registered slab (`hugepages-2Mi`/`1Gi` resources), and `CS_RDMA_DEVICES`
-pointing at the pod-visible device/IP. io_uring (`kind = "tier_b"`) also
-requires a container runtime/seccomp profile that permits the io_uring
-syscalls; on restricted runtimes fall back to `kind = "tier_a"`. Until an
-RDMA-enabled manifest lands, use the bare-metal toolkit for
-performance-critical deployments.
 
 ---
 
