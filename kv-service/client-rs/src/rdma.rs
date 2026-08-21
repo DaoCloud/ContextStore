@@ -30,6 +30,10 @@ const MSG_PUT_COMMIT: u8 = 6;
 const MSG_PUT_RESP: u8 = 7;
 const MSG_GET_DESCRIPTOR_REQ: u8 = 8;
 const MSG_PUT_IF_ABSENT_REQ: u8 = 9;
+/// PUT carrying options (TTL). Requires a server that understands tag 10/11;
+/// callers pass ttl_seconds=0 to stay on the legacy tags for compatibility.
+const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
+const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
 const MSG_BYE: u8 = 99;
 const PUT_RESULT_FAILED: u8 = 0;
 const PUT_RESULT_STORED: u8 = 1;
@@ -370,12 +374,28 @@ impl RdmaClient {
         offset: usize,
         size: usize,
     ) -> Result<()> {
+        self.put_from_with_ttl(namespace, object_key, buffer, offset, size, 0)
+    }
+
+    /// Like [`Self::put_from`] but stamps a TTL (seconds; 0 = no expiry) on
+    /// the stored object. Requires a server that understands the
+    /// with-options PUT tags.
+    pub fn put_from_with_ttl(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        buffer: &RegisteredBuffer<'_>,
+        offset: usize,
+        size: usize,
+        ttl_seconds: i64,
+    ) -> Result<()> {
         if !self.put_key_from(
             &canonical_key(namespace, object_key),
             buffer,
             offset,
             size,
             false,
+            ttl_seconds,
         )? {
             return Err(anyhow!("server rejected RDMA PUT"));
         }
@@ -394,12 +414,28 @@ impl RdmaClient {
         offset: usize,
         size: usize,
     ) -> Result<bool> {
+        self.put_if_absent_from_with_ttl(namespace, object_key, buffer, offset, size, 0)
+    }
+
+    /// Like [`Self::put_if_absent_from`] but stamps a TTL (seconds; 0 = no
+    /// expiry) on the stored object. Requires a server that understands the
+    /// with-options PUT tags.
+    pub fn put_if_absent_from_with_ttl(
+        &mut self,
+        namespace: &str,
+        object_key: &str,
+        buffer: &RegisteredBuffer<'_>,
+        offset: usize,
+        size: usize,
+        ttl_seconds: i64,
+    ) -> Result<bool> {
         self.put_key_from(
             &canonical_key(namespace, object_key),
             buffer,
             offset,
             size,
             true,
+            ttl_seconds,
         )
     }
 
@@ -410,14 +446,18 @@ impl RdmaClient {
         offset: usize,
         size: usize,
         if_not_exists: bool,
+        ttl_seconds: i64,
     ) -> Result<bool> {
         let (src_addr, lkey) = buffer.source(offset, size)?;
-        let message = if if_not_exists {
-            MSG_PUT_IF_ABSENT_REQ
-        } else {
-            MSG_PUT_REQ
+        // ttl_seconds=0 keeps the legacy tags so old servers stay compatible;
+        // a non-zero TTL uses the with-options tags (new servers only).
+        let message = match (if_not_exists, ttl_seconds != 0) {
+            (true, true) => MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ,
+            (true, false) => MSG_PUT_IF_ABSENT_REQ,
+            (false, true) => MSG_PUT_WITH_OPTIONS_REQ,
+            (false, false) => MSG_PUT_REQ,
         };
-        let request = build_put_request(message, key, size as u64)?;
+        let request = build_put_request(message, key, size as u64, ttl_seconds)?;
         self.stream.write_all(&request)?;
         self.stream.flush()?;
 
@@ -728,11 +768,16 @@ fn build_descriptor_get_request(
     Ok(request)
 }
 
-fn build_put_request(message: u8, key: &str, size: u64) -> Result<Vec<u8>> {
-    let mut request = Vec::with_capacity(1 + 2 + key.len() + 8);
+fn build_put_request(message: u8, key: &str, size: u64, ttl_seconds: i64) -> Result<Vec<u8>> {
+    let with_options =
+        message == MSG_PUT_WITH_OPTIONS_REQ || message == MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ;
+    let mut request = Vec::with_capacity(1 + 2 + key.len() + 8 + 8);
     request.push(message);
     push_string(&mut request, key, "key")?;
     request.extend_from_slice(&size.to_le_bytes());
+    if with_options {
+        request.extend_from_slice(&ttl_seconds.to_le_bytes());
+    }
     Ok(request)
 }
 

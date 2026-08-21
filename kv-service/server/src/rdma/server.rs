@@ -21,8 +21,9 @@ use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
     self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, MSG_GET_DESCRIPTOR_REQ,
-    MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_REQ, PUT_RESULT_EXISTS,
-    PUT_RESULT_FAILED, PUT_RESULT_STORED,
+    MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ,
+    MSG_PUT_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
+    PUT_RESULT_STORED,
 };
 use crate::router::ObjectKey;
 use crate::KVServiceContext;
@@ -283,8 +284,16 @@ fn handle_client(
             return Ok(());
         }
         // ===== PUT data path =====
-        if tag == MSG_PUT_REQ || tag == MSG_PUT_IF_ABSENT_REQ {
-            handle_put(&mut stream, &kv_ctx, nic_idx, tag == MSG_PUT_IF_ABSENT_REQ)?;
+        if tag == MSG_PUT_REQ
+            || tag == MSG_PUT_IF_ABSENT_REQ
+            || tag == MSG_PUT_WITH_OPTIONS_REQ
+            || tag == MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ
+        {
+            let if_not_exists =
+                tag == MSG_PUT_IF_ABSENT_REQ || tag == MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ;
+            let with_options =
+                tag == MSG_PUT_WITH_OPTIONS_REQ || tag == MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ;
+            handle_put(&mut stream, &kv_ctx, nic_idx, if_not_exists, with_options)?;
             continue;
         }
         if tag == MSG_GET_DESCRIPTOR_REQ {
@@ -1101,9 +1110,10 @@ fn handle_put(
     kv_ctx: &Arc<KVServiceContext>,
     nic_idx: usize,
     if_not_exists: bool,
+    with_options: bool,
 ) -> Result<()> {
     let t_recv_start = std::time::Instant::now();
-    let put_req = wire::recv_put_req_body(stream)?;
+    let put_req = wire::recv_put_req_body(stream, with_options)?;
     let t_recv_done = std::time::Instant::now();
 
     let size = put_req.size as usize;
@@ -1215,7 +1225,9 @@ fn handle_put(
         layout_version: 1,
         created_at: chrono::Utc::now().timestamp(),
         last_accessed_at: chrono::Utc::now().timestamp(),
-        ttl_seconds: 0,
+        // TTL from the with-options wire body (0 = no expiry); ContextStore's
+        // TTL lifecycle reaps expired objects the same way the gRPC path does.
+        ttl_seconds: put_req.ttl_seconds.max(0),
         num_tokens: 0,
         num_layers: 1,
         dtype: "uint8".to_string(),

@@ -42,6 +42,14 @@ pub const MSG_GET_DESCRIPTOR_REQ: u8 = 8;
 /// Immutable RDMA PUT. It uses the same body as `MSG_PUT_REQ`, but the server
 /// commits metadata with `SET NX` and reports an existing object distinctly.
 pub const MSG_PUT_IF_ABSENT_REQ: u8 = 9;
+/// PUT with options (currently: TTL). Body = the classic PutReq body plus a
+/// trailing options block; see `PutReqMsg::ttl_seconds`. A separate tag keeps
+/// old servers rejecting it loudly (unknown tag) instead of misparsing, and
+/// old clients keep sending tag 4/9 which new servers still accept.
+pub const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
+/// Immutable PUT with options. `MSG_PUT_WITH_OPTIONS_REQ`'s SET-NX variant,
+/// mirroring the tag-4 / tag-9 pairing.
+pub const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
 const MSG_BYE: u8 = 99;
 
 /// Synchronous read of exactly N bytes (TCP control plane messages are small; blocking read is fine).
@@ -293,10 +301,14 @@ pub fn send_bye(stream: &mut TcpStream) -> Result<()> {
 // ===================== PUT data plane =====================
 
 /// Put request message (client → server)
-/// wire: tag(1) + key_len(2) + key + size(8)
+/// wire (tag 4/9):   tag(1) + key_len(2) + key + size(8)
+/// wire (tag 10/11): tag(1) + key_len(2) + key + size(8) + ttl_seconds(8)
 pub struct PutReqMsg {
     pub key: String,
     pub size: u64,
+    /// Object lifetime in seconds; 0 = no expiry. Only carried by the
+    /// with-options tags — the legacy tags imply 0.
+    pub ttl_seconds: i64,
 }
 
 pub fn send_put_req(stream: &mut TcpStream, msg: &PutReqMsg) -> Result<()> {
@@ -304,11 +316,19 @@ pub fn send_put_req(stream: &mut TcpStream, msg: &PutReqMsg) -> Result<()> {
     if key_bytes.len() > 65535 {
         return Err(anyhow!("key too long: {}", key_bytes.len()));
     }
-    let mut frame = Vec::with_capacity(1 + 2 + key_bytes.len() + 8);
-    frame.push(MSG_PUT_REQ);
+    let with_options = msg.ttl_seconds != 0;
+    let mut frame = Vec::with_capacity(1 + 2 + key_bytes.len() + 8 + 8);
+    frame.push(if with_options {
+        MSG_PUT_WITH_OPTIONS_REQ
+    } else {
+        MSG_PUT_REQ
+    });
     frame.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
     frame.extend_from_slice(key_bytes);
     frame.extend_from_slice(&msg.size.to_le_bytes());
+    if with_options {
+        frame.extend_from_slice(&msg.ttl_seconds.to_le_bytes());
+    }
     stream
         .write_all(&frame)
         .map_err(|e| anyhow!("tcp write put_req failed: {}", e))?;
@@ -316,15 +336,26 @@ pub fn send_put_req(stream: &mut TcpStream, msg: &PutReqMsg) -> Result<()> {
     Ok(())
 }
 
-/// Receive PutReq body (the tag has already been consumed by the caller)
-pub fn recv_put_req_body(stream: &mut TcpStream) -> Result<PutReqMsg> {
+/// Receive PutReq body (the tag has already been consumed by the caller).
+/// `with_options` selects the extended body carrying ttl_seconds.
+pub fn recv_put_req_body(stream: &mut TcpStream, with_options: bool) -> Result<PutReqMsg> {
     let key_len_bytes = read_exact(stream, 2)?;
     let key_len = u16::from_le_bytes([key_len_bytes[0], key_len_bytes[1]]) as usize;
     let key_bytes = read_exact(stream, key_len)?;
     let key = String::from_utf8(key_bytes).map_err(|e| anyhow!("key utf8: {}", e))?;
     let size_b = read_exact(stream, 8)?;
     let size = u64::from_le_bytes(size_b.try_into().unwrap());
-    Ok(PutReqMsg { key, size })
+    let ttl_seconds = if with_options {
+        let ttl_b = read_exact(stream, 8)?;
+        i64::from_le_bytes(ttl_b.try_into().unwrap())
+    } else {
+        0
+    };
+    Ok(PutReqMsg {
+        key,
+        size,
+        ttl_seconds,
+    })
 }
 
 /// Put Ready response (server → client): tells the client where to WRITE the data
@@ -425,3 +456,55 @@ pub fn recv_put_resp(stream: &mut TcpStream) -> Result<PutRespMsg> {
 // Make the Rust compiler accept GID appearing in the public API
 #[allow(dead_code)]
 fn _assert_gid_used(_g: ibv_gid) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::net::{TcpListener, TcpStream};
+
+    /// Round-trip a PutReq frame through a loopback socket with the given
+    /// send-side message and receive-side options flag.
+    fn roundtrip(msg: &PutReqMsg, with_options: bool) -> PutReqMsg {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        send_put_req(&mut client, msg).unwrap();
+        client.flush().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let tag = read_exact(&mut server, 1).unwrap()[0];
+        let expected_tag = if with_options {
+            MSG_PUT_WITH_OPTIONS_REQ
+        } else {
+            MSG_PUT_REQ
+        };
+        assert_eq!(tag, expected_tag, "tag selects the legacy/options body");
+        recv_put_req_body(&mut server, with_options).unwrap()
+    }
+
+    #[test]
+    fn put_req_without_ttl_uses_legacy_tag_and_body() {
+        let msg = PutReqMsg {
+            key: "ns/obj".into(),
+            size: 4096,
+            ttl_seconds: 0,
+        };
+        let parsed = roundtrip(&msg, false);
+        assert_eq!(parsed.key, "ns/obj");
+        assert_eq!(parsed.size, 4096);
+        assert_eq!(parsed.ttl_seconds, 0);
+    }
+
+    #[test]
+    fn put_req_with_ttl_round_trips_through_options_body() {
+        let msg = PutReqMsg {
+            key: "ns/obj".into(),
+            size: 1 << 30,
+            ttl_seconds: 90_000,
+        };
+        let parsed = roundtrip(&msg, true);
+        assert_eq!(parsed.key, "ns/obj");
+        assert_eq!(parsed.size, 1 << 30);
+        assert_eq!(parsed.ttl_seconds, 90_000);
+    }
+}
