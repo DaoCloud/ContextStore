@@ -1231,14 +1231,27 @@ fn serve_get_stripes(
                     writes_posted += 1;
                     outstanding += 1;
                     total += bytes as u64;
-                    if outstanding == COMPLETION_WINDOW {
-                        let poll_start = std::time::Instant::now();
-                        if let Err(error) = RcQp::poll_n(client_cq, outstanding) {
-                            first_error = Some(format!("poll RDMA completion window: {error}"));
+                    // 机会式非阻塞收割: 每次 post 后顺手清已完成的 CQE.
+                    // 旧逻辑凑满窗口才 poll_n(64) 阻塞等全部完成, 期间不消费盘 IO
+                    // 完成事件 → 流水线断流. 现在仅当 SQ 接近满时才阻塞等 1 个腾位.
+                    let poll_start = std::time::Instant::now();
+                    match RcQp::poll_available(client_cq, outstanding) {
+                        Ok(n) => outstanding -= n,
+                        Err(error) => {
+                            first_error =
+                                Some(format!("poll RDMA completion window: {error}"))
                         }
-                        poll_us += poll_start.elapsed().as_micros() as u64;
-                        outstanding = 0;
                     }
+                    while first_error.is_none() && outstanding >= COMPLETION_WINDOW {
+                        match RcQp::poll_n(client_cq, 1) {
+                            Ok(()) => outstanding -= 1,
+                            Err(error) => {
+                                first_error =
+                                    Some(format!("poll RDMA completion window: {error}"))
+                            }
+                        }
+                    }
+                    poll_us += poll_start.elapsed().as_micros() as u64;
                 }
             }
             Ok(bytes) if first_error.is_none() => {
