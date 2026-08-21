@@ -103,6 +103,13 @@ KVService reads one TOML config file and requires a reachable Redis metadata
 store. See [`kv-service/configs/README.md`](kv-service/configs/README.md) for
 the config file format and examples.
 
+For **production installation on storage nodes** (immutable release
+directories, atomic activation, hardened systemd unit, post-upgrade acceptance
+checklist), use the versioned toolkit at
+[`deploy/baremetal/`](deploy/baremetal/README.md). Container and JBOF/NVMe-oF
+topologies are covered in
+[`kv-service/deploy/README.md`](kv-service/deploy/README.md).
+
 `make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
 metrics. It produces the server, Rust client SDK, and RDMA C ABI under
 `target/release/`. Before building, it prints the selected profile, features,
