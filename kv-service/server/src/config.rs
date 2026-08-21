@@ -116,7 +116,10 @@ fn default_striping_chunk_size() -> u64 {
 }
 
 fn default_rdma_stream_chunk_size() -> u64 {
-    8 * 1024 * 1024 // 8 MB
+    // 4 MB: 实测甜点. 8 MB 每盘在飞请求不足 (2 节点 4 NVMe 冷读 21.7 GiB/s),
+    // 4 MB 翻倍并发让盘队列吃满 (25.0 GiB/s, +15%); 2 MB 无进一步收益,
+    // 16 MB 反而回退. 依赖 stream 路径的 io_uring 聚合批量提交.
+    4 * 1024 * 1024
 }
 
 impl Default for StorageConfig {

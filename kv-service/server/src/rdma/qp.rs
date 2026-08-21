@@ -283,6 +283,33 @@ impl RcQp {
             }
         }
     }
+
+    /// 非阻塞收割: poll 当前已完成的 CQE (最多 `max`), 立即返回收到的数量.
+    /// 用于流水线中的机会式回收 — post 间隙顺手清 CQ, 避免凑满窗口后长阻塞.
+    pub fn poll_available(cq: NonNull<ibv_cq>, max: usize) -> Result<usize> {
+        unsafe {
+            let cap = max.max(1);
+            let mut wcs: Vec<ibv_wc> = Vec::with_capacity(cap);
+            for _ in 0..cap {
+                wcs.push(std::mem::zeroed());
+            }
+            let n = ibv_poll_cq(cq.as_ptr(), cap as i32, wcs.as_mut_ptr());
+            if n < 0 {
+                return Err(anyhow!("ibv_poll_cq error"));
+            }
+            for wc in wcs.iter().take(n as usize) {
+                if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
+                    return Err(anyhow!(
+                        "WR {} failed: status={} ({})",
+                        wc.wr_id,
+                        wc.status,
+                        wc_status_str(wc.status),
+                    ));
+                }
+            }
+            Ok(n as usize)
+        }
+    }
 }
 
 fn wc_status_str(status: u32) -> &'static str {

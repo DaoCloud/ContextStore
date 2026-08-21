@@ -26,6 +26,10 @@ struct Cli {
     /// Log level (trace/debug/info/warn/error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Validate the configuration and exit without starting listeners
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -54,6 +58,10 @@ async fn main() -> anyhow::Result<()> {
         config.memory_tier.capacity_mb,
         config.io_executor.kind,
     );
+    if cli.check_config {
+        info!("configuration validation succeeded");
+        return Ok(());
+    }
 
     // Optional: initialize GDS (only when compiled with --features gds and enabled in config)
     #[cfg(feature = "gds")]

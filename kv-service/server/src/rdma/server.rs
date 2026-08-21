@@ -21,10 +21,9 @@ use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
     self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, PutStripeLocation,
-    PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ,
-    MSG_PUT_STRIPES_REQ,
-    MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ,
-    MSG_PUT_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
+    PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ, MSG_GET_REQ,
+    MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ, MSG_PUT_REQ,
+    MSG_PUT_STRIPES_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
     PUT_RESULT_STORED,
 };
 use crate::router::ObjectKey;
@@ -382,9 +381,26 @@ fn handle_client(
                 // On failure, fall back to the old serve_get_fallback (per-chunk reg_mr,
                 // compatibility safety net).
                 let t_storage_start = std::time::Instant::now();
-                let slab_path_result = try_serve_get_via_slab(
-                    &kv_ctx, &qp, client_cq, &kv_key, dst_addr, dst_rkey, max_size, nic_idx,
-                );
+                let active_meta = kv_ctx.metadata.get_block(&kv_key.to_string_key())?;
+                let slab_path_result = match active_meta {
+                    Some(meta) if placement_spans_multiple_nodes(&meta) => {
+                        tracing::warn!(
+                            event = "rdma_get_multi_endpoint_required",
+                            key = %kv_key.to_string_key(),
+                            "legacy single-endpoint RDMA GET rejected for distributed placement; use placement lookup and stripe-subset GET"
+                        );
+                        Ok(None)
+                    }
+                    Some(meta) if meta.is_expired() => {
+                        kv_ctx.storage.delete_if_expired(&kv_key, &meta)?;
+                        Ok(None)
+                    }
+                    Some(meta) => try_serve_get_via_slab_with_meta(
+                        &kv_ctx, &qp, client_cq, &kv_key, &meta, dst_addr, dst_rkey, max_size,
+                        nic_idx,
+                    ),
+                    None => Ok(None),
+                };
                 let storage_get_us = t_storage_start.elapsed().as_micros() as u64;
                 fb_storage_get_us = storage_get_us;
 
@@ -656,11 +672,10 @@ fn serve_get_fallback(
 /// **RDMA GET cache-miss fast path** — perfectly symmetric with the PUT path (zero reg_mr).
 ///
 /// Flow:
-/// 1. Query metadata for BlockMeta (get the real size + striping info).
-/// 2. slab.alloc(size) → SlabExtent (4K aligned, pre-registered MR).
-/// 3. storage.get_into_ptr(extent.ptr) → O_DIRECT pread straight into slab (zero intermediate buffer).
-/// 4. Post RDMA WRITE using the slab's pre-registered lkey (zero reg_mr!).
-/// 5. **insert_chunks_from_slab injects into L1 cache** → subsequent GETs hit the slab fast path immediately.
+/// 1. slab.alloc(size) → SlabExtent (4K aligned, pre-registered MR).
+/// 2. storage.get_into_ptr(extent.ptr) → O_DIRECT pread straight into slab (zero intermediate buffer).
+/// 3. Post RDMA WRITE using the slab's pre-registered lkey (zero reg_mr!).
+/// 4. **insert_chunks_from_slab injects into L1 cache** → subsequent GETs hit the slab fast path immediately.
 ///
 /// Difference vs. the old serve_get_fallback:
 /// - Old: read into heap × 8 → 8× ibv_reg_mr (~33ms) → 8 SQEs post_write → poll
@@ -668,32 +683,8 @@ fn serve_get_fallback(
 ///
 /// Returns:
 /// - Ok(Some((bytes, post_us, poll_us))): RDMA WRITE succeeded
-/// - Ok(None): key does not exist (metadata miss)
+/// - Ok(None): the supplied metadata became unavailable or expired
 /// - Err(e): slab full / I/O error / protocol error → caller falls back to fallback
-fn try_serve_get_via_slab(
-    kv_ctx: &Arc<KVServiceContext>,
-    qp: &RcQp,
-    client_cq: NonNull<rdma_sys::ibv_cq>,
-    kv_key: &ObjectKey,
-    dst_addr: u64,
-    dst_rkey: u32,
-    max_size: u64,
-    nic_idx: usize,
-) -> Result<Option<(u64, u64, u64)>> {
-    // 1. Look up metadata to get size
-    let meta = match kv_ctx.metadata.get_block(&kv_key.to_string_key())? {
-        Some(m) => m,
-        None => return Ok(None),
-    };
-    if meta.is_expired() {
-        kv_ctx.storage.delete_if_expired(kv_key, &meta)?;
-        return Ok(None);
-    }
-    try_serve_get_via_slab_with_meta(
-        kv_ctx, qp, client_cq, kv_key, &meta, dst_addr, dst_rkey, max_size, nic_idx,
-    )
-}
-
 fn try_serve_get_via_slab_with_meta(
     kv_ctx: &Arc<KVServiceContext>,
     qp: &RcQp,
@@ -808,10 +799,8 @@ fn try_serve_get_via_slab_with_meta(
                     if outstanding_writes == RDMA_WRITE_COMPLETION_WINDOW {
                         let poll_start = std::time::Instant::now();
                         if let Err(error) = RcQp::poll_n(client_cq, outstanding_writes) {
-                            had_error = Some(format!(
-                                "poll RDMA write completion window: {}",
-                                error
-                            ));
+                            had_error =
+                                Some(format!("poll RDMA write completion window: {}", error));
                         }
                         poll_us += poll_start.elapsed().as_micros() as u64;
                         outstanding_writes = 0;
@@ -975,6 +964,135 @@ fn descriptor_meta_from_req(
     Ok(meta)
 }
 
+fn chunk_is_local(ctx: &KVServiceContext, location: &crate::metadata::ChunkLocation) -> bool {
+    let local_node_id = std::env::var("CS_NODE_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ctx.config.cluster.node_id.clone());
+    let local_grpc_endpoint = std::env::var("CS_GRPC_ADVERTISE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ctx.config.cluster.grpc_advertise.clone());
+    let local_rdma_endpoint = std::env::var("CS_RDMA_ADVERTISE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ctx.config.cluster.rdma_advertise.clone());
+
+    (!local_node_id.is_empty() && location.node_id == local_node_id)
+        || (!local_grpc_endpoint.is_empty() && location.grpc_endpoint == local_grpc_endpoint)
+        || (!local_rdma_endpoint.is_empty() && location.rdma_endpoint == local_rdma_endpoint)
+}
+
+fn placement_spans_multiple_nodes(meta: &BlockMeta) -> bool {
+    let Some(striping) = meta.striping.as_ref() else {
+        return false;
+    };
+    let mut first_identity: Option<&str> = None;
+    for location in &striping.chunk_locations {
+        let identity = if !location.node_id.is_empty() {
+            location.node_id.as_str()
+        } else if !location.rdma_endpoint.is_empty() {
+            location.rdma_endpoint.as_str()
+        } else {
+            location.grpc_endpoint.as_str()
+        };
+        if identity.is_empty() {
+            continue;
+        }
+        match first_identity {
+            Some(first) if first != identity => return true,
+            None => first_identity = Some(identity),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn allocate_subset_staging(kv_ctx: &KVServiceContext, size: usize) -> Result<SlabExtent> {
+    let slab = kv_ctx
+        .memory
+        .rdma_slab_get()
+        .ok_or_else(|| anyhow!("RDMA slab is unavailable"))?;
+    if size > slab.capacity() {
+        return Err(anyhow!(
+            "RDMA subset staging requires {} bytes but slab capacity is {}",
+            size,
+            slab.capacity()
+        ));
+    }
+    if let Some(extent) = slab.alloc(size) {
+        return Ok(extent);
+    }
+
+    let mut evict_multiplier = 2usize;
+    for _ in 0..5 {
+        let evict_target = size.saturating_mul(evict_multiplier).min(slab.capacity());
+        kv_ctx
+            .memory
+            .evict_chunks_cache_to_free(evict_target, slab.capacity());
+        if let Some(extent) = slab.alloc(size) {
+            return Ok(extent);
+        }
+        evict_multiplier = evict_multiplier.saturating_mul(2);
+    }
+    Err(anyhow!(
+        "RDMA subset staging allocation failed after cache eviction (need {} bytes)",
+        size
+    ))
+}
+
+fn serve_get_stripes_fallback(
+    kv_ctx: &Arc<KVServiceContext>,
+    rdma: &Arc<RdmaContext>,
+    qp: &RcQp,
+    client_cq: NonNull<rdma_sys::ibv_cq>,
+    striping: &StripingInfo,
+    req: &DescriptorGetReqMsg,
+) -> Result<(bool, u64, u32)> {
+    let indices = req
+        .stripes
+        .iter()
+        .map(|index| *index as usize)
+        .collect::<Vec<_>>();
+    let segments = match kv_ctx.storage.read_striped_chunks_at(striping, &indices) {
+        Ok(segments) => segments,
+        Err(error) => {
+            tracing::warn!(error = %error, "stripe-subset fallback read failed");
+            return Ok((false, 0, 0));
+        }
+    };
+
+    let mut total = 0u64;
+    let mut mrs = Vec::with_capacity(segments.len());
+    for (write_index, (stripe_index, segment)) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        let mr = unsafe {
+            rdma.register_mr_raw(
+                segment.as_ptr() as *mut u8,
+                segment.len(),
+                ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
+            )?
+        };
+        qp.post_write(
+            write_index as u64,
+            mr.addr,
+            mr.lkey,
+            req.dst_addr + *stripe_index as u64 * striping.chunk_size,
+            req.dst_rkey,
+            segment.len() as u32,
+            write_index + 1 == segments.len(),
+        )?;
+        total += segment.len() as u64;
+        mrs.push(mr);
+    }
+    if !mrs.is_empty() {
+        RcQp::poll_n(client_cq, 1)?;
+    }
+    Ok((true, total, segments.len() as u32))
+}
+
 /// Serve a stripe-subset descriptor GET (tag 12): read each requested stripe
 /// from local storage and RDMA-WRITE it at `dst_addr + index * chunk_size`.
 ///
@@ -989,8 +1107,8 @@ fn serve_get_stripes(
     kv_key: &ObjectKey,
     active_meta: &crate::metadata::BlockMeta,
     req: &DescriptorGetReqMsg,
+    nic_idx: usize,
 ) -> Result<(bool, u64, u32)> {
-    let _ = kv_key;
     let Some(striping) = active_meta.striping.as_ref() else {
         tracing::warn!("stripe-subset GET on a non-striped object");
         return Ok((false, 0, 0));
@@ -999,14 +1117,24 @@ fn serve_get_stripes(
     if chunk_size == 0 {
         return Ok((false, 0, 0));
     }
-    // Validate all indices and the destination window before any I/O.
-    for &idx in &req.stripes {
+    let locations_are_complete = striping.chunk_locations.len() == striping.chunk_paths.len();
+    let mut staged_bytes = 0usize;
+    // Validate ownership, indices, and the destination window before any I/O.
+    for (position, &idx) in req.stripes.iter().enumerate() {
+        if req.stripes[..position].contains(&idx) {
+            tracing::warn!(
+                stripe_index = idx,
+                "stripe-subset GET contains a duplicate index"
+            );
+            return Ok((false, 0, 0));
+        }
         let idx = idx as usize;
         if idx >= striping.chunk_paths.len() {
             tracing::warn!("stripe-subset GET: index {} out of range", idx);
             return Ok((false, 0, 0));
         }
-        let end = (idx as u64) * chunk_size + chunk_size.min(striping.total_size - (idx as u64) * chunk_size);
+        let end = (idx as u64) * chunk_size
+            + chunk_size.min(striping.total_size - (idx as u64) * chunk_size);
         if end > req.max_size {
             tracing::warn!(
                 "stripe-subset GET: stripe {} ends at {} beyond client window {}",
@@ -1016,59 +1144,160 @@ fn serve_get_stripes(
             );
             return Ok((false, 0, 0));
         }
+        if locations_are_complete && !chunk_is_local(kv_ctx, &striping.chunk_locations[idx]) {
+            tracing::warn!(
+                event = "rdma_get_stripes_wrong_endpoint",
+                key = %kv_key.to_string_key(),
+                stripe_index = idx,
+                owner_node = %striping.chunk_locations[idx].node_id,
+                owner_endpoint = %striping.chunk_locations[idx].rdma_endpoint,
+                "stripe-subset GET was sent to a node that does not own the stripe"
+            );
+            return Ok((false, 0, 0));
+        }
+        let stripe_offset = idx as u64 * chunk_size;
+        staged_bytes = staged_bytes
+            .checked_add(chunk_size.min(striping.total_size.saturating_sub(stripe_offset)) as usize)
+            .ok_or_else(|| anyhow!("stripe subset staging size overflow"))?;
     }
 
-    // Read the requested stripes from local storage (O_DIRECT pooled path).
-    let mut segments: Vec<(u32, prost::bytes::Bytes)> = Vec::with_capacity(req.stripes.len());
-    for &idx in &req.stripes {
-        match kv_ctx
-            .storage
-            .read_striped_chunk_at(striping, idx as usize)
-        {
-            Ok(seg) => segments.push((idx, seg)),
-            Err(e) => {
-                // Stripe not on this node (or read failed): fail the whole
-                // request; a partial fill would leave silent holes.
-                tracing::warn!("stripe-subset GET: read stripe {} failed: {}", idx, e);
-                return Ok((false, 0, 0));
+    let total_start = std::time::Instant::now();
+    let alloc_start = std::time::Instant::now();
+    let extent = match allocate_subset_staging(kv_ctx, staged_bytes) {
+        Ok(extent) => extent,
+        Err(error) => {
+            tracing::warn!(
+                key = %kv_key.to_string_key(),
+                error = %error,
+                "RDMA stripe-subset slab path unavailable; using registered-buffer fallback"
+            );
+            return serve_get_stripes_fallback(kv_ctx, rdma, qp, client_cq, striping, req);
+        }
+    };
+    let alloc_us = alloc_start.elapsed().as_micros() as u64;
+
+    let indices = req
+        .stripes
+        .iter()
+        .map(|index| *index as usize)
+        .collect::<Vec<_>>();
+    let stream_start = std::time::Instant::now();
+    let stream = match kv_ctx.storage.read_striped_subset_into_ptr_stream(
+        striping,
+        &indices,
+        extent.as_ptr() as *mut u8,
+        extent.capacity_bytes(),
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(
+                "stripe-subset GET: read failed for key {}: {}",
+                kv_key.to_string_key(),
+                error
+            );
+            return Ok((false, 0, 0));
+        }
+    };
+    let stream_setup_us = stream_start.elapsed().as_micros() as u64;
+    let view = extent.view(nic_idx);
+    const COMPLETION_WINDOW: usize = RcQp::MAX_SEND_WR / 2;
+    let mut outstanding = 0usize;
+    let mut writes_posted = 0usize;
+    let mut total = 0u64;
+    let mut poll_us = 0u64;
+    let mut first_io_us = None;
+    let mut last_io_us = 0u64;
+    let mut first_error = None;
+
+    while let Ok((stripe_index, source_offset, object_offset, length, result)) = stream.recv() {
+        let completion_us = stream_start.elapsed().as_micros() as u64;
+        first_io_us.get_or_insert(completion_us);
+        last_io_us = completion_us;
+        match result {
+            Ok(bytes) if bytes == length && first_error.is_none() => {
+                if let Err(error) = qp.post_write(
+                    writes_posted as u64,
+                    view.addr + source_offset as u64,
+                    view.lkey,
+                    req.dst_addr + object_offset as u64,
+                    req.dst_rkey,
+                    length as u32,
+                    true,
+                ) {
+                    first_error = Some(format!(
+                        "post RDMA write for stripe {stripe_index}: {error}"
+                    ));
+                } else {
+                    writes_posted += 1;
+                    outstanding += 1;
+                    total += bytes as u64;
+                    // 机会式非阻塞收割: 每次 post 后顺手清已完成的 CQE.
+                    // 旧逻辑凑满窗口才 poll_n(64) 阻塞等全部完成, 期间不消费盘 IO
+                    // 完成事件 → 流水线断流. 现在仅当 SQ 接近满时才阻塞等 1 个腾位.
+                    let poll_start = std::time::Instant::now();
+                    match RcQp::poll_available(client_cq, outstanding) {
+                        Ok(n) => outstanding -= n,
+                        Err(error) => {
+                            first_error =
+                                Some(format!("poll RDMA completion window: {error}"))
+                        }
+                    }
+                    while first_error.is_none() && outstanding >= COMPLETION_WINDOW {
+                        match RcQp::poll_n(client_cq, 1) {
+                            Ok(()) => outstanding -= 1,
+                            Err(error) => {
+                                first_error =
+                                    Some(format!("poll RDMA completion window: {error}"))
+                            }
+                        }
+                    }
+                    poll_us += poll_start.elapsed().as_micros() as u64;
+                }
             }
+            Ok(bytes) if first_error.is_none() => {
+                first_error = Some(format!(
+                    "stripe {stripe_index} short read: expected {length}, got {bytes}"
+                ));
+            }
+            Err(error) if first_error.is_none() => {
+                first_error = Some(format!("stripe {stripe_index} read failed: {error}"));
+            }
+            _ => {}
         }
     }
 
-    // RDMA WRITE each stripe to its own offset. Register per-segment MRs
-    // (fallback-style); the slab fast path can be layered in later.
-    let n = segments.len();
-    let mut total: u64 = 0;
-    let mut mrs = Vec::with_capacity(n);
-    for (i, (idx, seg)) in segments.iter().enumerate() {
-        if seg.is_empty() {
-            continue;
+    if outstanding > 0 {
+        let poll_start = std::time::Instant::now();
+        let poll_result = RcQp::poll_n(client_cq, outstanding);
+        poll_us += poll_start.elapsed().as_micros() as u64;
+        if let Err(error) = poll_result {
+            first_error.get_or_insert_with(|| format!("poll final RDMA completions: {error}"));
         }
-        let mr = unsafe {
-            rdma.register_mr_raw(
-                seg.as_ptr() as *mut u8,
-                seg.len(),
-                ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
-            )?
-        };
-        let dst = req.dst_addr + (*idx as u64) * chunk_size;
-        let signaled = i + 1 == n;
-        qp.post_write(
-            i as u64,
-            mr.addr,
-            mr.lkey,
-            dst,
-            req.dst_rkey,
-            seg.len() as u32,
-            signaled,
-        )?;
-        total += seg.len() as u64;
-        mrs.push(mr);
     }
-    if !mrs.is_empty() {
-        RcQp::poll_n(client_cq, 1)?;
+    let total_us = total_start.elapsed().as_micros() as u64;
+    tracing::info!(
+        "RDMA_SUBSET_DETAIL key={} bytes={} stripes={} requests={} alloc_us={} stream_setup_us={} first_io_us={} last_io_us={} poll_us={} total_us={}",
+        kv_key.to_string_key(),
+        total,
+        req.stripes.len(),
+        writes_posted,
+        alloc_us,
+        stream_setup_us,
+        first_io_us.unwrap_or(0),
+        last_io_us,
+        poll_us,
+        total_us,
+    );
+
+    if let Some(error) = first_error {
+        tracing::warn!(
+            key = %kv_key.to_string_key(),
+            error = %error,
+            "RDMA stripe-subset stream failed without deleting object metadata"
+        );
+        return Ok((false, 0, 0));
     }
-    Ok((true, total, n as u32))
+    Ok((true, total, req.stripes.len() as u32))
 }
 
 fn handle_descriptor_get(
@@ -1132,8 +1361,16 @@ fn handle_descriptor_get(
     // nodes fill disjoint regions of one client buffer concurrently with no
     // coordinator forwarding.
     if !req.stripes.is_empty() {
-        let (found, bytes_written, num_chunks) =
-            serve_get_stripes(kv_ctx, rdma, qp, client_cq, &kv_key, &active_meta, &req)?;
+        let (found, bytes_written, num_chunks) = serve_get_stripes(
+            kv_ctx,
+            rdma,
+            qp,
+            client_cq,
+            &kv_key,
+            &active_meta,
+            &req,
+            nic_idx,
+        )?;
         wire::send_get_resp(
             stream,
             &GetRespMsg {
@@ -1151,6 +1388,26 @@ fn handle_descriptor_get(
                 stripes = num_chunks,
             );
         }
+        return Ok(());
+    }
+
+    // Legacy descriptor GET asks one endpoint to serve the complete object. A distributed
+    // placement must be split by endpoint first; attempting a local full read would interpret
+    // remote stripes as missing files and could incorrectly invalidate otherwise valid metadata.
+    if placement_spans_multiple_nodes(&active_meta) {
+        tracing::warn!(
+            event = "rdma_get_multi_endpoint_required",
+            key = %kv_key.to_string_key(),
+            "legacy single-endpoint RDMA GET rejected for distributed placement; use placement lookup and stripe-subset GET"
+        );
+        wire::send_get_resp(
+            stream,
+            &GetRespMsg {
+                found: false,
+                bytes_written: 0,
+                num_chunks: 0,
+            },
+        )?;
         return Ok(());
     }
 
@@ -1192,10 +1449,7 @@ fn handle_descriptor_get(
                     "RDMA descriptor GET slab path failed, fallback to per-chunk reg_mr: {}",
                     e
                 );
-                match kv_ctx
-                    .storage
-                    .get_chunks_with_meta(&kv_key, &active_meta)
-                {
+                match kv_ctx.storage.get_chunks_with_meta(&kv_key, &active_meta) {
                     Ok(Some((segments, _meta))) => {
                         let (found, bytes, chunks, _reg_post_us, _poll_us) = serve_get_fallback(
                             rdma,
@@ -1273,7 +1527,11 @@ fn handle_put_stripes(
     }
     for (idx, len) in &req.stripes {
         if *len == 0 || *len > req.chunk_size {
-            tracing::warn!("RDMA stripe PUT rejected: stripe {} has bad len {}", idx, len);
+            tracing::warn!(
+                "RDMA stripe PUT rejected: stripe {} has bad len {}",
+                idx,
+                len
+            );
             return fail(stream);
         }
     }
@@ -1314,9 +1572,8 @@ fn handle_put_stripes(
     let mut offset: usize = 0;
     let mut write_err = false;
     for (idx, len) in &req.stripes {
-        let stripe = unsafe {
-            std::slice::from_raw_parts(extent.as_ptr().add(offset), *len as usize)
-        };
+        let stripe =
+            unsafe { std::slice::from_raw_parts(extent.as_ptr().add(offset), *len as usize) };
         offset += *len as usize;
         // Device rotation uses this node's local ordinal among its own
         // stripes (mirrors the gRPC placement path).
@@ -1363,7 +1620,13 @@ fn handle_put_stripes(
         bytes = total,
         stripes = locations.len(),
     );
-    wire::send_put_stripes_resp(stream, &PutStripesRespMsg { ok: true, stripes: locations })?;
+    wire::send_put_stripes_resp(
+        stream,
+        &PutStripesRespMsg {
+            ok: true,
+            stripes: locations,
+        },
+    )?;
     Ok(())
 }
 
@@ -1602,4 +1865,70 @@ fn handle_put(
 
     // extent already moved into cache (success) or explicitly dropped (failure); nothing to do here
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::ChunkLocation;
+
+    fn striped_meta(node_ids: &[&str]) -> BlockMeta {
+        let chunk_locations = node_ids
+            .iter()
+            .enumerate()
+            .map(|(stripe_index, node_id)| ChunkLocation {
+                stripe_index: stripe_index as u32,
+                node_id: (*node_id).to_string(),
+                grpc_endpoint: format!("{node_id}:50051"),
+                rdma_endpoint: format!("{node_id}:50053"),
+                device_id: (stripe_index % 2) as u32,
+                storage_handle: format!("/data/chunk{stripe_index}.bin"),
+                offset: stripe_index as u64 * 64 * 1024 * 1024,
+                length: 64 * 1024 * 1024,
+                checksum: String::new(),
+            })
+            .collect::<Vec<_>>();
+        BlockMeta {
+            device_id: 0,
+            file_path: String::new(),
+            size: node_ids.len() as u64 * 64 * 1024 * 1024,
+            object_handle: "test-object".to_string(),
+            object_generation: 1,
+            content_etag: "test-etag".to_string(),
+            layout_version: 1,
+            created_at: 0,
+            last_accessed_at: 0,
+            ttl_seconds: 0,
+            num_tokens: 0,
+            num_layers: 0,
+            dtype: "bytes".to_string(),
+            compressed: false,
+            striping: Some(StripingInfo {
+                chunk_size: 64 * 1024 * 1024,
+                chunk_devices: (0..node_ids.len())
+                    .map(|index| (index % 2) as u32)
+                    .collect(),
+                chunk_paths: (0..node_ids.len())
+                    .map(|index| format!("/data/chunk{index}.bin"))
+                    .collect(),
+                total_size: node_ids.len() as u64 * 64 * 1024 * 1024,
+                chunk_locations,
+                chunk_checksums: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn distributed_placement_requires_multi_endpoint_get() {
+        assert!(placement_spans_multiple_nodes(&striped_meta(&[
+            "worker01", "worker02", "worker01", "worker02"
+        ])));
+    }
+
+    #[test]
+    fn local_striped_placement_allows_single_endpoint_get() {
+        assert!(!placement_spans_multiple_nodes(&striped_meta(&[
+            "worker01", "worker01", "worker01", "worker01"
+        ])));
+    }
 }
