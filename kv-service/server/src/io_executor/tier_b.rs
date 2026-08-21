@@ -237,7 +237,16 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
         }
     };
 
-    while let Ok(job) = rx.recv() {
+    // pending: stream 批量聚合时从 channel 排干出的非 stream 任务, 下一轮循环优先处理.
+    let mut pending: Option<RingJob> = None;
+    loop {
+        let job = match pending.take() {
+            Some(j) => j,
+            None => match rx.recv() {
+                Ok(j) => j,
+                Err(_) => break,
+            },
+        };
         match job {
             RingJob::SingleRead { req, resp } => {
                 let r = do_read_one(&mut ring, &req);
@@ -434,13 +443,51 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                 req,
                 completion,
             } => {
+                // **批量聚合**: 单个 stream 请求逐一 submit_and_wait 会把有效队列深度压到 1
+                // (盘 util 假 100%, aqu-size≈0). 这里排干 channel 中已排队的其余 stream 请求,
+                // 合并成一次 io_uring 批量提交, 让 NVMe 真正吃到并发深度.
+                // 上限: 不超过 ring 深度可容纳的 SQE 数 (每 8MB 请求拆 2 个 4MB SQE, 留裕量).
                 let started = std::time::Instant::now();
                 let queue_wait_us = started.duration_since(queued_at).as_micros() as u64;
-                let (request, _, capacity) = &req;
-                let result = do_read_aligned_into_ptr_batch(&mut ring, std::slice::from_ref(&req))
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| Err(KVError::Internal("missing stream result".into())));
+                let max_batch = (depth as usize / 4).max(1);
+                let mut batch: Vec<(u64, usize, (IORequest, PtrWrapperMut, usize), _)> =
+                    vec![(job_id, original_index, req, completion)];
+                while batch.len() < max_batch {
+                    match rx.try_recv() {
+                        Ok(RingJob::ReadAlignedIntoPtrStream {
+                            job_id,
+                            queued_at: _,
+                            original_index,
+                            req,
+                            completion,
+                        }) => batch.push((job_id, original_index, req, completion)),
+                        Ok(other) => {
+                            // 非 stream 任务不能丢: 存入 pending, 批量读完成后下一轮循环处理.
+                            pending = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let reqs: Vec<(IORequest, PtrWrapperMut, usize)> = batch
+                    .iter()
+                    .map(|(_, _, (r, p, c), _)| (r.clone(), PtrWrapperMut(p.0), *c))
+                    .collect();
+                // **增量完成**: 所有 SQE 一次性灌入 ring (真实队列深度 = 全批), 但每个请求
+                // 自己的 chunk 全部读完就立即回调发送 completion → 下游 RDMA WRITE 不等整批,
+                // 流水线不断流. (整批 submit_and_wait 会让 RDMA 窗口空转, 实测 4× 回退.)
+                // KVError 不可 Clone: 日志只留 Ok 字节数, Err 记 0 并计失败.
+                let mut ok_bytes_per_req: Vec<Option<usize>> = vec![None; batch.len()];
+                do_read_aligned_into_ptr_batch_incremental(&mut ring, &reqs, |i, result| {
+                    ok_bytes_per_req[i] = result.as_ref().ok().copied();
+                    let (_, original_index, _, completion) = &batch[i];
+                    let _ = completion.send((*original_index, result));
+                });
+                let batch_len = batch.len();
+                let requested_bytes: usize = reqs.iter().map(|r| r.2).sum();
+                let completed_bytes: usize =
+                    ok_bytes_per_req.iter().filter_map(|x| *x).sum();
+                let success_count = ok_bytes_per_req.iter().filter(|r| r.is_some()).count();
                 let context = IoLogContext {
                     executor: "tier_b",
                     operation: "read",
@@ -448,23 +495,28 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                     device_id: device_idx as i64,
                     job_id,
                 };
-                match &result {
-                    Ok(bytes_read) => log_io_request(context, request, *bytes_read, *bytes_read),
-                    Err(error) => log_io_error(context, request, *capacity, error),
+                for ((_, _, (request, _, _capacity), _), ok_bytes) in
+                    batch.iter().zip(&ok_bytes_per_req)
+                {
+                    if let Some(bytes_read) = ok_bytes {
+                        log_io_request(context, request, *bytes_read, *bytes_read);
+                    }
+                    // Err 详情已随 completion 发给上游, 此处不重复格式化 (错误已消费).
                 }
                 log_io_batch(
                     context,
                     IoBatchStats {
-                        request_count: 1,
-                        success_count: if result.is_ok() { 1 } else { 0 },
-                        failure_count: if result.is_err() { 1 } else { 0 },
-                        requested_bytes: *capacity,
-                        completed_bytes: result.as_ref().ok().copied().unwrap_or(0),
+                        request_count: batch_len,
+                        success_count,
+                        failure_count: batch_len.saturating_sub(success_count),
+                        requested_bytes,
+                        completed_bytes,
                         queue_wait_us,
                         duration_us: started.elapsed().as_micros() as u64,
                     },
                 );
-                let _ = completion.send((original_index, result));
+                // completion 已在增量回调里发送, 此处不再重复发送.
+                drop(batch);
             }
             RingJob::Shutdown => break,
         }
@@ -1215,6 +1267,23 @@ fn do_read_aligned_into_ptr_batch(
     ring: &mut IoUring,
     reqs: &[(IORequest, PtrWrapperMut, usize)],
 ) -> Vec<Result<usize>> {
+    let mut results: Vec<Option<Result<usize>>> = Vec::with_capacity(reqs.len());
+    results.resize_with(reqs.len(), || None);
+    do_read_aligned_into_ptr_batch_incremental(ring, reqs, |i, r| results[i] = Some(r));
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err(KVError::Internal("missing read result".into()))))
+        .collect()
+}
+
+/// 与 `do_read_aligned_into_ptr_batch` 相同的批量 O_DIRECT 读, 但某个请求的全部 chunk
+/// 完成时**立即**触发 `on_complete(i, result)`, 不等整批. 用于 stream 路径:
+/// ring 保持满深度 (聚合批量), 同时下游 (RDMA WRITE) 按请求粒度流水线消费.
+fn do_read_aligned_into_ptr_batch_incremental(
+    ring: &mut IoUring,
+    reqs: &[(IORequest, PtrWrapperMut, usize)],
+    mut on_complete: impl FnMut(usize, Result<usize>),
+) {
     let n = reqs.len();
     let mut results: Vec<Result<usize>> = (0..n).map(|_| Ok(0)).collect();
     let mut files: Vec<Option<std::fs::File>> = (0..n).map(|_| None).collect();
@@ -1342,6 +1411,17 @@ fn do_read_aligned_into_ptr_batch(
     }
 
     // ===== Phase 2: gather all SQEs and submit in batches =====
+    // fired[i]: 请求 i 的最终结果是否已经通过 on_complete 上报.
+    let mut fired: Vec<bool> = vec![false; n];
+    // chunks_remaining[i]: 请求 i 还有多少个 chunk SQE 未完成 (0 = 无 SQE, phase 1 已定结果).
+    let mut chunks_remaining: Vec<usize> = sqe_plans.iter().map(|p| p.len()).collect();
+    // phase 1 已出结果 (错误 / Ok(0) / buffered fallback) 的请求立即上报.
+    for i in 0..n {
+        if chunks_remaining[i] == 0 || files[i].is_none() {
+            fired[i] = true;
+            on_complete(i, std::mem::replace(&mut results[i], Ok(0)));
+        }
+    }
     let mut all_sqes: Vec<(u64, u64, *mut u8, u32)> = Vec::new();
     for (i, plan) in sqe_plans.iter().enumerate() {
         if files[i].is_none() {
@@ -1354,7 +1434,7 @@ fn do_read_aligned_into_ptr_batch(
     }
 
     if all_sqes.is_empty() {
-        return results;
+        return;
     }
 
     let ring_capacity = ring.params().sq_entries() as usize;
@@ -1362,49 +1442,78 @@ fn do_read_aligned_into_ptr_batch(
 
     let mut any_error: Vec<bool> = vec![false; n];
     let mut total_read: Vec<usize> = vec![0; n];
+    // 请求 i 的全部 chunk 完成即上报 (增量流水线核心).
+    macro_rules! maybe_fire {
+        ($i:expr) => {
+            let i = $i;
+            if !fired[i] && chunks_remaining[i] == 0 {
+                fired[i] = true;
+                let r = if any_error[i] {
+                    std::mem::replace(&mut results[i], Ok(0))
+                } else {
+                    Ok(requested_lengths[i].min(total_read[i]))
+                };
+                on_complete(i, r);
+            }
+        };
+    }
 
+    // 滑动窗口: 始终保持 ring 内在飞 SQE ≈ batch_size, 每收一个 CQE 就补一个 SQE.
     let mut sqe_idx = 0;
-    while sqe_idx < all_sqes.len() {
-        let batch_end = (sqe_idx + batch_size).min(all_sqes.len());
-        let mut pushed = 0u32;
-
-        for (ud, off, ptr, len) in &all_sqes[sqe_idx..batch_end] {
+    let mut inflight: u32 = 0;
+    while sqe_idx < all_sqes.len() || inflight > 0 {
+        // 灌 SQE 直到窗口满或没有剩余.
+        while sqe_idx < all_sqes.len() && (inflight as usize) < batch_size {
+            let (ud, off, ptr, len) = all_sqes[sqe_idx];
             let i = (ud >> 32) as usize;
+            sqe_idx += 1;
             if any_error[i] {
+                chunks_remaining[i] -= 1;
+                maybe_fire!(i);
                 continue;
             }
-            let Some(file) = &files[i] else { continue };
-            let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), *ptr, *len)
-                .offset(*off)
+            let Some(file) = &files[i] else {
+                chunks_remaining[i] -= 1;
+                maybe_fire!(i);
+                continue;
+            };
+            let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, len)
+                .offset(off)
                 .build()
-                .user_data(*ud);
+                .user_data(ud);
             let push_res = unsafe { ring.submission().push(&entry) };
             if let Err(e) = push_res {
                 any_error[i] = true;
                 results[i] = Err(KVError::Internal(format!("uring push read_into: {:?}", e)));
+                chunks_remaining[i] -= 1;
+                maybe_fire!(i);
                 continue;
             }
-            pushed += 1;
+            inflight += 1;
         }
 
-        if pushed == 0 {
-            sqe_idx = batch_end;
+        if inflight == 0 {
             continue;
         }
 
-        if let Err(e) = ring.submit_and_wait(pushed as usize) {
-            for (i, r) in results.iter_mut().enumerate() {
-                if !any_error[i] && files[i].is_some() {
-                    *r = Err(KVError::Internal(format!("uring submit read_into: {}", e)));
-                    any_error[i] = true;
+        // 提交并至少等 1 个完成 (而非等整批), 让完成的请求尽早流入下游.
+        if let Err(e) = ring.submit_and_wait(1) {
+            for i in 0..n {
+                if !fired[i] {
+                    fired[i] = true;
+                    on_complete(
+                        i,
+                        Err(KVError::Internal(format!("uring submit read_into: {}", e))),
+                    );
                 }
             }
-            return results;
+            return;
         }
 
         for cqe in ring.completion() {
             let ud = cqe.user_data();
             let i = (ud >> 32) as usize;
+            inflight = inflight.saturating_sub(1);
             if i >= n {
                 continue;
             }
@@ -1415,20 +1524,23 @@ fn do_read_aligned_into_ptr_batch(
             } else {
                 total_read[i] += ret as usize;
             }
+            chunks_remaining[i] -= 1;
+            maybe_fire!(i);
         }
-
-        sqe_idx = batch_end;
     }
 
-    // ===== Phase 3: fill in return values (real file_size, not 4K padding) =====
+    // 兜底: 任何仍未上报的请求 (理论不应发生).
     for i in 0..n {
-        if !any_error[i] && files[i].is_some() {
-            // total_read[i] may include the final 4K padding; return only the requested range.
-            results[i] = Ok(requested_lengths[i].min(total_read[i]));
+        if !fired[i] {
+            fired[i] = true;
+            let r = if any_error[i] {
+                std::mem::replace(&mut results[i], Ok(0))
+            } else {
+                Ok(requested_lengths[i].min(total_read[i]))
+            };
+            on_complete(i, r);
         }
     }
-
-    results
 }
 
 /// Open a file for O_DIRECT read and get file_size; the fallback path returns
