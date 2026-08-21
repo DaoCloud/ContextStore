@@ -83,12 +83,15 @@ spec:
             - containerPort: 50053
               name: rdma-ctl
           securityContext:
-            capabilities:
-              add:
-                # ibv_reg_mr 锁页 (slab 8GB + 客户端 MR)
-                - IPC_LOCK
+            # 实测 (containerd 2.x, K8s 1.32): 仅 IPC_LOCK + hostPath 挂载
+            # /dev/infiniband 时, device cgroup 仍拦截 verbs 字符设备,
+            # ibv_open_device 报 ENOENT. privileged 是最直接的放行方式;
+            # 收紧路线是部署 k8s-rdma-shared-dev-plugin 并请求 rdma/hca
+            # 资源 (见文末注释), 即可去掉 privileged 回到 IPC_LOCK.
+            privileged: true
             # io_uring: RuntimeDefault seccomp 在部分运行时拦截 io_uring_setup.
-            # 收紧方案: 自定义 profile 放行 io_uring_{setup,enter,register}.
+            # (privileged 已隐含 Unconfined; 若走 device-plugin 路线记得保留
+            #  seccompProfile: Unconfined 或自定义 profile 放行 io_uring_*.)
             seccompProfile:
               type: Unconfined
           volumeMounts:

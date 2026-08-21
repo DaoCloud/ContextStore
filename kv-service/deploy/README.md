@@ -91,20 +91,28 @@ kubectl get pods -l app=contextstore-kv-rdma
 # readiness gates on the RDMA control port: Ready means the slab is registered
 ```
 
+Validated end to end on a 2-worker cluster (K8s 1.32, containerd 2.x,
+ConnectX HCAs in ETH/RoCE v2 mode): both pods Ready with the 8 GB hugepage
+slab registered, gRPC PUT through the pod, then single-endpoint RDMA GET
+from a host client — same-node 40.7 GB/s, cross-node 26.8 GB/s (slab-served;
+identical to the bare-metal numbers on the same fabric).
+
 Design notes (also inlined as comments in the manifest):
 
 - **hostNetwork** so the RDMA listener binds the host IP and RoCE v2 GIDs
   match the advertised address; clients keep using `--gid-index 3`.
-- **IPC_LOCK** capability for `ibv_reg_mr` of the slab; **hugepages-2Mi**
-  resource requests back its `MAP_HUGETLB` allocation (falls back to normal
-  pages with a warning if unavailable).
+- **privileged** (validated on containerd 2.x / K8s 1.32): a hostPath mount
+  of `/dev/infiniband` plus IPC_LOCK is not sufficient — the device cgroup
+  still blocks the verbs char devices and `ibv_open_device` fails. Deploying
+  `k8s-rdma-shared-dev-plugin` and requesting `rdma/hca` lets you drop
+  privileged back to IPC_LOCK. **hugepages-2Mi** resource requests back the
+  slab's `MAP_HUGETLB` allocation (falls back to normal pages if unavailable).
 - **seccomp Unconfined** because default profiles on some runtimes block
   io_uring; harden with a custom profile allowing
   `io_uring_setup/enter/register`, or set `io_executor.kind = "tier_a"`.
-- `/dev/infiniband` is mounted via hostPath; no `privileged` needed. On
-  clusters with Multus + `k8s-rdma-shared-dev-plugin`, swap hostNetwork and
-  the hostPath for an `rdma/hca` resource request and a secondary RoCE NIC
-  (see the comment block at the end of the manifest).
+- On clusters with Multus + `k8s-rdma-shared-dev-plugin`, swap hostNetwork,
+  the hostPath, and privileged for an `rdma/hca` resource request and a
+  secondary RoCE NIC (see the comment block at the end of the manifest).
 - Multi-node placement (`[cluster]`, coordinator-routed multi-endpoint
   reads) needs per-node `node_id`/advertise values: render per-node
   ConfigMaps with kustomize/helm, or generate the `[cluster]` section in an
