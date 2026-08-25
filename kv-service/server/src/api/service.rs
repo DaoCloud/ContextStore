@@ -1902,6 +1902,41 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         result
     }
 
+    async fn lookup_objects(
+        &self,
+        req: Request<pb::LookupObjectsRequest>,
+    ) -> Result<Response<pb::LookupObjectsResponse>, Status> {
+        let start = Instant::now();
+        let result = async {
+            let req = req.into_inner();
+            if req.keys.len() > 1024 {
+                return Err(Status::invalid_argument(format!(
+                    "too many keys in one LookupObjects: {} (max 1024)",
+                    req.keys.len()
+                )));
+            }
+            let mut results = Vec::with_capacity(req.keys.len());
+            for key in &req.keys {
+                let internal = pb_key_to_internal(key);
+                let meta = self.metadata_get_live(&internal).await?;
+                let descriptor = meta.as_ref().map(|m| descriptor_from_meta(&internal, m));
+                let placement = meta
+                    .as_ref()
+                    .map(|m| placement_from_meta(&self.ctx, &internal, m));
+                results.push(pb::LookupObjectResponse {
+                    found: descriptor.is_some(),
+                    descriptor,
+                    placement,
+                });
+            }
+            Ok(Response::new(pb::LookupObjectsResponse { results }))
+        }
+        .await;
+        let ok_status = "ok";
+        self.record_request("lookup_objects", start, &result, ok_status);
+        result
+    }
+
     async fn read_by_descriptor(
         &self,
         req: Request<pb::ReadByDescriptorRequest>,

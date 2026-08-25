@@ -14,6 +14,9 @@ service KVService {
   // ===== Descriptor operations =====
   // LookupObject only queries object metadata and does not read the value.
   rpc LookupObject(LookupObjectRequest) returns (LookupObjectResponse);
+  // Batched LookupObject: one round trip for N keys. Results align with the
+  // request order; a missing object yields found=false at its position.
+  rpc LookupObjects(LookupObjectsRequest) returns (LookupObjectsResponse);
   // ReadByDescriptor uses the client-cached descriptor to read the object. The server
   // validates the descriptor first; if it is stale, returns FAILED_PRECONDITION.
   rpc ReadByDescriptor(ReadByDescriptorRequest) returns (DataReadResponse);
@@ -164,6 +167,15 @@ message LookupObjectResponse {
   bool found = 1;
   ObjectDescriptor descriptor = 2;
   PlacementDescriptor placement = 3;
+}
+
+message LookupObjectsRequest {
+  repeated ObjectKey keys = 1;
+}
+
+message LookupObjectsResponse {
+  // One entry per requested key, in request order.
+  repeated LookupObjectResponse results = 1;
 }
 
 message ReadByDescriptorRequest {

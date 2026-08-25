@@ -219,6 +219,36 @@ impl KvClient {
         }))
     }
 
+    /// Batched [`Self::lookup_object`]: one round trip for N keys. Results
+    /// align with the input order; missing objects yield `None` at their
+    /// position.
+    pub async fn lookup_objects(
+        &mut self,
+        namespace: &str,
+        object_keys: &[&str],
+    ) -> Result<Vec<Option<ObjectLookup>>, tonic::Status> {
+        let req = pb::LookupObjectsRequest {
+            keys: object_keys
+                .iter()
+                .map(|k| Self::key(namespace, k))
+                .collect(),
+        };
+        let resp = self.inner.lookup_objects(req).await?.into_inner();
+        Ok(resp
+            .results
+            .into_iter()
+            .map(|r| {
+                if !r.found {
+                    return None;
+                }
+                r.descriptor.map(|descriptor| ObjectLookup {
+                    descriptor,
+                    placement: r.placement,
+                })
+            })
+            .collect())
+    }
+
     /// Batch PUT (single RPC; server writes in parallel).
     pub async fn put_batch(
         &mut self,
