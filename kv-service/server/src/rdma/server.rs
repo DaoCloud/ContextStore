@@ -184,6 +184,11 @@ fn run_listener(
     for stream_res in listener.incoming() {
         match stream_res {
             Ok(stream) => {
+                // 控制面小包 (GET req/resp) 若被 Nagle 与 delayed-ACK 组合延迟, 多连接
+                // 并发时每对象会产生 ~40-200ms 停顿, 拖垮整体带宽; 数据面走 RDMA 不受影响.
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!("set_nodelay on RDMA control stream failed: {}", e);
+                }
                 let kv_ctx = ctx.clone();
                 let rdma = rdma_ctx.clone();
                 let port_num = cfg.port_num;

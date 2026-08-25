@@ -298,6 +298,11 @@ impl RdmaClient {
         let result = (|| -> Result<TcpStream> {
             let mut stream = TcpStream::connect(&config.endpoint)
                 .with_context(|| format!("connect RDMA control endpoint {}", config.endpoint))?;
+            // 控制面小包必须即时发出: Nagle + delayed-ACK 在多连接并发时会给每个
+            // 请求注入 ~40-200ms 延迟 (数据面 RDMA WRITE 不经 TCP, 不受影响).
+            stream
+                .set_nodelay(true)
+                .context("set TCP_NODELAY on RDMA control stream")?;
             let local = QpInfo {
                 qpn: unsafe { (*qp.as_ptr()).qp_num },
                 psn: random_psn(),
