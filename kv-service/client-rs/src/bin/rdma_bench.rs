@@ -47,6 +47,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     ttl_seconds: i64,
 
+    /// Multi-endpoint GET: read through the SGE (scatter destination) wire
+    /// path, logically splitting the destination buffer into this many
+    /// segments. 0 = use the classic single-destination stripe GET.
+    /// Validates the tag-15 server path; data lands at identical offsets so
+    /// data_ok checks still hold.
+    #[arg(long, default_value_t = 0)]
+    sge_segments: usize,
+
     /// gRPC coordinator used to discover and read all RDMA placement endpoints.
     ///
     /// When set, the benchmark groups stripes by their owning node and issues
@@ -617,6 +625,7 @@ fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
     }
 
     let buf_size = args.buf_mb * 1024 * 1024;
+    let sge_segments = args.sge_segments;
     let object_size = usize::try_from(lookup.descriptor.size)
         .map_err(|_| anyhow!("object size does not fit usize"))?;
     if buf_size < object_size {
@@ -681,10 +690,30 @@ fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
             while let Ok(command) = command_rx.recv() {
                 match command {
                     WorkerCommand::Read => {
-                        let result = client
-                            .get_descriptor_stripes_into(&descriptor, &stripes, &registered, 0)
-                            .map(|bytes| bytes.unwrap_or(0))
-                            .map_err(|error| error.to_string());
+                        let result = if sge_segments > 0 {
+                            // 把整个目标 buffer 均分为 N 段 (同一 MR, 不同偏移),
+                            // 走 tag-15 SGE 路径; server 按段映射逐段 WRITE.
+                            let view = registered.view();
+                            let seg_len = (buf_size / sge_segments).max(1) as u64;
+                            let mut segments = Vec::with_capacity(sge_segments);
+                            let mut off = 0u64;
+                            let (base, rkey, total) =
+                                (view.addr(), view.rkey(), buf_size as u64);
+                            while off < total {
+                                let n = seg_len.min(total - off);
+                                segments.push((base + off, rkey, n));
+                                off += n;
+                            }
+                            client
+                                .get_descriptor_stripes_sge(&descriptor, &stripes, &segments)
+                                .map(|bytes| bytes.unwrap_or(0))
+                                .map_err(|error| error.to_string())
+                        } else {
+                            client
+                                .get_descriptor_stripes_into(&descriptor, &stripes, &registered, 0)
+                                .map(|bytes| bytes.unwrap_or(0))
+                                .map_err(|error| error.to_string())
+                        };
                         let _ = worker_events.send(WorkerEvent::ReadDone {
                             endpoint: worker_endpoint.clone(),
                             result,

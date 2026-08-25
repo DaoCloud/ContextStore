@@ -21,7 +21,8 @@ use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
     self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, PutStripeLocation,
-    PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ, MSG_GET_REQ,
+    PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ,
+    MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ, MSG_GET_REQ,
     MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ, MSG_PUT_REQ,
     MSG_PUT_STRIPES_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
     PUT_RESULT_STORED,
@@ -301,7 +302,10 @@ fn handle_client(
             handle_put_stripes(&mut stream, &kv_ctx, nic_idx)?;
             continue;
         }
-        if tag == MSG_GET_DESCRIPTOR_REQ || tag == MSG_GET_DESCRIPTOR_STRIPES_REQ {
+        if tag == MSG_GET_DESCRIPTOR_REQ
+            || tag == MSG_GET_DESCRIPTOR_STRIPES_REQ
+            || tag == MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ
+        {
             handle_descriptor_get(
                 &mut stream,
                 &kv_ctx,
@@ -309,7 +313,8 @@ fn handle_client(
                 &qp,
                 client_cq,
                 nic_idx,
-                tag == MSG_GET_DESCRIPTOR_STRIPES_REQ,
+                tag != MSG_GET_DESCRIPTOR_REQ,
+                tag == MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ,
             )?;
             continue;
         }
@@ -1041,6 +1046,44 @@ fn allocate_subset_staging(kv_ctx: &KVServiceContext, size: usize) -> Result<Sla
     ))
 }
 
+
+/// 把对象字节区间 [object_offset, object_offset+length) 映射到 scatter 段表.
+/// 段表按序覆盖对象字节范围; 一个区间可能跨多个段, 产出多条 (dst_addr, rkey, len).
+/// 返回 Err 当区间超出段表覆盖范围.
+fn map_range_to_segments(
+    segments: &[(u64, u32, u64)],
+    object_offset: u64,
+    length: u64,
+) -> anyhow::Result<Vec<(u64, u32, u64)>> {
+    let mut out = Vec::new();
+    let mut remaining = length;
+    let mut cursor = object_offset;
+    let mut seg_base = 0u64; // 当前段在对象字节空间的起点
+    for (addr, rkey, seg_len) in segments {
+        let seg_end = seg_base + seg_len;
+        if cursor < seg_end && remaining > 0 {
+            let in_seg = cursor - seg_base;
+            let n = remaining.min(seg_end - cursor);
+            out.push((addr + in_seg, *rkey, n));
+            cursor += n;
+            remaining -= n;
+        }
+        seg_base = seg_end;
+        if remaining == 0 {
+            break;
+        }
+    }
+    if remaining > 0 {
+        return Err(anyhow!(
+            "scatter segments cover {} bytes but range needs {}+{}",
+            seg_base,
+            object_offset,
+            length
+        ));
+    }
+    Ok(out)
+}
+
 fn serve_get_stripes_fallback(
     kv_ctx: &Arc<KVServiceContext>,
     rdma: &Arc<RdmaContext>,
@@ -1215,21 +1258,48 @@ fn serve_get_stripes(
         last_io_us = completion_us;
         match result {
             Ok(bytes) if bytes == length && first_error.is_none() => {
-                if let Err(error) = qp.post_write(
-                    writes_posted as u64,
-                    view.addr + source_offset as u64,
-                    view.lkey,
-                    req.dst_addr + object_offset as u64,
-                    req.dst_rkey,
-                    length as u32,
-                    true,
-                ) {
-                    first_error = Some(format!(
-                        "post RDMA write for stripe {stripe_index}: {error}"
-                    ));
+                // tag-15 (SGE): 数据区间按段表映射, 可能拆成多条 WRITE;
+                // tag-12: 单一连续目标, 等价于一个覆盖全对象的段.
+                let targets: Vec<(u64, u32, u64)> = if req.dst_segments.is_empty() {
+                    vec![(req.dst_addr + object_offset as u64, req.dst_rkey, length as u64)]
                 } else {
+                    match map_range_to_segments(
+                        &req.dst_segments,
+                        object_offset as u64,
+                        length as u64,
+                    ) {
+                        Ok(t) => t,
+                        Err(error) => {
+                            first_error = Some(format!(
+                                "map stripe {stripe_index} to scatter segments: {error}"
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                let mut src = view.addr + source_offset as u64;
+                let mut post_failed = false;
+                for (dst, rkey, n) in &targets {
+                    if let Err(error) = qp.post_write(
+                        writes_posted as u64,
+                        src,
+                        view.lkey,
+                        *dst,
+                        *rkey,
+                        *n as u32,
+                        true,
+                    ) {
+                        first_error = Some(format!(
+                            "post RDMA write for stripe {stripe_index}: {error}"
+                        ));
+                        post_failed = true;
+                        break;
+                    }
+                    src += n;
                     writes_posted += 1;
                     outstanding += 1;
+                }
+                if !post_failed {
                     total += bytes as u64;
                     // 机会式非阻塞收割: 每次 post 后顺手清已完成的 CQE.
                     // 旧逻辑凑满窗口才 poll_n(64) 阻塞等全部完成, 期间不消费盘 IO
@@ -1308,8 +1378,9 @@ fn handle_descriptor_get(
     client_cq: NonNull<rdma_sys::ibv_cq>,
     nic_idx: usize,
     with_stripes: bool,
+    with_segments: bool,
 ) -> Result<()> {
-    let req = wire::recv_descriptor_get_req_body(stream, with_stripes)?;
+    let req = wire::recv_descriptor_get_req_body_ext(stream, with_stripes, with_segments)?;
     let kv_key = parse_string_key(&req.key)?;
     // Validate descriptor layout fields before consulting the authoritative metadata. The actual
     // metadata is used for I/O so optional per-stripe checksums cannot be omitted by a client.
@@ -1930,5 +2001,37 @@ mod tests {
         assert!(!placement_spans_multiple_nodes(&striped_meta(&[
             "worker01", "worker01", "worker01", "worker01"
         ])));
+    }
+}
+
+#[cfg(test)]
+mod sge_tests {
+    use super::map_range_to_segments;
+
+    #[test]
+    fn range_within_one_segment() {
+        let segs = [(0x1000, 7, 100u64), (0x9000, 8, 100)];
+        let m = map_range_to_segments(&segs, 10, 50).unwrap();
+        assert_eq!(m, vec![(0x1000 + 10, 7, 50)]);
+    }
+
+    #[test]
+    fn range_spans_segments() {
+        let segs = [(0x1000, 7, 100u64), (0x9000, 8, 100)];
+        let m = map_range_to_segments(&segs, 80, 50).unwrap();
+        assert_eq!(m, vec![(0x1000 + 80, 7, 20), (0x9000, 8, 30)]);
+    }
+
+    #[test]
+    fn range_beyond_coverage_errors() {
+        let segs = [(0x1000, 7, 100u64)];
+        assert!(map_range_to_segments(&segs, 80, 50).is_err());
+    }
+
+    #[test]
+    fn exact_tail_fit() {
+        let segs = [(0x1000, 7, 64u64), (0x9000, 8, 64)];
+        let m = map_range_to_segments(&segs, 64, 64).unwrap();
+        assert_eq!(m, vec![(0x9000, 8, 64)]);
     }
 }

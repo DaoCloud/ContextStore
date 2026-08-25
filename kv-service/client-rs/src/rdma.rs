@@ -36,6 +36,7 @@ const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
 const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
 /// Descriptor GET restricted to a stripe subset (multi-endpoint direct reads).
 const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
+const MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ: u8 = 15;
 /// Stripe-subset PUT (multi-endpoint direct writes).
 const MSG_PUT_STRIPES_REQ: u8 = 13;
 const MSG_PUT_STRIPES_RESP: u8 = 14;
@@ -130,6 +131,16 @@ pub struct BufferView {
 }
 
 impl BufferView {
+    /// Destination base address of the registered region.
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    /// Remote key of the registration.
+    pub fn rkey(&self) -> u32 {
+        self.rkey
+    }
+
     fn destination(&self, offset: usize) -> Result<(u64, u32, usize)> {
         let available = self
             .len
@@ -513,6 +524,53 @@ impl RdmaClient {
             for idx in stripes {
                 request.extend_from_slice(&idx.to_le_bytes());
             }
+        }
+        self.stream.write_all(&request)?;
+        self.stream.flush()?;
+        read_get_response(&mut self.stream)
+    }
+
+    /// Stripe-subset GET with a scatter destination list (wire tag 15): the
+    /// server maps every served byte onto `segments` (addr, rkey, len — in
+    /// object byte order) and RDMA-WRITEs each piece to its own region,
+    /// eliminating the client-side staging buffer + scatter memcpy. Segments
+    /// may come from different registrations (different rkeys) as long as
+    /// each stays valid for the duration of the call.
+    pub fn get_descriptor_stripes_sge(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        segments: &[(u64, u32, u64)],
+    ) -> Result<RdmaReadResult> {
+        if segments.is_empty() {
+            return Err(anyhow!("SGE GET requires at least one destination segment"));
+        }
+        let key = descriptor
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("RDMA descriptor is missing its object key"))?;
+        let total: u64 = segments.iter().map(|(_, _, len)| *len).sum();
+        let mut request = build_descriptor_get_request(
+            &canonical_key(&key.namespace, &key.object_key),
+            descriptor,
+            segments[0].0,
+            segments[0].1,
+            total,
+        )?;
+        request[0] = MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ;
+        let count = u16::try_from(stripes.len())
+            .map_err(|_| anyhow!("too many stripes: {}", stripes.len()))?;
+        request.extend_from_slice(&count.to_le_bytes());
+        for idx in stripes {
+            request.extend_from_slice(&idx.to_le_bytes());
+        }
+        let seg_count = u16::try_from(segments.len())
+            .map_err(|_| anyhow!("too many segments: {}", segments.len()))?;
+        request.extend_from_slice(&seg_count.to_le_bytes());
+        for (addr, rkey, len) in segments {
+            request.extend_from_slice(&addr.to_le_bytes());
+            request.extend_from_slice(&rkey.to_le_bytes());
+            request.extend_from_slice(&len.to_le_bytes());
         }
         self.stream.write_all(&request)?;
         self.stream.flush()?;
