@@ -137,11 +137,14 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Multi-NIC support: configured via CS_RDMA_DEVICES (comma-separated list of
-        // `device:tcp_listen` items), e.g.
+        // `device:tcp_listen[:gid_index]` items), e.g.
         //   CS_RDMA_DEVICES=mlx5_0:0.0.0.0:50053,mlx5_1:0.0.0.0:50054
-        // Parse errors fall back to default (single NIC mlx5_0). port_num=1, gid_index=3
-        // stay at their defaults; each NIC gets its own listener but shares the same slab
-        // (each PD does its own reg_mr).
+        //   CS_RDMA_DEVICES=mlx5_1:192.168.222.5:50053:11   (pod/macvlan: non-default GID)
+        // Parse errors fall back to default (single NIC mlx5_0). port_num=1 stays at its
+        // default; gid_index defaults to 3 (host RoCE v2 IPv4) and can be overridden
+        // per-device — inside a pod with a macvlan/SR-IOV secondary NIC the RoCE v2 GID
+        // for the pod IP lands at a different index. Each NIC gets its own listener but
+        // shares the same slab (each PD does its own reg_mr).
         if let Ok(v) = std::env::var("CS_RDMA_DEVICES") {
             let mut devs = Vec::new();
             let mut parse_err: Option<String> = None;
@@ -150,17 +153,31 @@ async fn main() -> anyhow::Result<()> {
                 if item.is_empty() {
                     continue;
                 }
-                // Format: device:host:port, e.g. mlx5_0:0.0.0.0:50053
+                // Format: device:host:port[:gid_index], e.g. mlx5_0:0.0.0.0:50053:3
                 let parts: Vec<&str> = item.splitn(2, ':').collect();
                 if parts.len() != 2 {
-                    parse_err = Some(format!("bad item '{}', expect dev:host:port", item));
+                    parse_err = Some(format!("bad item '{}', expect dev:host:port[:gid]", item));
                     break;
                 }
+                // tcp_listen is "host:port" or "host:port:gid" — split a trailing
+                // numeric gid off the right side (host may itself contain ':' only
+                // for IPv6, which the RDMA listener does not use).
+                let (tcp_listen, gid_index) = match parts[1].rsplit_once(':') {
+                    Some((left, tail))
+                        if left.contains(':') && tail.chars().all(|c| c.is_ascii_digit()) =>
+                    {
+                        match tail.parse::<u8>() {
+                            Ok(g) => (left.to_string(), g),
+                            Err(_) => (parts[1].to_string(), 3),
+                        }
+                    }
+                    _ => (parts[1].to_string(), 3),
+                };
                 devs.push(RdmaDeviceConfig {
                     device_name: parts[0].to_string(),
                     port_num: 1,
-                    gid_index: 3,
-                    tcp_listen: parts[1].to_string(),
+                    gid_index,
+                    tcp_listen,
                 });
             }
             if let Some(e) = parse_err {

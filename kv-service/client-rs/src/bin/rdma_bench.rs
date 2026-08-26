@@ -22,13 +22,38 @@ use std::net::TcpStream;
 use std::ptr::{self, NonNull};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 struct Args {
     /// Server TCP address (RDMA control plane)
     #[arg(long, default_value = "127.0.0.1:50053")]
     server: String,
+
+    /// Benchmark direction: `get` (default) reads an existing object;
+    /// `put` writes `--put-mb` of patterned data per iteration over the
+    /// RDMA data plane (PutReq -> server slab grant -> RDMA WRITE ->
+    /// commit -> server pwrite), giving the write-path counterpart of
+    /// the read benchmark. `put` requires --namespace/--object-key and
+    /// is single-endpoint only (not valid with --coordinator).
+    #[arg(long, default_value = "get")]
+    mode: String,
+
+    /// PUT mode: payload size in MB per iteration.
+    #[arg(long, default_value_t = 480)]
+    put_mb: usize,
+
+    /// PUT mode: TTL seconds stamped on stored objects (0 = no expiry).
+    #[arg(long, default_value_t = 0)]
+    ttl_seconds: i64,
+
+    /// Multi-endpoint GET: read through the SGE (scatter destination) wire
+    /// path, logically splitting the destination buffer into this many
+    /// segments. 0 = use the classic single-destination stripe GET.
+    /// Validates the tag-15 server path; data lands at identical offsets so
+    /// data_ok checks still hold.
+    #[arg(long, default_value_t = 0)]
+    sge_segments: usize,
 
     /// gRPC coordinator used to discover and read all RDMA placement endpoints.
     ///
@@ -118,11 +143,93 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Result<Vec<u8>> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.mode == "put" {
+        return run_put(&args);
+    }
+    if args.mode != "get" {
+        return Err(anyhow!("unknown --mode {} (expected get|put)", args.mode));
+    }
     let object_key = resolve_object_key(&args)?;
     if let Some(coordinator) = &args.coordinator {
         return run_multi_endpoint(&args, coordinator);
     }
     run_single_endpoint(&args, &object_key)
+}
+
+/// RDMA PUT benchmark: each iteration writes a fresh object (`<object_key>-i<N>`)
+/// so the server takes the full write path every time (slab grant + client RDMA
+/// WRITE + commit + striped O_DIRECT pwrite) instead of dedup-skipping.
+fn run_put(args: &Args) -> Result<()> {
+    if args.coordinator.is_some() {
+        return Err(anyhow!("--mode put does not support --coordinator (single endpoint only)"));
+    }
+    let namespace = args
+        .namespace
+        .as_deref()
+        .ok_or_else(|| anyhow!("--mode put requires --namespace"))?;
+    let object_key = args
+        .object_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("--mode put requires --object-key"))?;
+
+    let size = args.put_mb * 1024 * 1024;
+    let config = RdmaClientConfig::new(&args.server, &args.device)
+        .with_port(args.port)
+        .with_gid_index(args.gid_index);
+    let mut client = RdmaClient::connect(config)?;
+
+    // Patterned payload: byte i = i % 251 (prime, detects offset shifts).
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let t_reg = Instant::now();
+    let buffer = client.register_buffer(&mut payload)?;
+    println!(
+        "[client] PUT source MR registered: {} MB in {:.1}ms",
+        args.put_mb,
+        t_reg.elapsed().as_secs_f64() * 1000.0
+    );
+
+    let mut times = Vec::with_capacity(args.iters);
+    for iter in 1..=args.iters {
+        let key = format!("{object_key}-i{iter}");
+        let t0 = Instant::now();
+        client.put_from_with_ttl(namespace, &key, &buffer, 0, size, args.ttl_seconds)?;
+        let dt = t0.elapsed();
+        times.push(dt);
+        let gbps = size as f64 * 8.0 / dt.as_secs_f64() / 1e9;
+        println!(
+            "[client] iter {iter}: bytes={size} time={:.2}ms BW={:.2} Gbps = {:.2} GB/s key={key}",
+            dt.as_secs_f64() * 1000.0,
+            gbps,
+            size as f64 / dt.as_secs_f64() / 1e9,
+        );
+    }
+
+    times.sort();
+    let med = times[times.len() / 2];
+    let min = times[0];
+    let max = times[times.len() - 1];
+    let bw = |d: &Duration| size as f64 / d.as_secs_f64() / 1e9;
+    println!();
+    println!(
+        "[summary] mode=rdma_put iters={} bytes_per_iter={} ({} MB)",
+        args.iters, size, args.put_mb
+    );
+    println!(
+        "  latency  min={:.2}ms med={:.2}ms max={:.2}ms",
+        min.as_secs_f64() * 1000.0,
+        med.as_secs_f64() * 1000.0,
+        max.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  BW       max={:.2} GB/s med={:.2} GB/s min={:.2} GB/s",
+        bw(&min),
+        bw(&med),
+        bw(&max)
+    );
+    Ok(())
 }
 
 fn run_single_endpoint(args: &Args, object_key: &str) -> Result<()> {
@@ -518,6 +625,7 @@ fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
     }
 
     let buf_size = args.buf_mb * 1024 * 1024;
+    let sge_segments = args.sge_segments;
     let object_size = usize::try_from(lookup.descriptor.size)
         .map_err(|_| anyhow!("object size does not fit usize"))?;
     if buf_size < object_size {
@@ -582,10 +690,30 @@ fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
             while let Ok(command) = command_rx.recv() {
                 match command {
                     WorkerCommand::Read => {
-                        let result = client
-                            .get_descriptor_stripes_into(&descriptor, &stripes, &registered, 0)
-                            .map(|bytes| bytes.unwrap_or(0))
-                            .map_err(|error| error.to_string());
+                        let result = if sge_segments > 0 {
+                            // 把整个目标 buffer 均分为 N 段 (同一 MR, 不同偏移),
+                            // 走 tag-15 SGE 路径; server 按段映射逐段 WRITE.
+                            let view = registered.view();
+                            let seg_len = (buf_size / sge_segments).max(1) as u64;
+                            let mut segments = Vec::with_capacity(sge_segments);
+                            let mut off = 0u64;
+                            let (base, rkey, total) =
+                                (view.addr(), view.rkey(), buf_size as u64);
+                            while off < total {
+                                let n = seg_len.min(total - off);
+                                segments.push((base + off, rkey, n));
+                                off += n;
+                            }
+                            client
+                                .get_descriptor_stripes_sge(&descriptor, &stripes, &segments)
+                                .map(|bytes| bytes.unwrap_or(0))
+                                .map_err(|error| error.to_string())
+                        } else {
+                            client
+                                .get_descriptor_stripes_into(&descriptor, &stripes, &registered, 0)
+                                .map(|bytes| bytes.unwrap_or(0))
+                                .map_err(|error| error.to_string())
+                        };
                         let _ = worker_events.send(WorkerEvent::ReadDone {
                             endpoint: worker_endpoint.clone(),
                             result,

@@ -150,6 +150,9 @@ vLLM Connector 有 Scheduler 侧和 Worker 侧，二者运行在不同进程/线
 | `ShardedStorageBackend.get_parallel` | 线性缩放 | 多线程并发，不可持有 GIL |
 | Rust `io_executor` | 取决于 tier | Tier B (io_uring) 是零拷贝异步路径 |
 | Rust `rdma::server` | ~10 GB/s | slab 预注册 + 零 memcpy，单 lkey 复用 |
+| Rust `serve_get_stripes` (tag 12/15) | 冷读 6-9 GB/s/流，聚合 23 GB/s | multi-endpoint 条带子集读 + SGE 段表映射；stream 路径依赖 4MB SQE 批量提交与增量完成流水线，不可整批 submit_and_wait（实测 4× 回退），不可在 chunk 循环内做堆分配 |
+| `map_range_to_segments` (SGE) | < 0.1ms/GET | 纯内存段表映射，服务端 SGE vs 单段实测零开销（22.7 vs 22.5 GiB/s），不可引入 I/O 或锁 |
+| RDMA 控制面 TCP | 每 GET 一次往返 | 必须 set_nodelay(true)（server accept 与 client connect 双侧），小包被 Nagle 延迟会直接拖垮并发带宽 |
 
 **规则**：
 - 热路径中不可引入 `logging.debug` 等有格式化开销的调用

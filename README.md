@@ -12,37 +12,63 @@ The repository is split into two independently built parts, plus a thin plugin l
 | **KVService** | `kv-service/` | Rust | Standalone distributed block-storage service for JBOF / NVMe-oF. Exposes gRPC + RDMA data paths. |
 | NIXL plugin | `nixl-plugin/` | C++ / Rust | Loads ContextStore as NIXL's `CONTEXTSTORE` backend under the `OBJ` descriptor contract. |
 
+KVService is consumer-agnostic: besides the in-repo Connector and NIXL plugin,
+external KV-cache managers integrate through `kv-service/client-rs` (Rust SDK,
+gRPC + RDMA including SGE scatter reads) or the gRPC API directly — this is the
+path used by redhare's cold-tier backend.
+
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    vLLM / Dynamo                        │
-└────────────────────┬────────────────────────────────────┘
-                     │ KVConnector API
-                     ▼
-┌─────────────────────────────────────────────────────────┐
-│         ContextStore Connector  (src/contextstore/)     │
-│  ┌───────────┐  ┌──────────┐  ┌──────────────────────┐  │
-│  │  Codec    │  │ Prefix   │  │ Scheduler / Worker   │  │
-│  │ (INT8 quant)│ │ Index    │  │ metadata + transfer  │  │
-│  └───────────┘  └──────────┘  └──────────────────────┘  │
-│                       ▼                                 │
-│               StorageBackend                            │
-│    L1 HostMemory  →  L2 Local / Sharded  →  L3 KVService│
-└──────────────────────────────────┬──────────────────────┘
-                                   │ gRPC / RDMA
-                                   ▼
-┌─────────────────────────────────────────────────────────┐
-│                KVService  (kv-service/)                 │
-│  MemoryTier (L1)  →  StorageTier (L2)                   │
-│  IO Executor: Tier A (thread pool) / Tier B (io_uring)   │
-│  RDMA server: pre-registered slab, zero-memcpy WRITE    │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        vLLM / Dynamo                            │
+└──────┬──────────────────────┬──────────────────────┬────────────┘
+       │ KVConnector API      │ KVConnector API      │ NIXL OBJ
+       ▼                      ▼                      ▼
+┌──────────────────┐  ┌───────────────────┐  ┌──────────────────┐
+│ ContextStore     │  │ external KV mgr   │  │ NIXL plugin      │
+│ Connector        │  │ (e.g. redhare     │  │ (nixl-plugin/)   │
+│ (src/contextstore)│ │ cold tier)        │  │                  │
+│ Codec · Prefix   │  │        │          │  │                  │
+│ Index · L1/L2    │  │        ▼          │  │                  │
+│ tiers            │  │ client-rs SDK     │  │                  │
+└────────┬─────────┘  │ (kv-service/      │  └────────┬─────────┘
+         │            │  client-rs)       │           │
+         │            └────────┬──────────┘           │
+         │ gRPC               │ gRPC ctl + RDMA data  │
+         │                    │ (multi-endpoint, SGE  │
+         │                    │  scatter direct-write)│
+         ▼                    ▼                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   KVService cluster (kv-service/)               │
+│                                                                 │
+│   ┌── node A ─────────────┐      ┌── node B ─────────────┐      │
+│   │ MemoryTier (RDMA slab,│      │ MemoryTier (RDMA slab,│      │
+│   │  pre-registered)      │      │  pre-registered)      │      │
+│   │ StorageTier           │      │ StorageTier           │      │
+│   │  io_uring O_DIRECT    │      │  io_uring O_DIRECT    │      │
+│   │  NVMe · NVMe · …      │      │  NVMe · NVMe · …      │      │
+│   └───────────────────────┘      └───────────────────────┘      │
+│      objects ≥ threshold are striped across nodes & disks;      │
+│      readers pull each node's stripes concurrently              │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ placement metadata
+                                ▼
+                        ┌──────────────┐
+                        │    Redis     │
+                        └──────────────┘
 ```
 
-Connector and KVService are built and deployed independently. The Connector handles KV semantics and the vLLM/Dynamo integration; KVService handles shared capacity and high-bandwidth data paths. Neither depends on the other at build time.
+Consumers and KVService are built and deployed independently. Each consumer
+(the in-repo Connector, an external KV manager over client-rs, or the NIXL
+plugin) owns its KV semantics; KVService owns shared capacity, cross-node
+striping, and the high-bandwidth data paths. The RDMA data path serves reads
+via multi-endpoint stripe-subset GETs — optionally with an SGE segment list so
+the server writes straight into the caller's scattered destination buffers —
+and control messages travel on a TCP side channel (NODELAY). Nothing depends
+on anything else at build time.
 
 ---
 
@@ -74,6 +100,8 @@ This keeps hot GETs to a single round trip while remaining correct under concurr
 
 **Multi-node placement.** For striped objects the coordinator uses `PutPlacementChunk` / `ReadPlacementChunk` / `DeletePlacementChunk` to write individual stripes directly to the data node that owns them, keyed off `PlacementChunk{stripe_index, node_id, grpc_endpoint, rdma_endpoint, device_id, storage_handle, offset, length}`. Clients that hold a fresh `PlacementDescriptor` can bypass the coordinator and read the primary node directly — this is what unlocks the RDMA fast path.
 
+**Multi-endpoint + SGE reads.** A reader groups an object's stripes by owning node and issues one stripe-subset GET per node concurrently, so aggregate cold-read bandwidth scales with node count. The SGE variant (wire tag 15) additionally carries the client's destination segment list, letting the server RDMA-WRITE each byte range straight into the caller's scattered buffers — no client-side staging copy. Both RDMA control-plane sockets run with `TCP_NODELAY`. Measured on 2 nodes × 2 NVMe (fio ceiling ~28 GB/s): 6.4–8.8 GB/s per synchronous client stream, 23 GB/s aggregate at 8 concurrent streams, disk-byte-accounted cold reads.
+
 ---
 
 ## Quick start
@@ -102,6 +130,13 @@ make deploy
 KVService reads one TOML config file and requires a reachable Redis metadata
 store. See [`kv-service/configs/README.md`](kv-service/configs/README.md) for
 the config file format and examples.
+
+For **production installation on storage nodes** (immutable release
+directories, atomic activation, hardened systemd unit, post-upgrade acceptance
+checklist), use the versioned toolkit at
+[`deploy/baremetal/`](deploy/baremetal/README.md). Container and JBOF/NVMe-oF
+topologies are covered in
+[`kv-service/deploy/README.md`](kv-service/deploy/README.md).
 
 `make build` enables the RDMA data path, Tier B `io-uring`, and Prometheus
 metrics. It produces the server, Rust client SDK, and RDMA C ABI under
@@ -278,7 +313,11 @@ make bench
 - **Docker / Compose** — run `make docker` to build the image, then use
   `kv-service/deploy/docker/docker-compose.yml`; the Docker build includes the
   RDMA, `io-uring`, and metrics feature set.
-- **Kubernetes** — `kv-service/deploy/k8s/statefulset.yaml`.
+- **Kubernetes** — three manifests under `kv-service/deploy/k8s/`:
+  `statefulset.yaml` (gRPC only), `statefulset-rdma.yaml` (RDMA, hostNetwork),
+  and `statefulset-rdma-spiderpool.yaml` (RDMA over a Multus/spiderpool
+  secondary NIC with fixed-IP pools and dynamic GID probing — use this when
+  client pods reach storage over the same secondary network).
 - **Systemd** — `kv-service/deploy/systemd/contextstore-server.service`.
 - **JBOF over NVMe-oF** — `kv-service/configs/server-nvmeof.toml` plus the SPDK target and NVMe-oF initiator helpers in `kv-service/deploy/jbof/`. `make build` includes the pre-registered-slab, zero-memcpy RDMA WRITE data path.
 

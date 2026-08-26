@@ -37,7 +37,7 @@ COPY kv-service/configs/ /etc/contextstore/
 
 RUN mkdir -p /var/lib/contextstore /var/log/contextstore
 
-EXPOSE 50051
+EXPOSE 50051 50053 9090
 
 ENTRYPOINT ["/usr/local/bin/contextstore-server"]
 CMD ["--config", "/etc/contextstore/server.toml"]

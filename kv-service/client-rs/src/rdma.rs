@@ -36,6 +36,7 @@ const MSG_PUT_WITH_OPTIONS_REQ: u8 = 10;
 const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
 /// Descriptor GET restricted to a stripe subset (multi-endpoint direct reads).
 const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
+const MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ: u8 = 15;
 /// Stripe-subset PUT (multi-endpoint direct writes).
 const MSG_PUT_STRIPES_REQ: u8 = 13;
 const MSG_PUT_STRIPES_RESP: u8 = 14;
@@ -95,6 +96,19 @@ pub struct RdmaClient {
     resources: Arc<RdmaResources>,
     qp: NonNull<ibv_qp>,
     stream: TcpStream,
+    /// Cached memory registrations keyed by (base pointer, length).
+    ///
+    /// `ibv_reg_mr` costs ~1.5 ms per 56 MB region; callers that reuse the
+    /// same staging buffers across many small-object reads (the redhare
+    /// cold-tier path) would otherwise pay it on every operation. Entries
+    /// live as long as this client (the MR's PD outlives it via the shared
+    /// `Arc<RdmaResources>`), and the cache is bounded — inserting beyond
+    /// the cap evicts the oldest entry.
+    ///
+    /// SAFETY contract with callers of [`Self::register_raw_buffer_cached`]:
+    /// the memory behind a cached registration must stay valid for the whole
+    /// lifetime of this client (buffer pools that never free satisfy this).
+    mr_cache: Vec<((usize, usize), RegisteredBuffer<'static>)>,
 }
 
 // SAFETY: A client is exclusively accessed through `&mut self`; libibverbs
@@ -106,6 +120,39 @@ unsafe impl Send for RdmaClient {}
 ///
 /// The buffer must remain registered for the full RDMA operation. The lifetime
 /// parameter and the private marker enforce that requirement for the safe API.
+/// A `Copy` view of a cached registration: destination address, rkey, and
+/// length. Produced by [`RdmaClient::register_raw_buffer_cached`]; the backing
+/// MR stays alive inside the client's cache.
+#[derive(Clone, Copy)]
+pub struct BufferView {
+    addr: u64,
+    rkey: u32,
+    len: usize,
+}
+
+impl BufferView {
+    /// Destination base address of the registered region.
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    /// Remote key of the registration.
+    pub fn rkey(&self) -> u32 {
+        self.rkey
+    }
+
+    fn destination(&self, offset: usize) -> Result<(u64, u32, usize)> {
+        let available = self
+            .len
+            .checked_sub(offset)
+            .ok_or_else(|| anyhow!("RDMA view offset {offset} exceeds length {}", self.len))?;
+        if available == 0 {
+            return Err(anyhow!("RDMA view has no remaining capacity"));
+        }
+        Ok((self.addr + offset as u64, self.rkey, available))
+    }
+}
+
 pub struct RegisteredBuffer<'a> {
     // Keeps the PD/CQ/device alive until the MR is deregistered in Drop.
     _resources: Arc<RdmaResources>,
@@ -251,6 +298,11 @@ impl RdmaClient {
         let result = (|| -> Result<TcpStream> {
             let mut stream = TcpStream::connect(&config.endpoint)
                 .with_context(|| format!("connect RDMA control endpoint {}", config.endpoint))?;
+            // 控制面小包必须即时发出: Nagle + delayed-ACK 在多连接并发时会给每个
+            // 请求注入 ~40-200ms 延迟 (数据面 RDMA WRITE 不经 TCP, 不受影响).
+            stream
+                .set_nodelay(true)
+                .context("set TCP_NODELAY on RDMA control stream")?;
             let local = QpInfo {
                 qpn: unsafe { (*qp.as_ptr()).qp_num },
                 psn: random_psn(),
@@ -268,12 +320,44 @@ impl RdmaClient {
                 resources,
                 qp,
                 stream,
+                mr_cache: Vec::new(),
             }),
             Err(error) => {
                 unsafe { ibv_destroy_qp(qp.as_ptr()) };
                 Err(error)
             }
         }
+    }
+
+    /// Like [`Self::register_raw_buffer`], but caches the registration inside
+    /// this client keyed by `(ptr, len)` and returns a `Copy` view of it:
+    /// repeated calls with the same region skip `ibv_reg_mr` (~1.5 ms per
+    /// 56 MB). Intended for pooled staging buffers reused across many
+    /// operations on a pooled client.
+    ///
+    /// # Safety
+    /// In addition to [`Self::register_raw_buffer`]'s requirements, the
+    /// memory must remain valid for the entire lifetime of this client —
+    /// the registration is only released when the client is dropped (or when
+    /// evicted after `MR_CACHE_CAP` other regions have been registered; the
+    /// caller must not use a view older than 16 distinct registrations).
+    pub unsafe fn register_raw_buffer_cached(
+        &mut self,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Result<BufferView> {
+        const MR_CACHE_CAP: usize = 16;
+        let key = (ptr as usize, len);
+        if let Some((_, registered)) = self.mr_cache.iter().find(|(k, _)| *k == key) {
+            return Ok(registered.view());
+        }
+        let registered = unsafe { self.register_raw_buffer(ptr, len)? };
+        let view = registered.view();
+        if self.mr_cache.len() >= MR_CACHE_CAP {
+            self.mr_cache.remove(0);
+        }
+        self.mr_cache.push((key, registered));
+        Ok(view)
     }
 
     /// Register a mutable host buffer for use as an RDMA read target or write
@@ -408,6 +492,90 @@ impl RdmaClient {
         request.extend_from_slice(&count.to_le_bytes());
         for idx in stripes {
             request.extend_from_slice(&idx.to_le_bytes());
+        }
+        self.stream.write_all(&request)?;
+        self.stream.flush()?;
+        read_get_response(&mut self.stream)
+    }
+
+    /// [`Self::get_descriptor_stripes_into`] for a cached [`BufferView`]
+    /// (see [`Self::register_raw_buffer_cached`]). Splitting the borrow this
+    /// way lets the view be produced by `&mut self` and then used by another
+    /// `&mut self` call without conflicting borrows.
+    pub fn get_descriptor_stripes_into_view(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        view: BufferView,
+        offset: usize,
+    ) -> Result<RdmaReadResult> {
+        let key = descriptor
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("RDMA descriptor is missing its object key"))?;
+        let (dst_addr, rkey, available) = view.destination(offset)?;
+        let mut request = build_descriptor_get_request(
+            &canonical_key(&key.namespace, &key.object_key),
+            descriptor,
+            dst_addr,
+            rkey,
+            available as u64,
+        )?;
+        if !stripes.is_empty() {
+            request[0] = MSG_GET_DESCRIPTOR_STRIPES_REQ;
+            let count = u16::try_from(stripes.len())
+                .map_err(|_| anyhow!("too many stripes: {}", stripes.len()))?;
+            request.extend_from_slice(&count.to_le_bytes());
+            for idx in stripes {
+                request.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+        self.stream.write_all(&request)?;
+        self.stream.flush()?;
+        read_get_response(&mut self.stream)
+    }
+
+    /// Stripe-subset GET with a scatter destination list (wire tag 15): the
+    /// server maps every served byte onto `segments` (addr, rkey, len — in
+    /// object byte order) and RDMA-WRITEs each piece to its own region,
+    /// eliminating the client-side staging buffer + scatter memcpy. Segments
+    /// may come from different registrations (different rkeys) as long as
+    /// each stays valid for the duration of the call.
+    pub fn get_descriptor_stripes_sge(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        segments: &[(u64, u32, u64)],
+    ) -> Result<RdmaReadResult> {
+        if segments.is_empty() {
+            return Err(anyhow!("SGE GET requires at least one destination segment"));
+        }
+        let key = descriptor
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("RDMA descriptor is missing its object key"))?;
+        let total: u64 = segments.iter().map(|(_, _, len)| *len).sum();
+        let mut request = build_descriptor_get_request(
+            &canonical_key(&key.namespace, &key.object_key),
+            descriptor,
+            segments[0].0,
+            segments[0].1,
+            total,
+        )?;
+        request[0] = MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ;
+        let count = u16::try_from(stripes.len())
+            .map_err(|_| anyhow!("too many stripes: {}", stripes.len()))?;
+        request.extend_from_slice(&count.to_le_bytes());
+        for idx in stripes {
+            request.extend_from_slice(&idx.to_le_bytes());
+        }
+        let seg_count = u16::try_from(segments.len())
+            .map_err(|_| anyhow!("too many segments: {}", segments.len()))?;
+        request.extend_from_slice(&seg_count.to_le_bytes());
+        for (addr, rkey, len) in segments {
+            request.extend_from_slice(&addr.to_le_bytes());
+            request.extend_from_slice(&rkey.to_le_bytes());
+            request.extend_from_slice(&len.to_le_bytes());
         }
         self.stream.write_all(&request)?;
         self.stream.flush()?;
@@ -675,6 +843,16 @@ impl<'a> RegisteredBuffer<'a> {
     /// operation is in flight on another connection.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// A `Copy` snapshot of this registration for use with the `_view` call
+    /// variants. Only safe to use while the registration itself stays alive.
+    pub fn view(&self) -> BufferView {
+        BufferView {
+            addr: self.ptr.as_ptr() as u64,
+            rkey: unsafe { (*self.mr.as_ptr()).rkey },
+            len: self.len,
+        }
     }
 
     fn destination(&self, offset: usize) -> Result<(u64, u32, usize)> {

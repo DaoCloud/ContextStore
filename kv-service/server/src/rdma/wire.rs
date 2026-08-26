@@ -56,6 +56,14 @@ pub const MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ: u8 = 11;
 /// so N nodes can fill disjoint regions of one destination buffer in
 /// parallel — the multi-endpoint direct-read building block.
 pub const MSG_GET_DESCRIPTOR_STRIPES_REQ: u8 = 12;
+/// Stripe-subset descriptor GET with a scatter destination list (SGE): the
+/// tag-12 body followed by seg_count(u16) + [seg_addr(8) seg_rkey(4)
+/// seg_len(8)]*. Segments describe the object's byte range in order and must
+/// cover at least the served stripes; the server maps each stripe's object
+/// offset onto the segment list and issues one RDMA WRITE per (stripe-chunk x
+/// segment) overlap. Eliminates the client-side staging buffer + scatter
+/// memcpy for readers whose destination is not contiguous (vLLM KV blocks).
+pub const MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ: u8 = 15;
 /// Stripe-subset PUT: push a set of stripes to the node that owns them.
 /// Flow mirrors the whole-object PUT (req -> ready -> RDMA WRITE -> commit ->
 /// result), but the slab region carries the listed stripes back-to-back and
@@ -195,6 +203,9 @@ pub struct DescriptorGetReqMsg {
     /// Non-empty = tag 12; the server reads only these stripes and writes
     /// each at `dst_addr + index * chunk_size`.
     pub stripes: Vec<u32>,
+    /// Non-empty = tag 15; scatter destination segments (addr, rkey, len)
+    /// covering the object byte range in order. Overrides dst_addr/dst_rkey.
+    pub dst_segments: Vec<(u64, u32, u64)>,
 }
 
 pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg) -> Result<()> {
@@ -215,7 +226,9 @@ pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg
             + 4
             + 8,
     );
-    frame.push(if msg.stripes.is_empty() {
+    frame.push(if !msg.dst_segments.is_empty() {
+        MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ
+    } else if msg.stripes.is_empty() {
         MSG_GET_DESCRIPTOR_REQ
     } else {
         MSG_GET_DESCRIPTOR_STRIPES_REQ
@@ -232,12 +245,25 @@ pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg
     frame.extend_from_slice(&msg.dst_addr.to_le_bytes());
     frame.extend_from_slice(&msg.dst_rkey.to_le_bytes());
     frame.extend_from_slice(&msg.max_size.to_le_bytes());
-    if !msg.stripes.is_empty() {
+    if !msg.stripes.is_empty() || !msg.dst_segments.is_empty() {
+        // tag-15 always carries a stripe list (possibly empty = all stripes
+        // is NOT supported; callers must enumerate) followed by the segment
+        // list; tag-12 carries the stripe list only.
         let count = u16::try_from(msg.stripes.len())
             .map_err(|_| anyhow!("too many stripes: {}", msg.stripes.len()))?;
         frame.extend_from_slice(&count.to_le_bytes());
         for idx in &msg.stripes {
             frame.extend_from_slice(&idx.to_le_bytes());
+        }
+    }
+    if !msg.dst_segments.is_empty() {
+        let count = u16::try_from(msg.dst_segments.len())
+            .map_err(|_| anyhow!("too many dst segments: {}", msg.dst_segments.len()))?;
+        frame.extend_from_slice(&count.to_le_bytes());
+        for (addr, rkey, len) in &msg.dst_segments {
+            frame.extend_from_slice(&addr.to_le_bytes());
+            frame.extend_from_slice(&rkey.to_le_bytes());
+            frame.extend_from_slice(&len.to_le_bytes());
         }
     }
     stream
@@ -252,6 +278,16 @@ pub fn send_descriptor_get_req(stream: &mut TcpStream, msg: &DescriptorGetReqMsg
 pub fn recv_descriptor_get_req_body(
     stream: &mut TcpStream,
     with_stripes: bool,
+) -> Result<DescriptorGetReqMsg> {
+    recv_descriptor_get_req_body_ext(stream, with_stripes, false)
+}
+
+/// `with_segments` selects the tag-15 body: the tag-12 body followed by a
+/// scatter destination segment list.
+pub fn recv_descriptor_get_req_body_ext(
+    stream: &mut TcpStream,
+    with_stripes: bool,
+    with_segments: bool,
 ) -> Result<DescriptorGetReqMsg> {
     let key = read_string_u16(stream, "key")?;
     let object_handle = read_string_u16(stream, "object_handle")?;
@@ -285,6 +321,27 @@ pub fn recv_descriptor_get_req_body(
     } else {
         Vec::new()
     };
+    let dst_segments = if with_segments {
+        let count_b = read_exact(stream, 2)?;
+        let count = u16::from_le_bytes([count_b[0], count_b[1]]) as usize;
+        if count == 0 {
+            return Err(anyhow!("tag-15 GET carries an empty segment list"));
+        }
+        let mut segs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let addr_b = read_exact(stream, 8)?;
+            let rkey_b = read_exact(stream, 4)?;
+            let len_b = read_exact(stream, 8)?;
+            segs.push((
+                u64::from_le_bytes(addr_b.try_into().unwrap()),
+                u32::from_le_bytes(rkey_b.try_into().unwrap()),
+                u64::from_le_bytes(len_b.try_into().unwrap()),
+            ));
+        }
+        segs
+    } else {
+        Vec::new()
+    };
     Ok(DescriptorGetReqMsg {
         key,
         object_handle,
@@ -299,6 +356,7 @@ pub fn recv_descriptor_get_req_body(
         dst_rkey,
         max_size,
         stripes,
+        dst_segments,
     })
 }
 
@@ -696,6 +754,7 @@ mod tests {
             dst_rkey: 42,
             max_size: 1 << 28,
             stripes: vec![1, 3, 5],
+            dst_segments: Vec::new(),
         };
         send_descriptor_get_req(&mut client, &msg).unwrap();
         client.flush().unwrap();
@@ -727,6 +786,7 @@ mod tests {
             dst_rkey: 2,
             max_size: 64,
             stripes: Vec::new(),
+            dst_segments: Vec::new(),
         };
         send_descriptor_get_req(&mut client, &msg).unwrap();
         client.flush().unwrap();

@@ -1,0 +1,34 @@
+[Unit]
+Description=ContextStore KVService
+Documentation=https://github.com/DaoCloud/ContextStore
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/contextstore/nvme0 /mnt/contextstore/nvme1
+
+[Service]
+Type=simple
+User=contextstore
+Group=contextstore
+EnvironmentFile=-/etc/contextstore/contextstore.env
+WorkingDirectory=/opt/contextstore/current
+# NOTE: no ExecStartPre config check — the server binary on main does not
+# implement --check-config. If that flag lands later, re-add:
+#   ExecStartPre=/opt/contextstore/current/bin/contextstore-server --config /etc/contextstore/server.toml --check-config
+ExecStart=/opt/contextstore/current/bin/contextstore-server --config /etc/contextstore/server.toml --log-level info
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+TasksMax=8192
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/mnt/contextstore /opt/contextstore/logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=contextstore-kvservice
+
+[Install]
+WantedBy=multi-user.target
