@@ -22,32 +22,53 @@ path used by redhare's cold-tier backend.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    vLLM / Dynamo                        │
-└────────────────────┬────────────────────────────────────┘
-                     │ KVConnector API
-                     ▼
-┌─────────────────────────────────────────────────────────┐
-│         ContextStore Connector  (src/contextstore/)     │
-│  ┌───────────┐  ┌──────────┐  ┌──────────────────────┐  │
-│  │  Codec    │  │ Prefix   │  │ Scheduler / Worker   │  │
-│  │ (INT8 quant)│ │ Index    │  │ metadata + transfer  │  │
-│  └───────────┘  └──────────┘  └──────────────────────┘  │
-│                       ▼                                 │
-│               StorageBackend                            │
-│    L1 HostMemory  →  L2 Local / Sharded  →  L3 KVService│
-└──────────────────────────────────┬──────────────────────┘
-                                   │ gRPC / RDMA
-                                   ▼
-┌─────────────────────────────────────────────────────────┐
-│                KVService  (kv-service/)                 │
-│  MemoryTier (L1)  →  StorageTier (L2)                   │
-│  IO Executor: Tier A (thread pool) / Tier B (io_uring)   │
-│  RDMA server: pre-registered slab, zero-memcpy WRITE    │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        vLLM / Dynamo                            │
+└──────┬──────────────────────┬──────────────────────┬────────────┘
+       │ KVConnector API      │ KVConnector API      │ NIXL OBJ
+       ▼                      ▼                      ▼
+┌──────────────────┐  ┌───────────────────┐  ┌──────────────────┐
+│ ContextStore     │  │ external KV mgr   │  │ NIXL plugin      │
+│ Connector        │  │ (e.g. redhare     │  │ (nixl-plugin/)   │
+│ (src/contextstore)│ │ cold tier)        │  │                  │
+│ Codec · Prefix   │  │        │          │  │                  │
+│ Index · L1/L2    │  │        ▼          │  │                  │
+│ tiers            │  │ client-rs SDK     │  │                  │
+└────────┬─────────┘  │ (kv-service/      │  └────────┬─────────┘
+         │            │  client-rs)       │           │
+         │            └────────┬──────────┘           │
+         │ gRPC               │ gRPC ctl + RDMA data  │
+         │                    │ (multi-endpoint, SGE  │
+         │                    │  scatter direct-write)│
+         ▼                    ▼                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   KVService cluster (kv-service/)               │
+│                                                                 │
+│   ┌── node A ─────────────┐      ┌── node B ─────────────┐      │
+│   │ MemoryTier (RDMA slab,│      │ MemoryTier (RDMA slab,│      │
+│   │  pre-registered)      │      │  pre-registered)      │      │
+│   │ StorageTier           │      │ StorageTier           │      │
+│   │  io_uring O_DIRECT    │      │  io_uring O_DIRECT    │      │
+│   │  NVMe · NVMe · …      │      │  NVMe · NVMe · …      │      │
+│   └───────────────────────┘      └───────────────────────┘      │
+│      objects ≥ threshold are striped across nodes & disks;      │
+│      readers pull each node's stripes concurrently              │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ placement metadata
+                                ▼
+                        ┌──────────────┐
+                        │    Redis     │
+                        └──────────────┘
 ```
 
-Connector and KVService are built and deployed independently. The Connector handles KV semantics and the vLLM/Dynamo integration; KVService handles shared capacity and high-bandwidth data paths. Neither depends on the other at build time.
+Consumers and KVService are built and deployed independently. Each consumer
+(the in-repo Connector, an external KV manager over client-rs, or the NIXL
+plugin) owns its KV semantics; KVService owns shared capacity, cross-node
+striping, and the high-bandwidth data paths. The RDMA data path serves reads
+via multi-endpoint stripe-subset GETs — optionally with an SGE segment list so
+the server writes straight into the caller's scattered destination buffers —
+and control messages travel on a TCP side channel (NODELAY). Nothing depends
+on anything else at build time.
 
 ---
 
