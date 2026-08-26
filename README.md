@@ -74,6 +74,8 @@ This keeps hot GETs to a single round trip while remaining correct under concurr
 
 **Multi-node placement.** For striped objects the coordinator uses `PutPlacementChunk` / `ReadPlacementChunk` / `DeletePlacementChunk` to write individual stripes directly to the data node that owns them, keyed off `PlacementChunk{stripe_index, node_id, grpc_endpoint, rdma_endpoint, device_id, storage_handle, offset, length}`. Clients that hold a fresh `PlacementDescriptor` can bypass the coordinator and read the primary node directly — this is what unlocks the RDMA fast path.
 
+**Multi-endpoint + SGE reads.** A reader groups an object's stripes by owning node and issues one stripe-subset GET per node concurrently, so aggregate cold-read bandwidth scales with node count. The SGE variant (wire tag 15) additionally carries the client's destination segment list, letting the server RDMA-WRITE each byte range straight into the caller's scattered buffers — no client-side staging copy. Both RDMA control-plane sockets run with `TCP_NODELAY`. Measured on 2 nodes × 2 NVMe (fio ceiling ~28 GB/s): 6.4–8.8 GB/s per synchronous client stream, 23 GB/s aggregate at 8 concurrent streams, disk-byte-accounted cold reads.
+
 ---
 
 ## Quick start

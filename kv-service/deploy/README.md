@@ -21,7 +21,14 @@ deploy/
 │   └── docker-compose.yml     # single-host compose
 ├── k8s/
 │   ├── statefulset.yaml       # StatefulSet + Service + ConfigMap (gRPC path only)
-│   └── statefulset-rdma.yaml  # RDMA-enabled variant (hostNetwork + hugepages + IPC_LOCK)
+│   ├── statefulset-rdma.yaml  # RDMA variant A: hostNetwork + hugepages + IPC_LOCK
+│   └── statefulset-rdma-spiderpool.yaml
+│                              # RDMA variant B: Multus/spiderpool secondary NIC,
+│                              # fixed-IP pools, dynamic GID probing, no privileged.
+│                              # Use this when client pods reach storage over the
+│                              # same secondary network (validated at 23 GB/s
+│                              # cold-read aggregate; see manifest comments for
+│                              # the ten field lessons)
 └── jbof/
     ├── spdk_target.sh         # JBOF side: start SPDK NVMe-oF target
     ├── initiator_connect.sh   # Storage host: attach + mount remote namespaces
@@ -83,7 +90,13 @@ kubectl label node <node> contextstore.io/rdma=true
 ```
 
 Then edit `statefulset-rdma.yaml` (HCA device name in `CS_RDMA_DEVICES`,
-NVMe hostPath mounts, Redis URL in the ConfigMap) and apply:
+NVMe hostPath mounts, Redis URL in the ConfigMap) and apply.
+
+`CS_RDMA_DEVICES` accepts `device:ip:port[:gid_index]`. The fourth segment
+matters on secondary-NIC networks (macvlan/SR-IOV), where the RoCE v2 GID
+index is derived from the pod IP and drifts on every pod recreation — probe
+it at startup instead of hard-coding (the spiderpool manifest does this
+automatically; hostNetwork deployments can usually keep the static index).
 
 ```bash
 kubectl apply -f kv-service/deploy/k8s/statefulset-rdma.yaml
