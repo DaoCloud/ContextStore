@@ -1,0 +1,182 @@
+# ContextStore KVService — RDMA StatefulSet (Multus/spiderpool 二级网卡形态).
+#
+# 与 statefulset-rdma.yaml (hostNetwork 形态) 的区别: 本 manifest 是经过真实集群
+# 长时间压测验证的 macvlan/SR-IOV 二级网卡部署形态 —— pod 拿独立 RDMA IP, 不占
+# 宿主机网络命名空间, 客户端 pod 与存储 pod 走同一个 NAD 网络直连.
+# 实测: 2 节点 × 2 NVMe, 冷读聚合 23 GB/s (8 并发客户端), 单客户端 6.4-8.8 GB/s.
+#
+# ─── 部署经验清单 (来自实测, 修改前必读) ─────────────────────────────────────
+#
+# 1. GID index 必须在 pod 内动态探测, 不能写死.
+#    macvlan/SR-IOV 子接口的 RoCE v2 GID 由 pod IP 派生, index 随 pod 重建漂移
+#    (实测同一节点先后出现 3/7/19/21/25/31/33). 下方启动脚本用
+#    "IP 尾两段 hex 匹配 gids/* + gid_attrs/types == RoCE v2" 自动探测.
+#    客户端同理 —— 任何写死 gid_index 的客户端配置都会在 pod 重建后失效.
+#
+# 2. 固定 IP 池 + cluster placement 静态成员表.
+#    多节点条带 (multi-endpoint 读) 要求每个数据节点的 rdma_endpoint 稳定;
+#    用 SpiderIPPool (或等价固定 IP 机制) 给每个 pod 固定 IP, 并把成员表写进
+#    server.toml [[cluster.data_nodes]]. IP 变了客户端 placement 全部失效.
+#
+# 3. macvlan 隔离规则: 子接口 ↔ 父接口(宿主机)不通, 子接口 ↔ 子接口通.
+#    存储 pod 和客户端 pod 都用 NAD 网络时无需特殊处理; 但若客户端跑在宿主机
+#    (hostNetwork), 宿主机需另建 macvlan shim 接口才能访问存储 pod.
+#
+# 4. spiderpool coordinator 可能给 pod 注入劫持路由 (/32 走 veth), 使 RDMA 流量
+#    偏离 net1. 若 QP 建连超时先检查 pod 内 `ip route` 是否有此类路由.
+#
+# 5. 不需要 privileged. spidernet.io/rdmas 设备插件资源 + IPC_LOCK 即可:
+#    设备插件负责 /dev/infiniband 字符设备注入, IPC_LOCK 放开 memlock (slab
+#    启动即 ibv_reg_mr 8GB). (hostPath /dev/infiniband + IPC_LOCK 而无设备插件
+#    在 containerd 2.x 上验证不足 —— cgroup device 控制器仍会拦 ioctl.)
+#
+# 6. HugePages 要下调预算. hugepages-2Mi limit 必须 >= slab 大小 + 余量;
+#    宿主机 nr_hugepages 池是全节点共享的, 若另一个 pod (或上一个自己) 没释放,
+#    新 pod 会 Pending. slab mmap MAP_HUGETLB 失败自动降普通页 (性能略降可用),
+#    可用 CS_RDMA_SLAB_MB 调小 slab 应急.
+#
+# 7. 二进制热更新通道 (调试期可选): 用 hostPath 挂一个宿主机目录, exec 宿主机
+#    目录里的新二进制, 免重打镜像. 生产部署应移除, 改回镜像内二进制.
+#
+# 8. TCP_NODELAY: RDMA 控制面 (50053) 是 TCP 小包协议, server/client 均已在代码
+#    里 set_nodelay(true) (commit e944147). 升级旧版本时注意包含此修复.
+#
+# 9. readinessProbe 探 RDMA 控制面端口要用 net1 IP, 不能用 localhost —— 服务
+#    只 bind 在 RDMA 网卡 IP 上.
+#
+# 10. 性能验收基线 (2 节点 4 NVMe, 单盘 fio ~7 GB/s):
+#     - 单客户端冷读 >= 6 GB/s; 8 客户端聚合 >= 20 GB/s (甜点为每节点 4 QP)
+#     - 每轮验收必须: 重启存储 pod + 双节点 drop_caches + iostat 字节对账,
+#       否则测到的是 slab/页缓存. 参考 docs 的存储性能测试报告.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: contextstore-kv-rdma
+  labels:
+    app: contextstore-kv-rdma
+spec:
+  clusterIP: None
+  selector:
+    app: contextstore-kv-rdma
+  ports:
+    - name: grpc
+      port: 50051
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: contextstore-kv-rdma
+  labels:
+    app: contextstore-kv-rdma
+spec:
+  serviceName: contextstore-kv-rdma
+  replicas: 2
+  selector:
+    matchLabels:
+      app: contextstore-kv-rdma
+  template:
+    metadata:
+      labels:
+        app: contextstore-kv-rdma
+      annotations:
+        # ① NAD: macvlan/SR-IOV 二级网卡 (按集群实际 NAD 名修改)
+        k8s.v1.cni.cncf.io/networks: kube-system/rdma-net
+        # ② 固定 IP 池: 保证 cluster.data_nodes 里的 rdma_endpoint 稳定
+        ipam.spidernet.io/ippool: '{"ipv4": ["contextstore-rdma-pool"]}'
+    spec:
+      # 每节点一个 pod: 数据盘是节点本地资源
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["contextstore-kv-rdma"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: kv-service
+          image: contextstore/kv-service:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              # ── GID 自动探测 (经验 #1): 从 RDMA 网卡 IP 反查 RoCE v2 GID index ──
+              # RDMA_SUBNET_PREFIX 按 IP 池网段修改.
+              NET1_IP=$(hostname -I | tr ' ' '\n' | grep "^${RDMA_SUBNET_PREFIX}" | head -1)
+              HEX=$(printf '%02x%02x:%02x%02x' $(echo $NET1_IP | tr '.' ' '))
+              GID_IDX=$(grep -l "ffff:$HEX" /sys/class/infiniband/${RDMA_DEVICE}/ports/1/gids/* | while read f; do
+                i=$(basename $f)
+                t=$(cat /sys/class/infiniband/${RDMA_DEVICE}/ports/1/gid_attrs/types/$i)
+                [ "$t" = 'RoCE v2' ] && echo $i && break
+              done)
+              echo "rdma_ip=$NET1_IP gid_index=$GID_IDX pod=$HOSTNAME"
+              export CS_RDMA_DEVICES="${RDMA_DEVICE}:$NET1_IP:50053:$GID_IDX"
+              # ── cluster placement 静态成员表 (经验 #2): 追加到基础配置 ──
+              # 成员 IP 必须与 SpiderIPPool 固定分配一致; 扩容节点时同步增改.
+              cp /etc/contextstore/server.toml /tmp/server.toml
+              cat >> /tmp/server.toml <<CEOF
+
+              [cluster]
+              node_id = "$HOSTNAME"
+              grpc_advertise = "$HOSTNAME.contextstore-kv-rdma.$POD_NAMESPACE.svc:50051"
+              rdma_advertise = "$NET1_IP:50053"
+              CEOF
+              # data_nodes 成员表由 configmap 提供 (cluster-members.toml), 与 IP 池对应
+              cat /etc/contextstore/cluster-members.toml >> /tmp/server.toml 2>/dev/null || true
+              exec /usr/local/bin/contextstore-server --config /tmp/server.toml
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: RDMA_DEVICE
+              value: mlx5_1           # 按 NAD 绑定的 HCA 修改
+            - name: RDMA_SUBNET_PREFIX
+              value: "192.168.222."   # 按 IP 池网段修改
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - { name: grpc, containerPort: 50051 }
+            - { name: rdma-ctl, containerPort: 50053 }
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                # 经验 #9: 探 RDMA 网卡 IP, 不是 localhost
+                - IP=$(hostname -I | tr " " "\n" | grep "^192\.168\.222\." | head -1); timeout 2 bash -c "</dev/tcp/$IP/50053"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: 20Gi
+              hugepages-2Mi: 10Gi          # >= slab (默认 8GB) + 余量 (经验 #6)
+            limits:
+              cpu: "8"
+              memory: 20Gi
+              hugepages-2Mi: 10Gi
+              spidernet.io/rdmas: "1"      # RDMA 设备插件资源 (经验 #5), 按集群插件改名
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]            # slab ibv_reg_mr 需要; 不需要 privileged
+          volumeMounts:
+            - { name: config, mountPath: /etc/contextstore, readOnly: true }
+            - { name: hugepages, mountPath: /dev/hugepages }
+            - { name: nvme0, mountPath: /data/nvme0 }
+            - { name: nvme1, mountPath: /data/nvme1 }
+      volumes:
+        - name: config
+          configMap:
+            name: contextstore-kv-config
+        - name: hugepages
+          emptyDir:
+            medium: HugePages-2Mi
+        # 数据盘: 每节点本地 NVMe (与 server.toml storage.data_dirs 对应)
+        - name: nvme0
+          hostPath: { path: /mnt/contextstore/nvme0, type: DirectoryOrCreate }
+        - name: nvme1
+          hostPath: { path: /mnt/contextstore/nvme1, type: DirectoryOrCreate }
