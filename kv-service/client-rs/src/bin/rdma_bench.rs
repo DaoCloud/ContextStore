@@ -32,10 +32,12 @@ struct Args {
 
     /// Benchmark direction: `get` (default) reads an existing object;
     /// `put` writes `--put-mb` of patterned data per iteration over the
-    /// RDMA data plane (PutReq -> server slab grant -> RDMA WRITE ->
-    /// commit -> server pwrite), giving the write-path counterpart of
-    /// the read benchmark. `put` requires --namespace/--object-key and
-    /// is single-endpoint only (not valid with --coordinator).
+    /// RDMA data plane. Without --coordinator this is a single-endpoint
+    /// direct write (no placement, all data lands on --server's node);
+    /// with --coordinator it takes the cross-node striped path
+    /// (PrepareDistributedPut -> per-node concurrent stripe RDMA PUT ->
+    /// CommitDistributedPut), matching production clients — use this to
+    /// seed objects whose reads exercise every node and disk.
     #[arg(long, default_value = "get")]
     mode: String,
 
@@ -144,6 +146,9 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Result<Vec<u8>> {
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.mode == "put" {
+        if args.coordinator.is_some() {
+            return run_distributed_put(&args);
+        }
         return run_put(&args);
     }
     if args.mode != "get" {
@@ -154,6 +159,237 @@ fn main() -> Result<()> {
         return run_multi_endpoint(&args, coordinator);
     }
     run_single_endpoint(&args, &object_key)
+}
+
+/// Distributed RDMA PUT benchmark (`--mode put --coordinator ...`): each
+/// iteration writes a fresh object through the cross-node striped write path —
+/// gRPC `PrepareDistributedPut` reserves the striped layout on the coordinator,
+/// stripes are grouped by owning node and pushed with one concurrent
+/// stripe-subset RDMA PUT (wire tag 13) per node, then a single
+/// `CommitDistributedPut` publishes the assembled placement. This is the write
+/// counterpart of the multi-endpoint GET, and what redhare's cold tier does in
+/// production; the single-endpoint `run_put` below bypasses placement entirely.
+fn run_distributed_put(args: &Args) -> Result<()> {
+    use contextstore_client_rs::pb;
+
+    let namespace = args
+        .namespace
+        .as_deref()
+        .ok_or_else(|| anyhow!("--mode put requires --namespace"))?;
+    let object_key = args
+        .object_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("--mode put requires --object-key"))?;
+    let coordinator = args.coordinator.as_deref().unwrap();
+    let coordinator = if coordinator.starts_with("http://") || coordinator.starts_with("https://") {
+        coordinator.to_string()
+    } else {
+        format!("http://{coordinator}")
+    };
+
+    let size = args.put_mb * 1024 * 1024;
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    // Patterned payload: byte i = i % 251 (prime, detects offset shifts) —
+    // identical to the single-endpoint PUT so GET-side data_ok checks hold.
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+
+    let mut times = Vec::with_capacity(args.iters);
+    let mut endpoint_count_seen = 0usize;
+    // NOTE: each iteration pays full connection setup — a fresh QP handshake
+    // and a 1 GB MR registration (~27 ms) per endpoint plus two gRPC round
+    // trips. Production clients amortize these across many puts via pooled
+    // connections; treat the numbers here as a floor, not the path's ceiling.
+    for iter in 1..=args.iters {
+        let key = format!("{object_key}-i{iter}");
+        let t0 = Instant::now();
+
+        // Phase 1: reserve the striped layout.
+        let options = pb::PutOptions {
+            ttl_seconds: args.ttl_seconds,
+            if_not_exists: true,
+            compression: pb::CompressionType::None as i32,
+        };
+        let prepared = runtime.block_on(async {
+            let mut client = KvClient::connect(coordinator.clone())
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            client
+                .prepare_distributed_put(namespace, &key, size as u64, Some(options.clone()))
+                .await
+                .map_err(|e| anyhow!("prepare_distributed_put: {e}"))
+        })?;
+        let Some((descriptor, placement)) = prepared else {
+            return Err(anyhow!(
+                "coordinator rejected the put (if_not_exists race?) for {key}"
+            ));
+        };
+        let chunk_size = descriptor.chunk_size as usize;
+        if chunk_size == 0 {
+            return Err(anyhow!("prepared descriptor has chunk_size 0"));
+        }
+
+        // Group stripes by owning node (same shape as the read path).
+        let mut endpoint_stripes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for chunk in &placement.chunks {
+            if chunk.rdma_endpoint.is_empty() {
+                return Err(anyhow!(
+                    "stripe {} has no RDMA endpoint in prepared placement",
+                    chunk.stripe_index
+                ));
+            }
+            endpoint_stripes
+                .entry(chunk.rdma_endpoint.clone())
+                .or_default()
+                .push(chunk.stripe_index);
+        }
+        for stripes in endpoint_stripes.values_mut() {
+            stripes.sort_unstable();
+            stripes.dedup();
+        }
+        endpoint_count_seen = endpoint_stripes.len();
+        if iter == 1 {
+            println!(
+                "[client] distributed-put placement: endpoints={} stripes={} chunk={} bytes={}",
+                endpoint_stripes.len(),
+                placement.chunks.len(),
+                chunk_size,
+                size
+            );
+            for (endpoint, stripes) in &endpoint_stripes {
+                println!("[client] endpoint {endpoint}: {} stripe(s)", stripes.len());
+            }
+        }
+
+        // Phase 2: one concurrent stripe-subset RDMA PUT per owning node.
+        // Threads (not async) — put_stripes_from is synchronous, mirroring the
+        // read path's per-endpoint worker structure.
+        let payload_ptr = payload.as_mut_ptr() as usize;
+        let (tx, rx) = mpsc::channel::<Result<Vec<contextstore_client_rs::rdma::PutStripeAck>>>();
+        let mut workers = 0usize;
+        for (endpoint, stripes) in &endpoint_stripes {
+            workers += 1;
+            let tx = tx.clone();
+            let endpoint = endpoint.clone();
+            let stripes = stripes.clone();
+            let descriptor = descriptor.clone();
+            let device = args.device.clone();
+            let port = args.port;
+            let gid_index = args.gid_index;
+            thread::spawn(move || {
+                let result = (|| -> Result<Vec<contextstore_client_rs::rdma::PutStripeAck>> {
+                    let config = RdmaClientConfig::new(&endpoint, &device)
+                        .with_port(port)
+                        .with_gid_index(gid_index);
+                    let mut client = RdmaClient::connect(config)?;
+                    // Safety: `payload` outlives every worker (joined via rx below)
+                    // and each stripe range stays within `size`.
+                    let buffer =
+                        unsafe { client.register_raw_buffer(payload_ptr as *mut u8, size) }?;
+                    let subset: Vec<(u32, usize, usize)> = stripes
+                        .iter()
+                        .map(|&idx| {
+                            let start = idx as usize * chunk_size;
+                            let len = chunk_size.min(size - start);
+                            (idx, start, len)
+                        })
+                        .collect();
+                    client.put_stripes_from(&descriptor, &subset, &buffer)
+                })();
+                let _ = tx.send(result);
+            });
+        }
+        drop(tx);
+        let mut acks = Vec::with_capacity(placement.chunks.len());
+        let mut first_err: Option<anyhow::Error> = None;
+        for _ in 0..workers {
+            match rx.recv()? {
+                Ok(mut node_acks) => acks.append(&mut node_acks),
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            // Never commit a partial write: the prepared generation stays
+            // unpublished and node handlers roll back their own stripes.
+            return Err(err);
+        }
+
+        // Phase 3: assemble placement chunks from the acks and commit once.
+        let chunks: Vec<pb::PlacementChunk> = acks
+            .into_iter()
+            .map(|ack| {
+                let node = placement
+                    .chunks
+                    .iter()
+                    .find(|c| c.stripe_index == ack.stripe_index);
+                let start = ack.stripe_index as u64 * descriptor.chunk_size;
+                pb::PlacementChunk {
+                    stripe_index: ack.stripe_index,
+                    node_id: node.map(|n| n.node_id.clone()).unwrap_or_default(),
+                    grpc_endpoint: node.map(|n| n.grpc_endpoint.clone()).unwrap_or_default(),
+                    rdma_endpoint: node.map(|n| n.rdma_endpoint.clone()).unwrap_or_default(),
+                    device_id: ack.device_id,
+                    storage_handle: ack.storage_handle,
+                    offset: start,
+                    length: descriptor.chunk_size.min(size as u64 - start),
+                    checksum: ack.checksum,
+                }
+            })
+            .collect();
+        let committed = runtime.block_on(async {
+            let mut client = KvClient::connect(coordinator.clone())
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            client
+                .commit_distributed_put(namespace, &key, descriptor, chunks, Some(options))
+                .await
+                .map_err(|e| anyhow!("commit_distributed_put: {e}"))
+        })?;
+        if !committed {
+            return Err(anyhow!("commit lost an if_not_exists race for {key}"));
+        }
+
+        let dt = t0.elapsed();
+        times.push(dt);
+        let gbps = size as f64 * 8.0 / dt.as_secs_f64() / 1e9;
+        println!(
+            "[client] iter {iter}: bytes={size} endpoints={endpoint_count_seen} time={:.2}ms BW={:.2} Gbps = {:.2} GB/s key={key}",
+            dt.as_secs_f64() * 1000.0,
+            gbps,
+            size as f64 / dt.as_secs_f64() / 1e9,
+        );
+    }
+
+    times.sort();
+    let med = times[times.len() / 2];
+    let min = times[0];
+    let max = times[times.len() - 1];
+    let bw = |d: &Duration| size as f64 / d.as_secs_f64() / 1e9;
+    println!();
+    println!(
+        "[summary] mode=distributed_rdma_put iters={} bytes_per_iter={} ({} MB) endpoints={}",
+        args.iters, size, args.put_mb, endpoint_count_seen
+    );
+    println!(
+        "  latency  min={:.2}ms med={:.2}ms max={:.2}ms",
+        min.as_secs_f64() * 1000.0,
+        med.as_secs_f64() * 1000.0,
+        max.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  BW       max={:.2} GB/s med={:.2} GB/s min={:.2} GB/s",
+        bw(&min),
+        bw(&med),
+        bw(&max)
+    );
+    Ok(())
 }
 
 /// RDMA PUT benchmark: each iteration writes a fresh object (`<object_key>-i<N>`)
