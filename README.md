@@ -12,6 +12,11 @@ The repository is split into two independently built parts, plus a thin plugin l
 | **KVService** | `kv-service/` | Rust | Standalone distributed block-storage service for JBOF / NVMe-oF. Exposes gRPC + RDMA data paths. |
 | NIXL plugin | `nixl-plugin/` | C++ / Rust | Loads ContextStore as NIXL's `CONTEXTSTORE` backend under the `OBJ` descriptor contract. |
 
+KVService is consumer-agnostic: besides the in-repo Connector and NIXL plugin,
+external KV-cache managers integrate through `kv-service/client-rs` (Rust SDK,
+gRPC + RDMA including SGE scatter reads) or the gRPC API directly — this is the
+path used by redhare's cold-tier backend.
+
 ---
 
 ## Architecture
@@ -287,7 +292,11 @@ make bench
 - **Docker / Compose** — run `make docker` to build the image, then use
   `kv-service/deploy/docker/docker-compose.yml`; the Docker build includes the
   RDMA, `io-uring`, and metrics feature set.
-- **Kubernetes** — `kv-service/deploy/k8s/statefulset.yaml`.
+- **Kubernetes** — three manifests under `kv-service/deploy/k8s/`:
+  `statefulset.yaml` (gRPC only), `statefulset-rdma.yaml` (RDMA, hostNetwork),
+  and `statefulset-rdma-spiderpool.yaml` (RDMA over a Multus/spiderpool
+  secondary NIC with fixed-IP pools and dynamic GID probing — use this when
+  client pods reach storage over the same secondary network).
 - **Systemd** — `kv-service/deploy/systemd/contextstore-server.service`.
 - **JBOF over NVMe-oF** — `kv-service/configs/server-nvmeof.toml` plus the SPDK target and NVMe-oF initiator helpers in `kv-service/deploy/jbof/`. `make build` includes the pre-registered-slab, zero-memcpy RDMA WRITE data path.
 
