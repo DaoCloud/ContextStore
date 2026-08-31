@@ -197,3 +197,102 @@ pip install -e '/path/to/ContextStore'   # installs contextstore + contextstore.
 ```
 
 Then point vLLM / Dynamo at the storage host — see the top-level [`README.md`](../../README.md) for the `--kv-transfer-config` payload.
+
+## Failure handling FAQ
+
+KVService keeps object metadata in Redis, object bytes in the configured
+storage tier, and optional hot data in its memory tier. These layers have
+different recovery behavior.
+
+| Failure | Service behavior | Client-visible result | Recovery |
+|---------|------------------|-----------------------|----------|
+| KVService restart | Drops process memory and RDMA connections; keeps committed Redis metadata and storage files. | Requests in flight fail. | Restart the service and retry. The first read may come from storage. |
+| Redis unavailable | Applies the configured timeout, reconnects, and retries the metadata command once. | The operation succeeds after a short interruption or returns an error. | Restore Redis, then retry. There is no in-process metadata fallback. |
+| Object or stripe missing | Rejects the incomplete object and invalidates stale metadata where the object read path owns it. | `NOT_FOUND` or an empty optional result. | Recompute or restore the complete object, then write it again. |
+| Stripe checksum mismatch | Rejects the object instead of returning partial or corrupt data. | `NOT_FOUND` on the normal object read path. | Investigate the device, then rewrite the object. There is no stripe reconstruction. |
+| TTL expired | Treats the object as absent and attempts to remove its metadata and files. | `NOT_FOUND` or an empty optional result. | No client recovery is required unless the object is still needed; then write it again. |
+
+Checksum and TTL behavior require a server and client release that supports
+the corresponding configuration and protocol fields. Do not mix client and
+server artifacts generated from incompatible protocol revisions.
+
+### What survives a KVService restart?
+
+An acknowledged PUT has written the object to the storage tier and committed
+its metadata. Those objects survive a service restart when Redis and the
+storage mounts remain available. The memory tier, registered RDMA buffers, and
+connections are process state and must be rebuilt.
+
+A process termination during PUT is different from an acknowledged PUT. The
+request fails and may leave an unreferenced file if the process stops after a
+physical write but before metadata commit. KVService does not replay in-flight
+requests after restart.
+
+For striped objects, every referenced data node and stripe must be available.
+KVService does not return a partial object and does not reconstruct a missing
+stripe from replicas.
+
+### What happens when Redis is temporarily unavailable?
+
+Each metadata operation uses `redis_connect_timeout_ms` and
+`redis_command_timeout_ms`. After a command failure, KVService opens a new
+connection and retries that command once. If Redis recovers within this
+window, the operation can complete. Otherwise the request returns an error;
+it is not converted into a cache miss.
+
+KVService requires Redis during startup and has no process-local metadata
+fallback. A write whose data reached storage but whose metadata commit failed
+is not readable and may leave an unreferenced file.
+
+### How are missing objects and stripes handled?
+
+Missing metadata is a normal cache miss. If metadata exists but the referenced
+file or stripe is absent, KVService does not return the remaining bytes. The
+normal object read path removes matching stale metadata and returns a miss.
+Direct placement APIs return `NOT_FOUND`; their caller must discard the stale
+descriptor and perform a fresh lookup before deciding whether to recompute.
+
+A data-node connection failure is reported as `UNAVAILABLE`, not
+`NOT_FOUND`. Clients must not delete metadata merely because a node is
+temporarily unreachable.
+
+### What happens when checksum verification fails?
+
+When `storage.verify_stripe_checksums` is enabled, KVService stores an
+xxh3-64 checksum for each physical stripe and verifies it before serving a
+disk read. A missing checksum, short read, or checksum mismatch makes the
+whole object unavailable. KVService logs the integrity failure and never
+returns a partially verified object.
+
+Checksum verification is disabled by default because it adds a memory scan to
+the storage read path. Objects written before verification was enabled have no
+stored checksums and must be rewritten before they can pass verification.
+KVService detects corruption but does not repair or reconstruct the stripe.
+
+### How does TTL cleanup work?
+
+A positive `ttl_seconds` expires an object at `created_at + ttl_seconds`; zero
+or a negative value disables expiry. Expiry is checked by read, existence,
+descriptor, RDMA, and conditional-write paths. The cleanup operation verifies
+the current object identity before deleting metadata, so an expired generation
+cannot delete a newer value written under the same key.
+
+TTL cleanup is lazy. KVService removes an expired object when an operation
+touches it; it does not periodically scan the complete Redis namespace. An
+expired object that is never accessed again can therefore continue to occupy
+storage. File deletion is best effort, so failed deletion can also leave an
+unreferenced file for an external maintenance job to reclaim.
+
+### Which errors should a client retry?
+
+| Status | Client action |
+|--------|---------------|
+| `NOT_FOUND` | Treat as a cache miss and recompute or fetch from another authoritative source. |
+| `UNAVAILABLE` | Retry with bounded exponential backoff; do not invalidate metadata immediately. |
+| `FAILED_PRECONDITION` | Refresh the descriptor or correct the client/server configuration before retrying. |
+| `INTERNAL` | Preserve the error, inspect service and Redis health, and retry only when the failing dependency is healthy. |
+| `ALREADY_EXISTS` or `committed=false` | Treat an immutable or conditional PUT as already committed according to the calling API contract. |
+
+Clients should bound retries and keep transport failures distinct from cache
+misses. KVService is not a write-ahead log and does not provide automatic
+application-request replay.
