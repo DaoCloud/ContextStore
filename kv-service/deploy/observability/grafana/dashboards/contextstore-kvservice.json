@@ -1,0 +1,372 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "type": "row",
+      "title": "Service Overview",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "KVService Health",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "max(kvservice_up{instance=~\"$instance\"})"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto"},
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 1}
+    },
+    {
+      "type": "stat",
+      "title": "Request Rate",
+      "description": "All gRPC requests accepted by KVService.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(rate(kvservice_request_total{instance=~\"$instance\"}[$__rate_interval]))"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 1}
+    },
+    {
+      "type": "stat",
+      "title": "Request p99",
+      "description": "End-to-end KVService request latency, aggregated across operations.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.99, sum by (le) (rate(kvservice_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1000"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 20}, {"color": "red", "value": 100}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 1}
+    },
+    {
+      "type": "stat",
+      "title": "RDMA TX Bandwidth",
+      "description": "Bytes sent by the direct RDMA data path.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(rate(kvservice_rdma_bytes_total{instance=~\"$instance\",direction=\"tx\"}[$__rate_interval]))"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 1}
+    },
+    {
+      "type": "stat",
+      "title": "NVMe Read Bandwidth",
+      "description": "Physical disk bytes read for forced RDMA disk reads.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(rate(kvservice_nvme_read_bytes_total{instance=~\"$instance\"}[$__rate_interval]))"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 1}
+    },
+    {
+      "type": "stat",
+      "title": "Forced Disk Reads",
+      "description": "Rate of RDMA reads explicitly bypassing the slab cache.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(rate(kvservice_force_disk_read_total{instance=~\"$instance\"}[$__rate_interval]))"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 1}
+    },
+    {
+      "type": "row",
+      "title": "Storage Path And Device Balance",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage I/O Throughput By Device",
+      "description": "Writes, deletes, and buffered storage operations. Use the RDMA physical-read panel for the direct RDMA disk path.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (device, operation) (rate(kvservice_storage_io_bytes_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{device}} {{operation}}"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 7}
+    },
+    {
+      "type": "timeseries",
+      "title": "RDMA Physical Disk Read By Device",
+      "description": "Per-NVMe bytes read into the RDMA slab. Matching lines demonstrate balanced disk reads.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (device) (rate(kvservice_nvme_read_bytes_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{device}}"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 16, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 7}
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage I/O p99 Latency",
+      "description": "Batch wall-clock latency per device and operation. It is useful for comparing devices and detecting queueing, not per-stripe latency.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.99, sum by (le, device, operation) (rate(kvservice_storage_io_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1000", "legendFormat": "{{device}} {{operation}}"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage I/O In Flight",
+      "description": "Outstanding I/O operations by device. Sustained imbalance or a rising queue is a tuning signal.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (device, operation) (kvservice_storage_io_inflight{instance=~\"$instance\"})", "legendFormat": "{{device}} {{operation}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 6, "x": 12, "y": 16}
+    },
+    {
+      "type": "timeseries",
+      "title": "Device Used Capacity",
+      "description": "Logical bytes currently owned by each storage device.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "device_used_bytes{instance=~\"$instance\"}", "legendFormat": "{{device}}"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 6, "x": 18, "y": 16}
+    },
+    {
+      "type": "row",
+      "title": "RDMA Data Plane",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 25},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "RDMA Throughput By NIC",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (nic, direction) (rate(kvservice_rdma_bytes_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{nic}} {{direction}}"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 16, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 0, "y": 26}
+    },
+    {
+      "type": "timeseries",
+      "title": "RDMA Transfer p99",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.99, sum by (le, nic, direction) (rate(kvservice_rdma_transfer_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1000", "legendFormat": "{{nic}} {{direction}}"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 8, "y": 26}
+    },
+    {
+      "type": "timeseries",
+      "title": "RDMA Connections And Disk-Read Rate",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (nic) (kvservice_rdma_connections{instance=~\"$instance\"})", "legendFormat": "{{nic}} connections"},
+        {"refId": "B", "expr": "sum(rate(kvservice_force_disk_read_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "forced disk reads/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 26}
+    },
+    {
+      "type": "row",
+      "title": "Metadata And Cache",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Metadata Operations",
+      "description": "Operation rate by metadata operation and outcome.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (operation, status) (rate(kvservice_metadata_operations_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{operation}} {{status}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 0, "y": 36}
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Metadata p99",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(kvservice_metadata_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1000", "legendFormat": "{{operation}}"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 8, "y": 36}
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache And L2 Activity",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(l1_cache_hits_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "L1 hits/s"},
+        {"refId": "B", "expr": "rate(l1_cache_misses_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "L1 misses/s"},
+        {"refId": "C", "expr": "rate(l2_reads_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "L2 reads/s"},
+        {"refId": "D", "expr": "rate(l2_striped_writes_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "striped writes/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 36}
+    },
+    {
+      "type": "row",
+      "title": "Errors And Saturation",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 45},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Request Errors",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (op, status) (rate(kvservice_request_total{instance=~\"$instance\",status!=\"ok\"}[$__rate_interval]))", "legendFormat": "{{op}} {{status}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "decimals": 3, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 16, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 46}
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage I/O Errors",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (device, operation, reason) (rate(kvservice_storage_io_errors_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{device}} {{operation}} {{reason}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "decimals": 3, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 16, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 46}
+    },
+    {
+      "type": "stat",
+      "title": "Redis Reconnects",
+      "description": "Reconnect counter. Any sustained increase is a metadata availability warning.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(increase(kvservice_metadata_reconnect_total{instance=~\"$instance\"}[$__range]))"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "background_solid", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 8, "w": 4, "x": 16, "y": 46}
+    },
+    {
+      "type": "stat",
+      "title": "L1 Cache Size",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "max(l1_cache_size_bytes{instance=~\"$instance\"})"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"},
+      "gridPos": {"h": 8, "w": 4, "x": 20, "y": 46}
+    },
+    {
+      "type": "row",
+      "title": "Host And Dependency Health",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 54},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "NVMe Average I/O Wait",
+      "description": "Average read and write completion time per operation, equivalent to the iostat await value.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "1000 * (rate(node_disk_read_time_seconds_total{instance=~\"$node_instance\",device=~\"nvme.*\"}[$__rate_interval]) + rate(node_disk_write_time_seconds_total{instance=~\"$node_instance\",device=~\"nvme.*\"}[$__rate_interval])) / clamp_min(rate(node_disk_reads_completed_total{instance=~\"$node_instance\",device=~\"nvme.*\"}[$__rate_interval]) + rate(node_disk_writes_completed_total{instance=~\"$node_instance\",device=~\"nvme.*\"}[$__rate_interval]), 0.001)", "legendFormat": "{{instance}} {{device}}"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 0, "y": 55}
+    },
+    {
+      "type": "timeseries",
+      "title": "NVMe Utilization",
+      "description": "Percentage of time each NVMe device is busy, equivalent to the iostat percent-util value.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "rate(node_disk_io_time_seconds_total{instance=~\"$node_instance\",device=~\"nvme.*\"}[$__rate_interval]) * 100", "legendFormat": "{{instance}} {{device}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 8, "y": 55}
+    },
+    {
+      "type": "timeseries",
+      "title": "Filesystem Used",
+      "description": "Used capacity for persistent filesystems reported by node_exporter.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "100 * (1 - node_filesystem_avail_bytes{instance=~\"$node_instance\",fstype!~\"tmpfs|overlay|squashfs|ramfs|nsfs|tracefs\"} / node_filesystem_size_bytes{instance=~\"$node_instance\",fstype!~\"tmpfs|overlay|squashfs|ramfs|nsfs|tracefs\"})", "legendFormat": "{{instance}} {{mountpoint}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 55}
+    },
+    {
+      "type": "stat",
+      "title": "Redis Health",
+      "description": "Availability reported by redis_exporter for the selected Redis instances.",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "min(redis_up{instance=~\"$redis_instance\"})"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 64}
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Connected Clients",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "redis_connected_clients{instance=~\"$redis_instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 64}
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Memory Used",
+      "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+      "targets": [{"refId": "A", "expr": "redis_memory_used_bytes{instance=~\"$redis_instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 2, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 64}
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["contextstore", "kvservice", "rdma", "storage"],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+        "definition": "label_values(kvservice_up, instance)",
+        "query": {"query": "label_values(kvservice_up, instance)", "refId": "StandardVariableQuery"},
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {"selected": true, "text": "All", "value": "$__all"},
+        "refresh": 1,
+        "hide": 0
+      },
+      {
+        "name": "node_instance",
+        "label": "Node exporter instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+        "definition": "label_values(node_uname_info, instance)",
+        "query": {"query": "label_values(node_uname_info, instance)", "refId": "StandardVariableQuery"},
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {"selected": true, "text": "All", "value": "$__all"},
+        "refresh": 1,
+        "hide": 0
+      },
+      {
+        "name": "redis_instance",
+        "label": "Redis exporter instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "contextstore-prometheus"},
+        "definition": "label_values(redis_up, instance)",
+        "query": {"query": "label_values(redis_up, instance)", "refId": "StandardVariableQuery"},
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {"selected": true, "text": "All", "value": "$__all"},
+        "refresh": 1,
+        "hide": 0
+      }
+    ]
+  },
+  "time": {"from": "now-15m", "to": "now"},
+  "timezone": "browser",
+  "title": "ContextStore KVService Performance",
+  "uid": "contextstore-kvservice",
+  "version": 2,
+  "weekStart": ""
+}
