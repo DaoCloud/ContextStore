@@ -35,6 +35,7 @@ pub struct StorageTier {
     striping_chunk_size: u64,
     rdma_stream_chunk_size: usize,
     verify_stripe_checksums: bool,
+    gc_grace_seconds: u64,
     executor_name: String,
     device_labels: Vec<String>,
     metrics: Option<Arc<Metrics>>,
@@ -84,6 +85,7 @@ impl StorageTier {
                 .max(DIRECT_IO_ALIGNMENT)
                 & !(DIRECT_IO_ALIGNMENT - 1),
             verify_stripe_checksums: config.storage.verify_stripe_checksums,
+            gc_grace_seconds: config.gc.grace_seconds,
             executor_name: config.io_executor.kind.clone(),
             device_labels: (0..num_devices)
                 .map(|device_id| format!("nvme{}", device_id))
@@ -127,6 +129,24 @@ impl StorageTier {
             .get(device_id)
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// Return the configured delay before a retired generation may be reclaimed.
+    pub fn gc_grace_seconds(&self) -> u64 {
+        self.gc_grace_seconds
+    }
+
+    fn gc_not_before(&self) -> i64 {
+        chrono::Utc::now().timestamp() + self.gc_grace_seconds as i64
+    }
+
+    /// Atomically remove the current metadata and schedule its physical layout
+    /// for delayed reclamation. L1 invalidation is owned by the caller.
+    pub fn retire(&self, key: &ObjectKey) -> Result<bool> {
+        Ok(self
+            .metadata
+            .retire_block(&key.to_string_key(), self.gc_not_before())?
+            .is_some())
     }
 
     pub fn device_used_bytes(&self, device_id: usize) -> u64 {
@@ -416,6 +436,7 @@ impl StorageTier {
             && actual.size == expected.size
     }
 
+    #[cfg(test)]
     fn delete_files_for_meta(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<()> {
         if let Some(stripe) = &meta.striping {
             let mut last_err = None;
@@ -447,44 +468,6 @@ impl StorageTier {
         Ok(())
     }
 
-    fn delete_expired_files_best_effort(&self, key: &ObjectKey, meta: &BlockMeta) {
-        if let Some(stripe) = &meta.striping {
-            for (index, path) in stripe.chunk_paths.iter().enumerate() {
-                let result = stripe
-                    .chunk_devices
-                    .get(index)
-                    .copied()
-                    .map(|device_id| device_id as usize)
-                    .or_else(|| self.device_id_for_path(Path::new(path)))
-                    .ok_or_else(|| {
-                        KVError::InvalidArgument(format!(
-                            "unable to identify storage device for {}",
-                            path
-                        ))
-                    })
-                    .and_then(|device_id| self.delete_file_on_device(device_id, Path::new(path)));
-                if let Err(error) = result {
-                    warn!(
-                        path = %path,
-                        error = %error,
-                        "failed to delete expired striped file"
-                    );
-                }
-            }
-        } else {
-            let path = self.meta_path_or_route(key, meta);
-            if let Err(error) =
-                self.delete_file_on_device(self.meta_device_or_route(key, meta), &path)
-            {
-                warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "failed to delete expired file"
-                );
-            }
-        }
-    }
-
     fn delete_metadata_if_current(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
         self.metadata
             .delete_block_if_matches(&key.to_string_key(), meta)
@@ -501,7 +484,9 @@ impl StorageTier {
         let result = if if_absent {
             self.metadata.put_block_if_absent(&str_key, meta)
         } else {
-            self.metadata.put_block(&str_key, meta).map(|_| true)
+            self.metadata
+                .replace_block(&str_key, meta, self.gc_not_before())
+                .map(|_| true)
         };
         match result {
             Ok(true) => Ok(true),
@@ -539,8 +524,8 @@ impl StorageTier {
         if !current.is_expired() || !Self::meta_identity_matches(&current, expected) {
             return Ok(false);
         }
-        self.delete_expired_files_best_effort(key, &current);
-        self.delete_metadata_if_current(key, &current)
+        self.metadata
+            .retire_block_if_matches(&str_key, &current, self.gc_not_before())
     }
 
     fn purge_if_expired(&self, key: &ObjectKey, meta: &BlockMeta) -> Result<bool> {
@@ -1250,17 +1235,7 @@ impl StorageTier {
     }
 
     pub fn delete(&self, key: &ObjectKey) -> Result<bool> {
-        let str_key = key.to_string_key();
-        let meta = self.metadata.get_block(&str_key)?;
-        let existed = meta.is_some();
-
-        if let Some(meta) = meta {
-            self.delete_files_for_meta(key, &meta)?;
-            self.delete_metadata_if_current(key, &meta)?;
-            return Ok(existed);
-        }
-        self.metadata.delete_block(&str_key)?;
-        Ok(existed)
+        self.retire(key)
     }
 
     pub fn exists(&self, key: &ObjectKey) -> Result<bool> {
@@ -3026,7 +3001,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_single_object_is_purged_on_get() {
+    fn expired_single_object_is_retired_on_get() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(tmp.path());
         let router = Arc::new(ShardRouter::new(&cfg).unwrap());
@@ -3047,11 +3022,22 @@ mod tests {
             .get_block(&key.to_string_key())
             .unwrap()
             .is_none());
-        assert!(!std::path::Path::new(&path).exists());
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(
+            st.metadata
+                .take_due_gc_tasks(
+                    chrono::Utc::now().timestamp() + cfg.gc.grace_seconds as i64,
+                    1,
+                    1
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
-    fn expired_striped_object_purges_all_chunks() {
+    fn expired_striped_object_is_retired_on_get() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = test_config(tmp.path());
         cfg.storage.striping_threshold = 8;
@@ -3074,13 +3060,22 @@ mod tests {
             .get_block(&key.to_string_key())
             .unwrap()
             .is_none());
-        assert!(paths
-            .iter()
-            .all(|path| !std::path::Path::new(path).exists()));
+        assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+        assert_eq!(
+            st.metadata
+                .take_due_gc_tasks(
+                    chrono::Utc::now().timestamp() + cfg.gc.grace_seconds as i64,
+                    1,
+                    1
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
-    fn expired_object_purges_metadata_when_chunk_cleanup_fails() {
+    fn expired_object_retires_metadata_without_synchronous_chunk_cleanup() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(tmp.path());
         let router = Arc::new(ShardRouter::new(&cfg).unwrap());
@@ -3111,7 +3106,7 @@ mod tests {
             .get_block(&key.to_string_key())
             .unwrap()
             .is_none());
-        assert!(!valid_path.exists());
+        assert!(valid_path.exists());
     }
 
     #[test]
@@ -3507,14 +3502,26 @@ mod tests {
         let (got, _) = st.get(&key).unwrap().unwrap();
         assert_eq!(got.as_ref(), data.as_slice());
 
-        // delete should clean up all chunks.
+        // Delete retires the metadata immediately and preserves the chunk layout
+        // until the background GC worker reaches its grace deadline.
         st.delete(&key).unwrap();
         for p in &stripe.chunk_paths {
             assert!(
-                !std::path::Path::new(p).exists(),
-                "chunk {} still exists",
+                std::path::Path::new(p).exists(),
+                "chunk {} should remain until GC",
                 p
             );
         }
+        assert_eq!(
+            st.metadata
+                .take_due_gc_tasks(
+                    chrono::Utc::now().timestamp() + cfg.gc.grace_seconds as i64,
+                    1,
+                    1
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -176,6 +176,12 @@ redis_command_timeout_ms = 1000
 [metrics]
 enabled = false
 listen = "127.0.0.1:0"
+[gc]
+enabled = true
+interval_seconds = 1
+grace_seconds = 0
+max_tasks_per_run = 100
+task_lease_seconds = 5
 [cluster]
 node_id = "{node}"
 grpc_advertise = "127.0.0.1:{port}"
@@ -336,7 +342,10 @@ async fn assert_four_way_placement(cluster: &Cluster, client: &mut KvClient) {
         .await
         .expect("lookup object")
         .expect("object metadata must exist after put");
-    assert!(lookup.descriptor.is_striped, "object must use striped placement");
+    assert!(
+        lookup.descriptor.is_striped,
+        "object must use striped placement"
+    );
     assert_eq!(lookup.descriptor.stripe_count, 4, "expected four stripes");
     let locations: HashSet<(String, u32)> = lookup
         .placement
@@ -416,7 +425,7 @@ async fn two_node_restart_recovers_shared_metadata_and_stripes() {
 }
 
 #[tokio::test]
-async fn two_node_distributed_delete_removes_all_stripe_files() {
+async fn two_node_distributed_delete_retires_then_reclaims_all_stripe_files() {
     let cluster = Cluster::start("distributed_delete").await;
     let payload = striped_payload();
     let mut client = connect(&cluster, "node-a").await;
@@ -429,16 +438,22 @@ async fn two_node_distributed_delete_removes_all_stripe_files() {
             .delete(TEST_NAMESPACE, TEST_OBJECT_KEY)
             .await
             .expect("distributed delete"),
-        "delete must remove the existing object",
+        "delete must retire the existing object",
     );
-    for node in ["node-a", "node-b"] {
-        for device in 0..2 {
-            assert_eq!(
-                cluster.file_count(node, device),
-                0,
-                "distributed delete must remove stripe from {node}/nvme{device}",
-            );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ["node-a", "node-b"]
+            .into_iter()
+            .all(|node| (0..2).all(|device| cluster.file_count(node, device) == 0))
+        {
+            cluster.log("distributed_delete_reclaimed");
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    cluster.log("distributed_delete_verified");
+    panic!(
+        "distributed GC did not reclaim all stripe files before deadline: {}",
+        cluster.diagnostics()
+    );
 }

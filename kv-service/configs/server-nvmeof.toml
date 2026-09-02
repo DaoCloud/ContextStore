@@ -49,6 +49,13 @@ redis_key_prefix = "contextstore:metadata:"
 redis_connect_timeout_ms = 1000
 redis_command_timeout_ms = 1000
 
+[gc]
+enabled = true
+interval_seconds = 300
+grace_seconds = 600
+max_tasks_per_run = 1000
+task_lease_seconds = 300
+
 [metrics]
 enabled = true
 listen = "0.0.0.0:9090"

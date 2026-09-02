@@ -16,6 +16,9 @@ use std::collections::HashMap;
 
 const BLOCK_META_SEGMENT: &str = "block_meta";
 const GENERATION_SEGMENT: &str = "generation";
+const GC_DUE_SEGMENT: &str = "gc:due";
+const GC_INFLIGHT_SEGMENT: &str = "gc:inflight";
+const GC_TASK_SEGMENT: &str = "gc:task:";
 
 fn default_object_generation() -> u64 {
     1
@@ -113,6 +116,17 @@ impl BlockMeta {
     }
 }
 
+/// A durable request to reclaim a generation that is no longer referenced by
+/// current metadata. The complete placement is retained for crash-safe cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcTask {
+    pub id: String,
+    pub key: String,
+    pub retired: BlockMeta,
+    pub not_before: i64,
+    pub attempts: u32,
+}
+
 enum MetadataBackend {
     Redis(RedisMetadataBackend),
     #[cfg(test)]
@@ -158,6 +172,80 @@ impl MetadataService {
             MetadataBackend::Redis(backend) => backend.put_block_if_absent(key, meta),
             #[cfg(test)]
             MetadataBackend::Memory(backend) => backend.put_block_if_absent(key, meta),
+        }
+    }
+
+    /// Atomically publish `meta` and enqueue the previously visible generation
+    /// for delayed physical reclamation.
+    pub fn replace_block(
+        &self,
+        key: &str,
+        meta: &BlockMeta,
+        not_before: i64,
+    ) -> Result<Option<BlockMeta>> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.replace_block(key, meta, not_before),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.replace_block(key, meta, not_before),
+        }
+    }
+
+    /// Atomically make the object unreachable and enqueue its physical layout.
+    pub fn retire_block(&self, key: &str, not_before: i64) -> Result<Option<BlockMeta>> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.retire_block(key, not_before),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.retire_block(key, not_before),
+        }
+    }
+
+    /// Retire only the metadata version observed by the caller.
+    pub fn retire_block_if_matches(
+        &self,
+        key: &str,
+        expected: &BlockMeta,
+        not_before: i64,
+    ) -> Result<bool> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => {
+                backend.retire_block_if_matches(key, expected, not_before)
+            }
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => {
+                backend.retire_block_if_matches(key, expected, not_before)
+            }
+        }
+    }
+
+    /// Claim due tasks under a time-bounded lease.
+    pub fn take_due_gc_tasks(
+        &self,
+        now: i64,
+        limit: usize,
+        lease_seconds: u64,
+    ) -> Result<Vec<GcTask>> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.take_due_gc_tasks(now, limit, lease_seconds),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => {
+                backend.take_due_gc_tasks(now, limit, lease_seconds)
+            }
+        }
+    }
+
+    pub fn complete_gc_task(&self, task_id: &str) -> Result<()> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.complete_gc_task(task_id),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.complete_gc_task(task_id),
+        }
+    }
+
+    pub fn reschedule_gc_task(&self, task: &GcTask) -> Result<()> {
+        match &self.backend {
+            MetadataBackend::Redis(backend) => backend.reschedule_gc_task(task),
+            #[cfg(test)]
+            MetadataBackend::Memory(backend) => backend.reschedule_gc_task(task),
         }
     }
 
@@ -313,6 +401,18 @@ impl RedisMetadataBackend {
         format!("{}{}:{}", self.prefix, GENERATION_SEGMENT, key)
     }
 
+    fn gc_due_key(&self) -> String {
+        format!("{}{}", self.prefix, GC_DUE_SEGMENT)
+    }
+
+    fn gc_inflight_key(&self) -> String {
+        format!("{}{}", self.prefix, GC_INFLIGHT_SEGMENT)
+    }
+
+    fn gc_task_prefix(&self) -> String {
+        format!("{}{}", self.prefix, GC_TASK_SEGMENT)
+    }
+
     fn serialize(meta: &BlockMeta) -> Result<Vec<u8>> {
         serde_json::to_vec(meta).map_err(|e| KVError::Metadata(format!("serialize: {}", e)))
     }
@@ -340,6 +440,201 @@ impl RedisMetadataBackend {
                 .query::<Option<String>>(connection)
         })?;
         Ok(result.is_some())
+    }
+
+    fn replace_block(
+        &self,
+        key: &str,
+        meta: &BlockMeta,
+        not_before: i64,
+    ) -> Result<Option<BlockMeta>> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+        let script = SCRIPT.get_or_init(|| {
+            redis::Script::new(
+                r#"
+            local old = redis.call("GET", KEYS[1])
+            redis.call("SET", KEYS[1], ARGV[1])
+            if old then
+                local id = redis.sha1hex(KEYS[1] .. ":" .. old)
+                local task_key = ARGV[2] .. id
+                local task = cjson.encode({id=id, key=ARGV[3], retired=cjson.decode(old), not_before=tonumber(ARGV[4]), attempts=0})
+                redis.call("HSET", task_key, "payload", task)
+                redis.call("ZADD", KEYS[2], tonumber(ARGV[4]), task_key)
+            end
+            return old
+            "#,
+            )
+        });
+        let block_key = self.block_key(key);
+        let due_key = self.gc_due_key();
+        let bytes = Self::serialize(meta)?;
+        let old =
+            self.run_with_reconnect("replace block metadata and enqueue GC", |connection| {
+                script
+                    .key(&block_key)
+                    .key(&due_key)
+                    .arg(&bytes)
+                    .arg(self.gc_task_prefix())
+                    .arg(key)
+                    .arg(not_before)
+                    .invoke::<Option<Vec<u8>>>(connection)
+            })?;
+        old.as_deref().map(Self::deserialize).transpose()
+    }
+
+    fn retire_block(&self, key: &str, not_before: i64) -> Result<Option<BlockMeta>> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+        let script = SCRIPT.get_or_init(|| {
+            redis::Script::new(
+                r#"
+            local old = redis.call("GET", KEYS[1])
+            if old then
+                redis.call("DEL", KEYS[1])
+                local id = redis.sha1hex(KEYS[1] .. ":" .. old)
+                local task_key = ARGV[1] .. id
+                local task = cjson.encode({id=id, key=ARGV[2], retired=cjson.decode(old), not_before=tonumber(ARGV[3]), attempts=0})
+                redis.call("HSET", task_key, "payload", task)
+                redis.call("ZADD", KEYS[2], tonumber(ARGV[3]), task_key)
+            end
+            return old
+            "#,
+            )
+        });
+        let block_key = self.block_key(key);
+        let due_key = self.gc_due_key();
+        let old =
+            self.run_with_reconnect("retire block metadata and enqueue GC", |connection| {
+                script
+                    .key(&block_key)
+                    .key(&due_key)
+                    .arg(self.gc_task_prefix())
+                    .arg(key)
+                    .arg(not_before)
+                    .invoke::<Option<Vec<u8>>>(connection)
+            })?;
+        old.as_deref().map(Self::deserialize).transpose()
+    }
+
+    fn retire_block_if_matches(
+        &self,
+        key: &str,
+        expected: &BlockMeta,
+        not_before: i64,
+    ) -> Result<bool> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+        let script = SCRIPT.get_or_init(|| {
+            redis::Script::new(
+                r#"
+            local current = redis.call("GET", KEYS[1])
+            if not current then return 0 end
+            local expected = cjson.decode(ARGV[1])
+            local actual = cjson.decode(current)
+            if actual["object_handle"] ~= expected["object_handle"]
+                or actual["object_generation"] ~= expected["object_generation"]
+                or actual["layout_version"] ~= expected["layout_version"]
+                or actual["content_etag"] ~= expected["content_etag"]
+                or actual["size"] ~= expected["size"] then
+                return 0
+            end
+            redis.call("DEL", KEYS[1])
+            local id = redis.sha1hex(KEYS[1] .. ":" .. current)
+            local task_key = ARGV[2] .. id
+            local task = cjson.encode({id=id, key=ARGV[3], retired=actual, not_before=tonumber(ARGV[4]), attempts=0})
+            redis.call("HSET", task_key, "payload", task)
+            redis.call("ZADD", KEYS[2], tonumber(ARGV[4]), task_key)
+            return 1
+            "#,
+            )
+        });
+        let expected = Self::serialize(expected)?;
+        let block_key = self.block_key(key);
+        let due_key = self.gc_due_key();
+        let retired = self.run_with_reconnect("retire matching block metadata", |connection| {
+            script
+                .key(&block_key)
+                .key(&due_key)
+                .arg(&expected)
+                .arg(self.gc_task_prefix())
+                .arg(key)
+                .arg(not_before)
+                .invoke::<i32>(connection)
+        })?;
+        Ok(retired == 1)
+    }
+
+    fn take_due_gc_tasks(&self, now: i64, limit: usize, lease_seconds: u64) -> Result<Vec<GcTask>> {
+        static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+        let script = SCRIPT.get_or_init(|| redis::Script::new(r#"
+            local expired = redis.call("ZRANGEBYSCORE", KEYS[2], "-inf", ARGV[1])
+            for _, task_key in ipairs(expired) do
+                if redis.call("ZREM", KEYS[2], task_key) == 1 then
+                    redis.call("ZADD", KEYS[1], ARGV[1], task_key)
+                end
+            end
+            local task_keys = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ARGV[2])
+            local payloads = {}
+            for _, task_key in ipairs(task_keys) do
+                if redis.call("ZREM", KEYS[1], task_key) == 1 then
+                    local payload = redis.call("HGET", task_key, "payload")
+                    if payload then
+                        redis.call("ZADD", KEYS[2], tonumber(ARGV[1]) + tonumber(ARGV[3]), task_key)
+                        table.insert(payloads, payload)
+                    end
+                end
+            end
+            return payloads
+        "#));
+        let due_key = self.gc_due_key();
+        let inflight_key = self.gc_inflight_key();
+        let payloads = self.run_with_reconnect("claim due GC tasks", |connection| {
+            script
+                .key(&due_key)
+                .key(&inflight_key)
+                .arg(now)
+                .arg(limit)
+                .arg(lease_seconds)
+                .invoke::<Vec<Vec<u8>>>(connection)
+        })?;
+        payloads
+            .into_iter()
+            .map(|payload| {
+                serde_json::from_slice(&payload)
+                    .map_err(|e| KVError::Metadata(format!("deserialize GC task: {}", e)))
+            })
+            .collect()
+    }
+
+    fn complete_gc_task(&self, task_id: &str) -> Result<()> {
+        let task_key = format!("{}{}", self.gc_task_prefix(), task_id);
+        self.run_with_reconnect("complete GC task", |connection| {
+            let _: () = redis::cmd("ZREM")
+                .arg(self.gc_inflight_key())
+                .arg(&task_key)
+                .query(connection)?;
+            redis::cmd("DEL").arg(&task_key).query::<()>(connection)
+        })
+    }
+
+    fn reschedule_gc_task(&self, task: &GcTask) -> Result<()> {
+        let task_key = format!("{}{}", self.gc_task_prefix(), task.id);
+        let payload = serde_json::to_vec(task)
+            .map_err(|e| KVError::Metadata(format!("serialize GC task: {}", e)))?;
+        self.run_with_reconnect("reschedule GC task", |connection| {
+            let _: () = redis::cmd("ZREM")
+                .arg(self.gc_inflight_key())
+                .arg(&task_key)
+                .query(connection)?;
+            let _: () = redis::cmd("HSET")
+                .arg(&task_key)
+                .arg("payload")
+                .arg(&payload)
+                .query(connection)?;
+            redis::cmd("ZADD")
+                .arg(self.gc_due_key())
+                .arg(task.not_before)
+                .arg(&task_key)
+                .query::<()>(connection)
+        })
     }
 
     fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
@@ -435,6 +730,8 @@ struct MemoryMetadataBackend {
 struct MemoryMetadataInner {
     blocks: HashMap<String, Vec<u8>>,
     generations: HashMap<String, u64>,
+    gc_tasks: HashMap<String, GcTask>,
+    gc_leases: HashMap<String, i64>,
     fail_next_puts: usize,
 }
 
@@ -480,6 +777,136 @@ impl MemoryMetadataBackend {
         }
         inner.blocks.insert(key.to_string(), Self::serialize(meta)?);
         Ok(true)
+    }
+
+    fn task_id(key: &str, meta: &BlockMeta) -> Result<String> {
+        Ok(format!(
+            "{}:g{}:l{}:{}",
+            key, meta.object_generation, meta.layout_version, meta.content_etag
+        ))
+    }
+
+    fn enqueue_gc(
+        inner: &mut MemoryMetadataInner,
+        key: &str,
+        retired: BlockMeta,
+        not_before: i64,
+    ) -> Result<()> {
+        let id = Self::task_id(key, &retired)?;
+        inner.gc_tasks.insert(
+            id.clone(),
+            GcTask {
+                id,
+                key: key.to_string(),
+                retired,
+                not_before,
+                attempts: 0,
+            },
+        );
+        Ok(())
+    }
+
+    fn replace_block(
+        &self,
+        key: &str,
+        meta: &BlockMeta,
+        not_before: i64,
+    ) -> Result<Option<BlockMeta>> {
+        let mut inner = self.inner.lock();
+        if inner.fail_next_puts > 0 {
+            inner.fail_next_puts -= 1;
+            return Err(KVError::Metadata("injected put failure".to_string()));
+        }
+        let old = inner
+            .blocks
+            .insert(key.to_string(), Self::serialize(meta)?)
+            .as_deref()
+            .map(Self::deserialize)
+            .transpose()?;
+        if let Some(retired) = old.as_ref() {
+            Self::enqueue_gc(&mut inner, key, retired.clone(), not_before)?;
+        }
+        Ok(old)
+    }
+
+    fn retire_block(&self, key: &str, not_before: i64) -> Result<Option<BlockMeta>> {
+        let mut inner = self.inner.lock();
+        let old = inner
+            .blocks
+            .remove(key)
+            .as_deref()
+            .map(Self::deserialize)
+            .transpose()?;
+        if let Some(retired) = old.as_ref() {
+            Self::enqueue_gc(&mut inner, key, retired.clone(), not_before)?;
+        }
+        Ok(old)
+    }
+
+    fn same_version(actual: &BlockMeta, expected: &BlockMeta) -> bool {
+        actual.object_handle == expected.object_handle
+            && actual.object_generation == expected.object_generation
+            && actual.layout_version == expected.layout_version
+            && actual.content_etag == expected.content_etag
+            && actual.size == expected.size
+    }
+
+    fn retire_block_if_matches(
+        &self,
+        key: &str,
+        expected: &BlockMeta,
+        not_before: i64,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let current = inner
+            .blocks
+            .get(key)
+            .map(|bytes| Self::deserialize(bytes))
+            .transpose()?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !Self::same_version(&current, expected) {
+            return Ok(false);
+        }
+        inner.blocks.remove(key);
+        Self::enqueue_gc(&mut inner, key, current, not_before)?;
+        Ok(true)
+    }
+
+    fn take_due_gc_tasks(&self, now: i64, limit: usize, lease_seconds: u64) -> Result<Vec<GcTask>> {
+        let mut inner = self.inner.lock();
+        inner.gc_leases.retain(|_, lease_until| *lease_until > now);
+        let ids = inner
+            .gc_tasks
+            .iter()
+            .filter(|(id, task)| task.not_before <= now && !inner.gc_leases.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .take(limit)
+            .collect::<Vec<_>>();
+        let tasks = ids
+            .iter()
+            .filter_map(|id| inner.gc_tasks.get(id).cloned())
+            .collect();
+        let lease_until = now.saturating_add(lease_seconds as i64);
+        for id in ids {
+            inner.gc_leases.insert(id, lease_until);
+        }
+        Ok(tasks)
+    }
+
+    fn complete_gc_task(&self, task_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.gc_tasks.remove(task_id);
+        inner.gc_leases.remove(task_id);
+        Ok(())
+    }
+
+    fn reschedule_gc_task(&self, task: &GcTask) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.gc_leases.remove(&task.id);
+        inner.gc_tasks.insert(task.id.clone(), task.clone());
+        Ok(())
     }
 
     fn get_block(&self, key: &str) -> Result<Option<BlockMeta>> {
@@ -646,6 +1073,71 @@ mod tests {
         meta.object_generation = 10;
         svc.put_block("k1", &meta).unwrap();
         assert_eq!(svc.next_generation("k1").unwrap(), 11);
+    }
+
+    #[test]
+    fn replace_block_enqueues_the_superseded_generation() {
+        let svc = MetadataService::new(&test_config("replace-gc")).unwrap();
+        let first = meta();
+        let mut second = meta();
+        second.object_generation = 2;
+        second.object_handle = "handle-2".to_string();
+        second.content_etag = "etag-2".to_string();
+
+        svc.put_block("k1", &first).unwrap();
+        let retired = svc.replace_block("k1", &second, 100).unwrap().unwrap();
+        assert_eq!(retired.object_generation, first.object_generation);
+        assert_eq!(retired.object_handle, first.object_handle);
+        let current = svc.get_block("k1").unwrap().unwrap();
+        assert_eq!(current.object_generation, second.object_generation);
+        assert_eq!(current.object_handle, second.object_handle);
+
+        let tasks = svc.take_due_gc_tasks(100, 10, 10).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].key, "k1");
+        assert_eq!(tasks[0].retired.object_generation, 1);
+    }
+
+    #[test]
+    fn retiring_a_block_preserves_the_generation_counter() {
+        let svc = MetadataService::new(&test_config("retire-generation")).unwrap();
+        let first = meta();
+        assert_eq!(svc.next_generation("k1").unwrap(), 1);
+        svc.put_block("k1", &first).unwrap();
+
+        let retired = svc.retire_block("k1", 100).unwrap().unwrap();
+        assert_eq!(retired.object_generation, first.object_generation);
+        assert!(svc.get_block("k1").unwrap().is_none());
+        assert_eq!(svc.next_generation("k1").unwrap(), 2);
+    }
+
+    #[test]
+    fn stale_retire_does_not_remove_a_newer_identity() {
+        let svc = MetadataService::new(&test_config("stale-retire")).unwrap();
+        let first = meta();
+        let mut replacement = first.clone();
+        replacement.content_etag = "replacement-etag".to_string();
+        replacement.object_handle = "replacement-handle".to_string();
+
+        svc.put_block("k1", &replacement).unwrap();
+        assert!(!svc.retire_block_if_matches("k1", &first, 100).unwrap());
+        let current = svc.get_block("k1").unwrap().unwrap();
+        assert_eq!(current.object_handle, replacement.object_handle);
+        assert!(svc.take_due_gc_tasks(100, 10, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_gc_lease_can_be_reclaimed() {
+        let svc = MetadataService::new(&test_config("gc-lease")).unwrap();
+        svc.put_block("k1", &meta()).unwrap();
+        svc.retire_block("k1", 100).unwrap();
+
+        let first = svc.take_due_gc_tasks(100, 1, 10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(svc.take_due_gc_tasks(109, 1, 10).unwrap().is_empty());
+        let recovered = svc.take_due_gc_tasks(110, 1, 10).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, first[0].id);
     }
 
     #[test]

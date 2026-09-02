@@ -67,6 +67,7 @@ struct StreamPutStats {
     metadata_elapsed: Duration,
 }
 
+#[derive(Clone)]
 pub struct KVServiceImpl {
     ctx: Arc<KVServiceContext>,
     write_locks: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
@@ -76,6 +77,7 @@ pub struct KVServiceImpl {
 mod tests {
     use super::*;
     use crate::metadata::{ChunkLocation, StripingInfo};
+    use tempfile::TempDir;
 
     fn ctx_with_nodes(nodes: Vec<ClusterNodeConfig>) -> KVServiceContext {
         ctx_with_local_and_nodes("coordinator", "127.0.0.1:50051", nodes)
@@ -104,6 +106,15 @@ mod tests {
             grpc_endpoint: grpc.to_string(),
             rdma_endpoint: String::new(),
         }
+    }
+
+    fn ctx_with_gc_storage(dir: &TempDir) -> Arc<KVServiceContext> {
+        let mut cfg = crate::config::Config::default();
+        cfg.metadata.redis_url = format!("memory://api-service-gc-{}", dir.path().display());
+        cfg.storage.devices = vec![dir.path().join("nvme0")];
+        cfg.storage.striping_threshold = 0;
+        cfg.gc.grace_seconds = 0;
+        Arc::new(KVServiceContext::new(cfg).unwrap())
     }
 
     fn meta() -> BlockMeta {
@@ -342,6 +353,44 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    #[tokio::test]
+    async fn gc_worker_reclaims_only_the_retired_generation() {
+        let dir = TempDir::new().unwrap();
+        let ctx = ctx_with_gc_storage(&dir);
+        let service = KVServiceImpl::new_shared(ctx.clone());
+        let key = key();
+
+        ctx.storage
+            .put(&key, Bytes::from_static(b"generation-one"), meta())
+            .unwrap();
+        let first = ctx
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+        ctx.storage
+            .put(&key, Bytes::from_static(b"generation-two"), meta())
+            .unwrap();
+        let current = ctx
+            .metadata
+            .get_block(&key.to_string_key())
+            .unwrap()
+            .unwrap();
+
+        service.run_gc_once().await;
+
+        assert!(!std::path::Path::new(&first.file_path).exists());
+        assert!(std::path::Path::new(&current.file_path).exists());
+        assert_eq!(
+            ctx.metadata
+                .get_block(&key.to_string_key())
+                .unwrap()
+                .unwrap()
+                .object_generation,
+            current.object_generation
+        );
+    }
 }
 
 impl KVServiceImpl {
@@ -469,17 +518,19 @@ impl KVServiceImpl {
             let metadata = self.ctx.metadata.clone();
             let str_key = key.to_string_key();
             let expected = meta.clone();
-            let deleted = tokio::task::spawn_blocking(move || {
-                metadata.delete_block_if_matches(&str_key, &expected)
+            let not_before = chrono::Utc::now()
+                .timestamp()
+                .saturating_add(self.ctx.config.gc.grace_seconds as i64);
+            let retired = tokio::task::spawn_blocking(move || {
+                metadata.retire_block_if_matches(&str_key, &expected, not_before)
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(Status::from)?;
-            if !deleted {
+            if !retired {
                 return Ok(false);
             }
             self.ctx.memory.invalidate(key);
-            self.delete_distributed_chunks(placement).await?;
             return Ok(true);
         }
 
@@ -533,7 +584,9 @@ impl KVServiceImpl {
         let data_len = data.len() as u64;
         if is_local_node(&ctx, &node) {
             let device_stripe_index = local_device_stripe_index(&ctx, &key, stripe_index)
-                .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
+                .ok_or_else(|| {
+                    Status::failed_precondition("stripe assigned to a different data node")
+                })?;
             let key_for_write = key.clone();
             let storage = ctx.storage.clone();
             let generation = descriptor.object_generation;
@@ -699,7 +752,9 @@ impl KVServiceImpl {
             .map(|loc| chunk_location_to_pb(&key, loc))
             .collect::<Vec<_>>();
         if self.ctx.storage.verify_stripe_checksums()
-            && locations.iter().any(|location| location.checksum.is_empty())
+            && locations
+                .iter()
+                .any(|location| location.checksum.is_empty())
         {
             for chunk in rollback_chunks {
                 let _ = Self::delete_chunk_from_placement(self.ctx.clone(), chunk).await;
@@ -713,10 +768,7 @@ impl KVServiceImpl {
             .iter()
             .map(|loc| loc.storage_handle.clone())
             .collect();
-        let chunk_checksums = locations
-            .iter()
-            .map(|loc| loc.checksum.clone())
-            .collect();
+        let chunk_checksums = locations.iter().map(|loc| loc.checksum.clone()).collect();
         let mut committed = prepared_meta;
         committed.size = total as u64;
         committed.file_path = String::new();
@@ -733,12 +785,17 @@ impl KVServiceImpl {
         let metadata = self.ctx.metadata.clone();
         let str_key = key.to_string_key();
         let committed_meta = committed.clone();
+        let gc_not_before = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(self.ctx.config.gc.grace_seconds as i64);
         let metadata_start = Instant::now();
         let committed_result = tokio::task::spawn_blocking(move || {
             if if_absent {
                 metadata.put_block_if_absent(&str_key, &committed_meta)
             } else {
-                metadata.put_block(&str_key, &committed_meta).map(|_| true)
+                metadata
+                    .replace_block(&str_key, &committed_meta, gc_not_before)
+                    .map(|_| true)
             }
         })
         .await;
@@ -838,7 +895,9 @@ impl KVServiceImpl {
             let chunk_start = Instant::now();
             let data_len: u64 = segments.iter().map(|s| s.len() as u64).sum();
             let device_stripe_index = local_device_stripe_index(&ctx, &key, stripe_index)
-                .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
+                .ok_or_else(|| {
+                    Status::failed_precondition("stripe assigned to a different data node")
+                })?;
             let key_for_write = key.clone();
             let storage = ctx.storage.clone();
             let generation = descriptor.object_generation;
@@ -928,12 +987,8 @@ impl KVServiceImpl {
             .prepare_write_meta(&key, meta, declared_total as u64)
             .map_err(Status::from)?;
         let prepare_elapsed = prepare_start.elapsed();
-        let descriptor = self.make_distributed_descriptor(
-            &key,
-            &prepared_meta,
-            stripe_count,
-            chunk_size as u64,
-        );
+        let descriptor =
+            self.make_distributed_descriptor(&key, &prepared_meta, stripe_count, chunk_size as u64);
 
         let mut inflight: JoinSet<Result<ChunkWriteResult, Status>> = JoinSet::new();
         let mut locations: Vec<ChunkLocation> = Vec::with_capacity(stripe_count);
@@ -1085,10 +1140,7 @@ impl KVServiceImpl {
             .iter()
             .map(|loc| loc.storage_handle.clone())
             .collect();
-        let chunk_checksums = locations
-            .iter()
-            .map(|loc| loc.checksum.clone())
-            .collect();
+        let chunk_checksums = locations.iter().map(|loc| loc.checksum.clone()).collect();
         let mut committed_meta = prepared_meta;
         committed_meta.size = declared_total as u64;
         committed_meta.file_path = String::new();
@@ -1105,12 +1157,17 @@ impl KVServiceImpl {
         let metadata = self.ctx.metadata.clone();
         let str_key = key.to_string_key();
         let meta_for_commit = committed_meta.clone();
+        let gc_not_before = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(self.ctx.config.gc.grace_seconds as i64);
         let metadata_start = Instant::now();
         let committed = tokio::task::spawn_blocking(move || {
             if if_absent {
                 metadata.put_block_if_absent(&str_key, &meta_for_commit)
             } else {
-                metadata.put_block(&str_key, &meta_for_commit).map(|_| true)
+                metadata
+                    .replace_block(&str_key, &meta_for_commit, gc_not_before)
+                    .map(|_| true)
             }
         })
         .await
@@ -1285,6 +1342,73 @@ impl KVServiceImpl {
             result?;
         }
         Ok(())
+    }
+
+    /// Process a bounded set of durable retired-generation tasks. A task is
+    /// checked against current metadata before physical deletion, so delayed
+    /// cleanup cannot remove a generation that has become current again.
+    pub async fn run_gc_once(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let metadata = self.ctx.metadata.clone();
+        let limit = self.ctx.config.gc.max_tasks_per_run;
+        let lease_seconds = self.ctx.config.gc.task_lease_seconds;
+        let tasks = match tokio::task::spawn_blocking(move || {
+            metadata.take_due_gc_tasks(now, limit, lease_seconds)
+        })
+        .await
+        {
+            Ok(Ok(tasks)) => tasks,
+            Ok(Err(error)) => {
+                tracing::warn!("GC could not claim due tasks: {}", error);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("GC task claim worker failed: {}", error);
+                return;
+            }
+        };
+
+        for mut task in tasks {
+            let key = match InternalKey::from_string_key(&task.key) {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(task_id = %task.id, "GC task has invalid key: {}", error);
+                    if let Err(error) = self.ctx.metadata.complete_gc_task(&task.id) {
+                        tracing::warn!(task_id = %task.id, "GC could not discard invalid task: {}", error);
+                    }
+                    continue;
+                }
+            };
+            let current = match self.ctx.metadata.get_block(&task.key) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    self.reschedule_gc_task(&mut task, now, &error.to_string());
+                    continue;
+                }
+            };
+            if current
+                .as_ref()
+                .is_some_and(|meta| Self::meta_identity_matches(meta, &task.retired))
+            {
+                self.reschedule_gc_task(&mut task, now, "retired generation is current");
+                continue;
+            }
+            let placement = placement_from_meta(&self.ctx, &key, &task.retired);
+            if let Err(error) = self.delete_distributed_chunks(placement).await {
+                self.reschedule_gc_task(&mut task, now, error.message());
+            } else if let Err(error) = self.ctx.metadata.complete_gc_task(&task.id) {
+                self.reschedule_gc_task(&mut task, now, &error.to_string());
+            }
+        }
+    }
+
+    fn reschedule_gc_task(&self, task: &mut crate::metadata::GcTask, now: i64, reason: &str) {
+        task.attempts = task.attempts.saturating_add(1);
+        let delay = 5_i64.saturating_mul(1_i64 << task.attempts.min(6));
+        task.not_before = now.saturating_add(delay.min(300));
+        if let Err(error) = self.ctx.metadata.reschedule_gc_task(task) {
+            tracing::warn!(task_id = %task.id, attempts = task.attempts, "GC retry could not be persisted after {}: {}", reason, error);
+        }
     }
 }
 
@@ -1822,34 +1946,13 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             .key
             .ok_or_else(|| Status::invalid_argument("missing key"))?;
         let internal = pb_key_to_internal(&key);
-        let str_key = internal.to_string_key();
-        let meta_ctx = self.ctx.clone();
-        let meta = tokio::task::spawn_blocking(move || meta_ctx.metadata.get_block(&str_key))
+        let storage = self.ctx.storage.clone();
+        let key_for_retire = internal.clone();
+        let ok = tokio::task::spawn_blocking(move || storage.retire(&key_for_retire))
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(Status::from)?;
-        if let Some(meta) = meta.as_ref() {
-            let placement = placement_from_meta(&self.ctx, &internal, meta);
-            if self.placement_has_remote_chunks(&placement) {
-                self.delete_distributed_chunks(placement).await?;
-                self.ctx.memory.invalidate(&internal);
-                let metadata = self.ctx.metadata.clone();
-                let str_key = internal.to_string_key();
-                let expected = meta.clone();
-                tokio::task::spawn_blocking(move || {
-                    metadata.delete_block_if_matches(&str_key, &expected)
-                })
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .map_err(Status::from)?;
-                return Ok(Response::new(pb::DeleteResponse { success: true }));
-            }
-        }
-        let ctx = self.ctx.clone();
-        let ok = tokio::task::spawn_blocking(move || ctx.memory.delete(&internal))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(Status::from)?;
+        self.ctx.memory.invalidate(&internal);
         Ok(Response::new(pb::DeleteResponse { success: ok }))
     }
 
@@ -2175,11 +2278,16 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let metadata = self.ctx.metadata.clone();
         let str_key = internal.to_string_key();
         let meta_for_commit = committed_meta;
+        let gc_not_before = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(self.ctx.config.gc.grace_seconds as i64);
         let committed = tokio::task::spawn_blocking(move || {
             if if_not_exists {
                 metadata.put_block_if_absent(&str_key, &meta_for_commit)
             } else {
-                metadata.put_block(&str_key, &meta_for_commit).map(|_| true)
+                metadata
+                    .replace_block(&str_key, &meta_for_commit, gc_not_before)
+                    .map(|_| true)
             }
         })
         .await
@@ -2218,7 +2326,9 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let stripe_index_u32 = req.stripe_index;
         let stripe_index = stripe_index_u32 as usize;
         let device_stripe_index = local_device_stripe_index(&self.ctx, &internal, stripe_index)
-            .ok_or_else(|| Status::failed_precondition("stripe assigned to a different data node"))?;
+            .ok_or_else(|| {
+                Status::failed_precondition("stripe assigned to a different data node")
+            })?;
         let offset = stripe_index as u64 * req.chunk_size;
         let local = local_node(&self.ctx);
         let ctx = self.ctx.clone();
@@ -2548,8 +2658,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                             let start = i * SUB_CHUNK;
                             let end = (start + SUB_CHUNK).min(seg_len);
                             sent_bytes += (end - start) as u64;
-                            let is_last =
-                                next_send + 1 == stripe_count && i + 1 == n_sub;
+                            let is_last = next_send + 1 == stripe_count && i + 1 == n_sub;
                             let chunk = pb::DataChunk {
                                 data: seg.slice(start..end),
                                 offset: base + start as i64,
@@ -2783,11 +2892,10 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 // a live object refuses the write; an expired one is purged then overwritten.
                 let metadata = self.ctx.metadata.clone();
                 let str_key = internal.to_string_key();
-                let existing =
-                    tokio::task::spawn_blocking(move || metadata.get_block(&str_key))
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?
-                        .map_err(Status::from)?;
+                let existing = tokio::task::spawn_blocking(move || metadata.get_block(&str_key))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(Status::from)?;
                 if let Some(existing) = existing {
                     if !existing.is_expired() {
                         let result = Ok(Response::new(pb::PutResponse {
@@ -2797,7 +2905,8 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                         self.record_request("put_stream", request_start, &result, "ok");
                         return result;
                     }
-                    self.purge_expired_object_locked(&internal, &existing).await?;
+                    self.purge_expired_object_locked(&internal, &existing)
+                        .await?;
                 }
             }
             let first_is_last = first.is_last;
@@ -2841,8 +2950,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 slowest_stripe_us = stats.slowest_stripe.as_micros(),
                 metadata_us = stats.metadata_elapsed.as_micros(),
                 total_us = t_total.as_micros(),
-                throughput_gib_s =
-                    declared_total as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
+                throughput_gib_s = declared_total as f64 / t_total.as_secs_f64() / 1_073_741_824.0,
             );
             let result = Ok(Response::new(pb::PutResponse {
                 success: inserted,

@@ -27,6 +27,8 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub gds: GdsConfig,
+    #[serde(default)]
+    pub gc: GcConfig,
 }
 
 // ===== Cluster / Placement =====
@@ -262,6 +264,33 @@ impl Default for GdsConfig {
     }
 }
 
+// ===== Generation Garbage Collection =====
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcConfig {
+    /// Enable delayed reclamation of superseded object generations.
+    pub enabled: bool,
+    /// Frequency of the persistent retirement-queue worker.
+    pub interval_seconds: u64,
+    /// Minimum time a retired generation remains available on storage.
+    pub grace_seconds: u64,
+    /// Upper bound on queued tasks processed in one worker iteration.
+    pub max_tasks_per_run: usize,
+    /// Task lease duration. Expired leases are reclaimed after a worker crash.
+    pub task_lease_seconds: u64,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            grace_seconds: 600,
+            max_tasks_per_run: 1_000,
+            task_lease_seconds: 300,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -274,6 +303,7 @@ impl Default for Config {
             metadata: Default::default(),
             metrics: Default::default(),
             gds: Default::default(),
+            gc: Default::default(),
         }
     }
 }
@@ -348,6 +378,21 @@ impl Config {
         if self.metadata.redis_command_timeout_ms == 0 {
             return Err(KVError::Config(
                 "metadata.redis_command_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+        if self.gc.enabled && self.gc.interval_seconds == 0 {
+            return Err(KVError::Config(
+                "gc.interval_seconds must be greater than 0 when GC is enabled".to_string(),
+            ));
+        }
+        if self.gc.enabled && self.gc.max_tasks_per_run == 0 {
+            return Err(KVError::Config(
+                "gc.max_tasks_per_run must be greater than 0 when GC is enabled".to_string(),
+            ));
+        }
+        if self.gc.enabled && self.gc.task_lease_seconds == 0 {
+            return Err(KVError::Config(
+                "gc.task_lease_seconds must be greater than 0 when GC is enabled".to_string(),
             ));
         }
         Ok(())
