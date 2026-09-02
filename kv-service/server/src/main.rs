@@ -11,6 +11,7 @@ use contextstore_server::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::Server;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -211,6 +212,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let svc = KVServiceImpl::new_shared(ctx);
+    if config.gc.enabled {
+        let task_worker = svc.clone();
+        let interval = Duration::from_secs(config.gc.interval_seconds);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                task_worker.run_gc_once().await;
+            }
+        });
+        info!(
+            grace_seconds = config.gc.grace_seconds,
+            interval_seconds = config.gc.interval_seconds,
+            "generation garbage collection enabled"
+        );
+    }
     // Large KV payloads: a single layer can reach several MB and a batch several
     // hundred MB. Raise tonic's default 4MB limit to 2GiB.
     let kv_server = KvServiceServer::new(svc)

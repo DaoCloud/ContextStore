@@ -54,6 +54,16 @@ redis_key_prefix = "contextstore:metadata:"
 redis_connect_timeout_ms = 1000
 redis_command_timeout_ms = 1000
 
+[gc]
+# Retire metadata immediately and reclaim superseded physical generations after
+# the grace period. TTL remains access-triggered; this worker does not scan for
+# expired metadata that has not been accessed.
+enabled = true
+interval_seconds = 300
+grace_seconds = 600
+max_tasks_per_run = 1000
+task_lease_seconds = 300
+
 [metrics]
 # Prometheus HTTP exporter (requires --features metrics at build time).
 # Endpoints: GET http://<listen>/metrics, GET http://<listen>/health
