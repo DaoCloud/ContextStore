@@ -11,6 +11,7 @@
 //! cannot be released while its memory region is registered with the NIC.
 
 use crate::pb;
+use crate::multi_rail::{RailReader, RailRegistration};
 use anyhow::{anyhow, Context, Result};
 use rdma_sys::*;
 use std::ffi::{c_void, CStr};
@@ -96,6 +97,8 @@ pub struct RdmaClient {
     resources: Arc<RdmaResources>,
     qp: NonNull<ibv_qp>,
     stream: TcpStream,
+    /// Stable rail identifier (RDMA device name), surfaced to the multi-rail layer.
+    rail_id: String,
     /// Cached memory registrations keyed by (base pointer, length).
     ///
     /// `ibv_reg_mr` costs ~1.5 ms per 56 MB region; callers that reuse the
@@ -320,6 +323,7 @@ impl RdmaClient {
                 resources,
                 qp,
                 stream,
+                rail_id: config.device.clone(),
                 mr_cache: Vec::new(),
             }),
             Err(error) => {
@@ -1246,6 +1250,32 @@ fn poll_completion(cq: NonNull<ibv_cq>) -> Result<()> {
             }
             std::thread::yield_now();
         }
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl RailReader for RdmaClient {
+    fn rail_id(&self) -> String {
+        self.rail_id.clone()
+    }
+
+    unsafe fn register(&mut self, base: *mut u8, len: usize) -> Result<RailRegistration> {
+        let view = self.register_raw_buffer_cached(base, len)?;
+        Ok(RailRegistration {
+            addr: view.addr(),
+            rkey: view.rkey(),
+            len: view.len(),
+        })
+    }
+
+    fn read_stripes(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        segments: &[(u64, u32, u64)],
+    ) -> Result<usize> {
+        self.get_descriptor_stripes_sge(descriptor, stripes, segments)
+            .map(|r| r.unwrap_or(0))
     }
 }
 
