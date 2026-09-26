@@ -46,6 +46,11 @@ src/contextstore/kvservice_client/_pb/*.pyi
 *.swp
 *.swo
 *~
+.workbuddy/
+.codegraph/
+# Competition-only helper scripts (not part of upstream ContextStore)
+build-and-test.cmd
+setup-wsl2-rxe.sh
 
 # Data & logs
 /tmp/

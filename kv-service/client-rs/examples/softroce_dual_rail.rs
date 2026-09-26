@@ -1,31 +1,37 @@
-//! `softroce_dual_rail` — 在 WSL2 的两条 Soft-RoCE 路径上接入赛题多轨读取。
+//! `softroce_dual_rail` — wires the contest multi-rail read onto two Soft-RoCE
+//! paths inside WSL2.
 //!
-//! 编译/运行（需先按 `wsl2-softroce-setup.md` 在 WSL2 拉起 rxe0/rxe1，并部署
-//! 一个在两条 rxe 上各监听一个 RDMA 端点的 ContextStore server）：
+//! Build/run (first bring up rxe0/rxe1 in WSL2 per `wsl2-softroce-setup.md` and
+//! deploy a ContextStore server that listens on one RDMA endpoint per rxe):
 //! ```text
 //! cargo run --features rdma --example softroce_dual_rail
 //! ```
 //!
-//! 本例演示**接线**：把两条独立 `RdmaClient`（各绑 rxe0 / rxe1，各连一个
-//! server 端点）塞进 `RailManager`，即构成"多轨并行读取"的 rail 集合。
-//! 真实读路径复用 `rdma.rs` 已有的 `get_descriptor_stripes_sge`（wire tag 15，
-//! RDMA WRITE 直写 caller 分散缓冲），read 完成信号走 TCP `GET_RESP`。
+//! This example shows the **wiring**: two independent `RdmaClient`s (one bound
+//! to rxe0, one to rxe1, each connected to a server endpoint) are dropped into
+//! `RailManager`, forming the rail set for "multi-rail parallel read". The real
+//! read path reuses `rdma.rs`'s existing `get_descriptor_stripes_sge` (wire tag
+//! 15, RDMA WRITE straight into the caller's scattered buffer); read completion
+//! is signaled over TCP `GET_RESP`.
 //!
-//! 前提（赛题后续项）：server 端需支持"多 RDMA 监听"——即同一对象的不同
-//! stripe 子集分布在两个以不同 rxe 为下层的 QP 上。当前仓库 server 默认单
-//! 监听；本例的 `endpoints` 因此指向两个端口，待 server 改造后即可端到端跑通。
+//! Prerequisite (server-side follow-up): the server must support "multi-RDMA
+//! listen" — i.e. different stripe subsets of the same object land on QPs that
+//! sit on different rxe devices. The current in-repo server listens on a single
+//! device by default; this example's `endpoints` therefore point at two ports
+//! and will run end-to-end once the server is enhanced.
 
 use contextstore_client_rs::multi_rail::{RailManager, RailReader};
 use contextstore_client_rs::pb;
 use contextstore_client_rs::rdma::RdmaClient;
 
 fn main() {
-    // 两条独立 Soft-RoCE 路径：rxe0 挂在 veth0、rxe1 挂在 veth1（见 setup-wsl2-rxe.sh）。
-    // 每个 RdmaClient 连接一个 ContextStore 数据节点端点；该端点在其对应 rxe 上建 QP。
+    // Two independent Soft-RoCE paths: rxe0 on veth0, rxe1 on veth1 (see setup-wsl2-rxe.sh).
+    // Each RdmaClient connects to one ContextStore data-node endpoint; that endpoint
+    // builds its QP on the corresponding rxe.
     let endpoints: [&str; 2] = ["127.0.0.1:50051", "127.0.0.1:50052"];
     let devices: [&str; 2] = ["rxe0", "rxe1"];
 
-    // 把每条真实 RDMA 路径包成一个 `Box<dyn RailReader>`，交给 RailManager。
+    // Wrap each real RDMA path as a `Box<dyn RailReader>` and hand it to RailManager.
     let mut rails: Vec<Box<dyn RailReader>> = Vec::with_capacity(2);
     for i in 0..2 {
         rails.push(
@@ -35,31 +41,33 @@ fn main() {
 
     let manager = RailManager::new(rails);
     println!(
-        "[dual-rail] 已用 {} 条独立 RDMA 路径（rxe0/rxe1）组装多轨读取器",
+        "[dual-rail] assembled multi-rail reader from {} independent RDMA paths (rxe0/rxe1)",
         manager.rail_count()
     );
     if manager.is_single() {
-        println!("[dual-rail] 警告：只有 1 条路径，未构成多轨。请检查 rxe 设备是否拉起。");
+        println!(
+            "[dual-rail] warning: only 1 path present, multi-rail not formed. Check that rxe devices are up."
+        );
     }
 
-    // ---- 真实读模板（取消注释并填入 descriptor / buffer / checksums 即可跑）----
+    // ---- Real read template (uncomment and fill descriptor / buffer / checksums to run) ----
     //
-    // let lookup = client.lookup_object(NS, KEY).await?;  // 从 gRPC 控制面取 descriptor+placement
+    // let lookup = client.lookup_object(NS, KEY).await?;  // fetch descriptor+placement from gRPC control plane
     // let descriptor = lookup.descriptor;
     // let mut buf = vec![0u8; descriptor.size as usize];
     // let checksums: Vec<Option<String>> = descriptor_derived_checksums(&lookup.placement);
     // let mut reader = manager.reader();
     // let stats = reader.read(&descriptor, &checksums, &mut buf)?;
     // manager.reclaim(reader);
-    // println!("[dual-rail] 读完成: {} bytes, 瓶颈={}", stats.total_bytes, stats.bottleneck());
+    // println!("[dual-rail] read done: {} bytes, bottleneck={}", stats.total_bytes, stats.bottleneck());
 
     println!(
-        "[dual-rail] 说明：端到端读需 server 支持多 RDMA 监听（后续项）。\n\
-         \t当前可先在 WSL2 用 `ib_send_bw -d rxe0 ... & ib_send_bw -d rxe1 ... &`\n\
-         \t并行测两条 rxe 的带宽，叠加即多轨聚合的真 verbs 证据（见 setup 手册第 5 步）。"
+        "[dual-rail] note: end-to-end read needs the server to support multi-RDMA listen (server-side follow-up).\n\
+         \tFor now, on WSL2 run `ib_send_bw -d rxe0 ... & ib_send_bw -d rxe1 ... &`\n\
+         \tto measure both rxe bandwidths in parallel; summing them is the real-verbs proof of multi-rail aggregation (see setup manual step 5)."
     );
 }
 
-// 让 pb 被引用，避免未使用告警（真实读时取消注释本函数与调用）。
+// Keep `pb` referenced to avoid an unused-import warning (used in the real read template above).
 #[allow(dead_code)]
 fn _unused(_d: pb::ObjectDescriptor) {}

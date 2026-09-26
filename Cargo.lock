@@ -346,6 +346,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
+ "indexmap 1.9.3",
  "libc",
  "prost",
  "protoc-bin-vendored",
@@ -355,6 +356,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "twox-hash",
 ]
 
 [[package]]
