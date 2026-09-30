@@ -366,6 +366,12 @@ All code and doc changes must follow [`CLAUDE.md`](./CLAUDE.md):
 
 ---
 
+## Origin
+
+Originally created by [DaoCloud](https://github.com/DaoCloud).
+
+---
+
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).
