@@ -166,6 +166,46 @@ fn registration_budget_rejects_before_transport() {
 }
 
 #[test]
+fn per_rail_inflight_limit_counts_concurrent_requests() {
+    let (descriptor, placement) = fixture(64, 8);
+    let configured = vec![routes()[0].clone()];
+    let plan = RailPlan::build(&descriptor, &placement, &configured).unwrap();
+    let limits = RailLimits {
+        max_active_reads: 2,
+        max_inflight_bytes_per_rail: 96,
+        ..RailLimits::default()
+    };
+    let reader = RailReader::new(configured, limits).unwrap();
+    let first = reader.reserve(&plan).unwrap();
+    assert!(matches!(
+        reader.reserve(&plan),
+        Err(RailReadError::ResourceExhausted(_))
+    ));
+    drop(first);
+    assert!(reader.reserve(&plan).is_ok());
+}
+
+#[test]
+fn per_rail_task_limit_counts_concurrent_requests() {
+    let (descriptor, placement) = fixture(64, 8);
+    let configured = vec![routes()[0].clone()];
+    let plan = RailPlan::build(&descriptor, &placement, &configured).unwrap();
+    let limits = RailLimits {
+        max_active_reads: 2,
+        max_active_reads_per_rail: 1,
+        ..RailLimits::default()
+    };
+    let reader = RailReader::new(configured, limits).unwrap();
+    let first = reader.reserve(&plan).unwrap();
+    assert!(matches!(
+        reader.reserve(&plan),
+        Err(RailReadError::ResourceExhausted(_))
+    ));
+    drop(first);
+    assert!(reader.reserve(&plan).is_ok());
+}
+
+#[test]
 fn completed_payload_keeps_staging_and_active_read_reserved_until_drop() {
     let mock = MockTransport::new(vec![0x42; 64]);
     let limits = RailLimits {
@@ -179,6 +219,20 @@ fn completed_payload_keeps_staging_and_active_read_reserved_until_drop() {
         .unwrap();
     assert_eq!(reader.budget.lock().unwrap().active_reads, 1);
     assert!(reader.budget.lock().unwrap().staging_bytes >= 64);
+    assert!(reader
+        .budget
+        .lock()
+        .unwrap()
+        .rail_active_reads
+        .iter()
+        .all(|count| *count == 0));
+    assert!(reader
+        .budget
+        .lock()
+        .unwrap()
+        .rail_inflight_bytes
+        .iter()
+        .all(|bytes| *bytes == 0));
     assert!(matches!(
         reader.read_staged_with(&descriptor, &placement, &mock, None),
         Err(RailReadError::ResourceExhausted(_))

@@ -342,9 +342,11 @@ default setting, older placements may have no checksums. Cancellation and
 publishing share a gate, so whichever starts first determines the result;
 a failed or cancelled read
 leaves its caller buffer unchanged. Each rail owns a compact registered
-receive buffer. The reader retains the active-read and final-staging budget
-through the post-read lookup and publish step; transfer and MR reservations
-end after all rail workers finish. No in-request transparent retry is attempted.
+receive buffer. The reader bounds concurrent tasks and aggregate in-flight
+bytes per rail across simultaneous requests. It retains the active-read and
+final-staging budget through the post-read lookup and publish step; transfer
+and MR reservations end after all rail workers finish. No in-request
+transparent retry is attempted.
 The server's stripe-subset fallback also honors tag-15 scatter destinations
 when its registered slab cannot provide staging space. A fallback WRITE with
 uncertain completion retains its source and MR until its QP is destroyed.

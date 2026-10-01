@@ -91,13 +91,15 @@ impl RailRoute {
 pub struct RailLimits {
     /// Maximum concurrent object reads accepted by this reader.
     pub max_active_reads: usize,
+    /// Maximum concurrent transfer tasks using one configured rail.
+    pub max_active_reads_per_rail: usize,
     /// Maximum final and per-rail staging allocation reserved at once.
     pub max_staging_bytes: u64,
     /// Maximum total MR lengths reserved across active reads.
     pub max_registered_bytes: u64,
     /// Maximum object payload bytes in flight at once.
     pub max_inflight_bytes: u64,
-    /// Maximum payload bytes assigned to one rail for one request.
+    /// Maximum aggregate payload bytes in flight on one rail.
     pub max_inflight_bytes_per_rail: u64,
     /// TCP control deadline for connect, send, and reply operations.
     pub io_timeout: Duration,
@@ -109,6 +111,7 @@ impl Default for RailLimits {
     fn default() -> Self {
         Self {
             max_active_reads: 8,
+            max_active_reads_per_rail: 8,
             max_staging_bytes: 4 * 1024 * 1024 * 1024,
             max_registered_bytes: 4 * 1024 * 1024 * 1024,
             max_inflight_bytes: 4 * 1024 * 1024 * 1024,
@@ -527,6 +530,8 @@ struct BudgetState {
     staging_bytes: u64,
     registered_bytes: u64,
     inflight_bytes: u64,
+    rail_active_reads: Vec<usize>,
+    rail_inflight_bytes: Vec<u64>,
 }
 
 /// Bounded multi-rail reader; one active request uses one QP per chosen rail.
@@ -543,6 +548,7 @@ struct BudgetGuard {
     staging: u64,
     registered: u64,
     inflight: u64,
+    rail_reservations: Vec<(usize, u64)>,
 }
 
 impl BudgetGuard {
@@ -551,6 +557,10 @@ impl BudgetGuard {
         budget.staging_bytes -= self.registered;
         budget.registered_bytes -= self.registered;
         budget.inflight_bytes -= self.inflight;
+        for (index, bytes) in self.rail_reservations.drain(..) {
+            budget.rail_active_reads[index] -= 1;
+            budget.rail_inflight_bytes[index] -= bytes;
+        }
         self.staging -= self.registered;
         self.registered = 0;
         self.inflight = 0;
@@ -564,6 +574,10 @@ impl Drop for BudgetGuard {
         budget.staging_bytes -= self.staging;
         budget.registered_bytes -= self.registered;
         budget.inflight_bytes -= self.inflight;
+        for (index, bytes) in &self.rail_reservations {
+            budget.rail_active_reads[*index] -= 1;
+            budget.rail_inflight_bytes[*index] -= *bytes;
+        }
     }
 }
 
@@ -584,7 +598,10 @@ impl StagedRailRead {
 impl RailReader {
     /// Validate routes and create an RDMA reader without opening connections.
     pub fn new(routes: Vec<RailRoute>, limits: RailLimits) -> Result<Self, RailReadError> {
-        if routes.is_empty() || limits.max_active_reads == 0 {
+        if routes.is_empty()
+            || limits.max_active_reads == 0
+            || limits.max_active_reads_per_rail == 0
+        {
             return Err(RailReadError::InvalidPlacement(
                 "at least one rail and one active read slot are required".into(),
             ));
@@ -626,12 +643,17 @@ impl RailReader {
                 ..RailCounters::default()
             })
             .collect();
+        let route_count = routes.len();
         Ok(Self {
             routes,
             topologies,
             limits,
             counters,
-            budget: Arc::new(Mutex::new(BudgetState::default())),
+            budget: Arc::new(Mutex::new(BudgetState {
+                rail_active_reads: vec![0; route_count],
+                rail_inflight_bytes: vec![0; route_count],
+                ..BudgetState::default()
+            })),
         })
     }
 
@@ -688,15 +710,11 @@ impl RailReader {
             .checked_add(plan.size as u64)
             .ok_or_else(|| RailReadError::ResourceExhausted("staging size overflow".into()))?;
         let inflight = plan.size as u64;
-        if plan
+        let rail_reservations: Vec<(usize, u64)> = plan
             .tasks
             .iter()
-            .any(|task| task.packed_len as u64 > self.limits.max_inflight_bytes_per_rail)
-        {
-            return Err(RailReadError::ResourceExhausted(
-                "per-rail in-flight bytes".into(),
-            ));
-        }
+            .map(|task| (task.route_index, task.packed_len as u64))
+            .collect();
         let mut budget = self.budget.lock().unwrap();
         if budget.active_reads >= self.limits.max_active_reads
             || budget.staging_bytes.saturating_add(staging) > self.limits.max_staging_bytes
@@ -707,15 +725,29 @@ impl RailReader {
                 "active reads, staging, registration, or in-flight bytes".into(),
             ));
         }
+        if rail_reservations.iter().any(|(index, bytes)| {
+            budget.rail_active_reads[*index] >= self.limits.max_active_reads_per_rail
+                || budget.rail_inflight_bytes[*index].saturating_add(*bytes)
+                    > self.limits.max_inflight_bytes_per_rail
+        }) {
+            return Err(RailReadError::ResourceExhausted(
+                "per-rail active tasks or aggregate in-flight bytes".into(),
+            ));
+        }
         budget.active_reads += 1;
         budget.staging_bytes += staging;
         budget.registered_bytes += registered;
         budget.inflight_bytes += inflight;
+        for (index, bytes) in &rail_reservations {
+            budget.rail_active_reads[*index] += 1;
+            budget.rail_inflight_bytes[*index] += *bytes;
+        }
         Ok(BudgetGuard {
             state: Arc::clone(&self.budget),
             staging,
             registered,
             inflight,
+            rail_reservations,
         })
     }
 
