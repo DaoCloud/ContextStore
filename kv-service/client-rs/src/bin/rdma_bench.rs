@@ -161,7 +161,9 @@ fn main() -> Result<()> {
 /// WRITE + commit + striped O_DIRECT pwrite) instead of dedup-skipping.
 fn run_put(args: &Args) -> Result<()> {
     if args.coordinator.is_some() {
-        return Err(anyhow!("--mode put does not support --coordinator (single endpoint only)"));
+        return Err(anyhow!(
+            "--mode put does not support --coordinator (single endpoint only)"
+        ));
     }
     let namespace = args
         .namespace
@@ -697,8 +699,7 @@ fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
                             let seg_len = (buf_size / sge_segments).max(1) as u64;
                             let mut segments = Vec::with_capacity(sge_segments);
                             let mut off = 0u64;
-                            let (base, rkey, total) =
-                                (view.addr(), view.rkey(), buf_size as u64);
+                            let (base, rkey, total) = (view.addr(), view.rkey(), buf_size as u64);
                             while off < total {
                                 let n = seg_len.min(total - off);
                                 segments.push((base + off, rkey, n));
@@ -909,6 +910,10 @@ mod tests {
     #[test]
     fn readable_selector_encodes_canonical_key() {
         let args = Args {
+            mode: "get".to_string(),
+            put_mb: 480,
+            ttl_seconds: 0,
+            sge_segments: 0,
             key: None,
             namespace: Some("rust-bench".to_string()),
             object_key: Some("rdma-checksum0/__combined__".to_string()),

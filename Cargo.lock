@@ -355,6 +355,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "twox-hash",
 ]
 
 [[package]]

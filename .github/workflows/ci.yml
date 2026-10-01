@@ -89,6 +89,37 @@ jobs:
         working-directory: kv-service/server
         run: cargo test --release
 
+  # Compile the real Verbs path and run hardware-independent rail state-machine tests.
+  rust-rdma:
+    name: Rust RDMA client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Verbs build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              protobuf-compiler libclang-dev pkg-config \
+              libibverbs-dev librdmacm-dev
+
+      - name: Test RDMA SDK, benchmark CLI, and Mock state machine
+        working-directory: kv-service/client-rs
+        run: cargo test --features rdma --lib --bins --test rail_read_e2e
+
+      - name: Check RDMA service feature combination
+        working-directory: kv-service/server
+        run: cargo check --features rdma,io-uring,metrics
+
+      - name: Clippy RDMA client
+        working-directory: kv-service/client-rs
+        run: cargo clippy --features rdma --all-targets -- -D warnings
+
   # ==========================================================================
   # E2E: isolated Redis + two loopback KVService nodes
   # ==========================================================================

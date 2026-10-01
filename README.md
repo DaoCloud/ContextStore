@@ -305,6 +305,48 @@ Run the Python benchmark wrapper through the root Makefile with:
 make bench
 ```
 
+### Multi-rail descriptor reads (experimental)
+
+The Rust SDK can read one striped object over multiple local RDMA devices and
+listeners on the same owning storage node. This uses the existing descriptor
+GET and tag-15 SGE protocol; object placement and disk stripes are unchanged.
+`LookupObject` advertises one primary RDMA endpoint per node, so each rail
+explicitly maps that advertised endpoint to a listener on the same node.
+Different rail entries for one node must use different local device/port pairs
+and different remote listeners. A seventh comma-separated rail field may set
+a positive relative scheduling weight; omitted weights default to 1. The
+reader also reports each local device's sysfs NUMA node and PCI address when
+the host exposes them.
+
+```bash
+# Run against an already stored striped object. Set the server's
+# CS_RDMA_DEVICES for both listeners and advertise its primary listener.
+./target/release/cs-rail-read-bench \
+  --environment physical --coordinator http://10.0.0.1:50051 \
+  --namespace bench --object-key large-object \
+  --rail 'r0,mlx5_0,10.0.0.1:50053,10.0.0.1:50053,1,3' \
+  --rail 'r1,mlx5_1,10.0.0.1:50053,10.0.1.1:50054,1,3' \
+  --warmup 1 --iterations 5
+```
+
+Use only the first `--rail` for a comparable single-rail run. The CLI labels
+physical RDMA and Soft-RoCE separately, reports per-rail bytes, and hashes
+every returned object. Set the server's cache policy and disk-read forcing
+identically for both runs; these flags cannot prove a network bottleneck by
+themselves. The SDK's `KvClient::read_multi_rail_into` rechecks descriptor and
+placement identity after the transfer and publishes bytes only after all
+rails and checksums succeed. A failed or cancelled read leaves its caller
+buffer unchanged. Each rail owns a compact registered receive buffer, and
+the reader bounds active requests, in-flight bytes, staging, and registered
+memory. No in-request transparent retry is attempted.
+
+For hardware-independent scheduling and failure checks, run
+`cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
+rail_read::tests`. The ignored `rail_read_e2e` tests require two reachable
+RDMA listeners and the `CS_RAIL_*` endpoint/device environment variables.
+The ignored `software_only_mock_benchmark` exercises scheduling and memory
+copies; its throughput is **not** an RDMA hardware result.
+
 ---
 
 ## Deployment shapes

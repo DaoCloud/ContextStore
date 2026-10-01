@@ -14,6 +14,11 @@ name = "cs-rdma-bench"
 path = "src/bin/rdma_bench.rs"
 required-features = ["rdma"]
 
+[[bin]]
+name = "cs-rail-read-bench"
+path = "src/bin/rail_read_bench.rs"
+required-features = ["rdma"]
+
 [dependencies]
 # gRPC (versions aligned with the server)
 tonic = "0.11"
@@ -29,10 +34,11 @@ clap = { version = "4", features = ["derive"] }
 rdma-sys = { version = "0.3", optional = true }
 anyhow = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
+twox-hash = { version = "1.6", optional = true }
 
 [features]
 default = []
-rdma = ["dep:rdma-sys", "dep:anyhow", "dep:libc"]
+rdma = ["dep:rdma-sys", "dep:anyhow", "dep:libc", "dep:twox-hash"]
 
 [build-dependencies]
 tonic-build = "0.11"
