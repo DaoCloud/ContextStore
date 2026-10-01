@@ -6,19 +6,13 @@
 
 use super::{
     log_io_batch, log_io_error, AlignedBuffer, IOExecutor, IORequest, IoBatchStats, IoLogContext,
+    O_DIRECT_FLAG,
 };
 use crate::error::{KVError, Result};
 use crossbeam_channel as channel;
 use prost::bytes::Bytes;
 use std::path::Path;
 use std::thread;
-
-/// Linux O_DIRECT flag value (x86_64 / aarch64 = 0o40000); fully equivalent to libc::O_DIRECT.
-/// Inlined as a constant to avoid depending on libc (CLAUDE.md: don't modify Cargo.toml deps).
-#[cfg(target_os = "linux")]
-const O_DIRECT_FLAG: i32 = 0o40000;
-#[cfg(not(target_os = "linux"))]
-const O_DIRECT_FLAG: i32 = 0;
 
 /// Alignment required by O_DIRECT (Linux standard page size = filesystem block size = NVMe physical sector).
 pub const DIRECT_IO_ALIGN: usize = 4096;
@@ -834,6 +828,12 @@ impl IOExecutor for TierAExecutor {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_io_flag_matches_native_platform() {
+        assert_eq!(O_DIRECT_FLAG, libc::O_DIRECT);
+    }
 
     #[test]
     fn write_read_roundtrip() {

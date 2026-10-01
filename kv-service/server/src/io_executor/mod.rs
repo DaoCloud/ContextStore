@@ -10,6 +10,15 @@
 mod aligned_buffer;
 mod tier_a;
 
+// Linux arm64 assigns O_DIRECT a different bit from x86. Both executors use
+// this one constant so a future architecture port has one value to verify.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_DIRECT_FLAG: i32 = 0o200000;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const O_DIRECT_FLAG: i32 = 0o40000;
+#[cfg(not(target_os = "linux"))]
+const O_DIRECT_FLAG: i32 = 0;
+
 pub use aligned_buffer::{AlignedBuffer, PooledAlignedBuffer, READ_BUFFER_POOL};
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]

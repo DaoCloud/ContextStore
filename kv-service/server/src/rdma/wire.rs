@@ -700,7 +700,6 @@ pub fn recv_put_stripes_resp(stream: &mut TcpStream) -> Result<PutStripesRespMsg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
 
     /// Round-trip a PutReq frame through a loopback socket with the given
