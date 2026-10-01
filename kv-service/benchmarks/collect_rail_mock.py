@@ -30,7 +30,7 @@ def read_command(*args: str) -> str:
 
 def write_csv(path: Path, rows: list[dict[str, int | float]]) -> None:
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
