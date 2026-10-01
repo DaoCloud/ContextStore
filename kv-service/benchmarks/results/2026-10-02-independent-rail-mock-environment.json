@@ -1,0 +1,21 @@
+{
+  "environment": "Mock software-only; no RDMA Verbs, network, or disk I/O",
+  "host_cpu": "Apple M5 Pro",
+  "guest": "Debian GNU/Linux 12, Linux aarch64, native OrbStack container",
+  "rustc": "1.94.1 (e408947bf 2026-03-25)",
+  "git_commit": "c0543f4",
+  "object_sizes_mib": [
+    64,
+    256,
+    512
+  ],
+  "stripe_mib": 4,
+  "warmup_reads_per_run": 1,
+  "independent_trials": 3,
+  "iterations_per_trial": 10,
+  "rail_counts": [
+    1,
+    2
+  ],
+  "notes": "One rail and two rail runs use the same in-memory object, chunk layout, client, and host. Rows are paired in trial/size order. Per-rail bytes were equal in two-rail runs. This is not hardware RDMA evidence."
+}

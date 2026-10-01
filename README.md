@@ -354,7 +354,11 @@ For hardware-independent scheduling and failure checks, run
 rail_read::tests`. The ignored `rail_read_e2e` tests require two reachable
 RDMA listeners and the `CS_RAIL_*` endpoint/device environment variables.
 The ignored `software_only_mock_benchmark` exercises scheduling and memory
-copies; its throughput is **not** an RDMA hardware result.
+copies; its throughput is **not** an RDMA hardware result. Reproduce its
+paired 1/2-rail matrix and save all per-read samples with
+`python kv-service/benchmarks/collect_rail_mock.py --sizes 64,256,512`.
+The checked-in `kv-service/benchmarks/results/2026-10-02-independent-rail-mock-*`
+files contain one Linux ARM64 software-only run, including environment details.
 
 ---
 
