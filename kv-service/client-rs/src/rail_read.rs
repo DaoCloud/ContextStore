@@ -180,6 +180,7 @@ pub(crate) fn commit_if_unchanged(
     current: &crate::ObjectLookup,
     payload: &[u8],
     destination: &mut [u8],
+    cancel: Option<&RailCancel>,
 ) -> Result<usize, RailReadError> {
     if !same_descriptor_identity(&initial.descriptor, &current.descriptor)
         || initial.placement != current.placement
@@ -200,23 +201,42 @@ pub(crate) fn commit_if_unchanged(
             have: destination.len(),
         });
     }
-    destination[..size].copy_from_slice(payload);
+    if let Some(cancel) = cancel {
+        cancel.publish_if_live(|| destination[..size].copy_from_slice(payload))?;
+    } else {
+        destination[..size].copy_from_slice(payload);
+    }
     Ok(size)
 }
 
 /// Cooperative request cancellation shared with the caller.
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    publish_gate: Mutex<()>,
+}
+
 #[derive(Clone, Default)]
-pub struct RailCancel(Arc<AtomicBool>);
+pub struct RailCancel(Arc<CancelState>);
 
 impl RailCancel {
     /// Request cancellation; already started rail workers still quiesce.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        let _gate = self.0.publish_gate.lock().unwrap();
+        self.0.cancelled.store(true, Ordering::Release);
     }
 
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    fn publish_if_live<T>(&self, publish: impl FnOnce() -> T) -> Result<T, RailReadError> {
+        let _gate = self.0.publish_gate.lock().unwrap();
+        if self.is_cancelled() {
+            return Err(RailReadError::Cancelled);
+        }
+        Ok(publish())
     }
 }
 
@@ -515,23 +535,49 @@ pub struct RailReader {
     topologies: Vec<RailTopology>,
     limits: RailLimits,
     counters: Vec<RailCounters>,
-    budget: Mutex<BudgetState>,
+    budget: Arc<Mutex<BudgetState>>,
 }
 
-struct BudgetGuard<'a> {
-    reader: &'a RailReader,
+struct BudgetGuard {
+    state: Arc<Mutex<BudgetState>>,
     staging: u64,
     registered: u64,
     inflight: u64,
 }
 
-impl Drop for BudgetGuard<'_> {
+impl BudgetGuard {
+    fn finish_transfer(&mut self) {
+        let mut budget = self.state.lock().unwrap();
+        budget.staging_bytes -= self.registered;
+        budget.registered_bytes -= self.registered;
+        budget.inflight_bytes -= self.inflight;
+        self.staging -= self.registered;
+        self.registered = 0;
+        self.inflight = 0;
+    }
+}
+
+impl Drop for BudgetGuard {
     fn drop(&mut self) {
-        let mut budget = self.reader.budget.lock().unwrap();
+        let mut budget = self.state.lock().unwrap();
         budget.active_reads -= 1;
         budget.staging_bytes -= self.staging;
         budget.registered_bytes -= self.registered;
         budget.inflight_bytes -= self.inflight;
+    }
+}
+
+/// A verified private payload that retains its staging and active-read budget
+/// until the caller publishes or discards the bytes.
+pub struct StagedRailRead {
+    bytes: Vec<u8>,
+    _budget: BudgetGuard,
+}
+
+impl StagedRailRead {
+    /// Complete object bytes in descriptor order.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -585,7 +631,7 @@ impl RailReader {
             topologies,
             limits,
             counters,
-            budget: Mutex::new(BudgetState::default()),
+            budget: Arc::new(Mutex::new(BudgetState::default())),
         })
     }
 
@@ -628,7 +674,7 @@ impl RailReader {
         true
     }
 
-    fn reserve(&self, plan: &RailPlan) -> Result<BudgetGuard<'_>, RailReadError> {
+    fn reserve(&self, plan: &RailPlan) -> Result<BudgetGuard, RailReadError> {
         let registered = plan
             .tasks
             .iter()
@@ -666,7 +712,7 @@ impl RailReader {
         budget.registered_bytes += registered;
         budget.inflight_bytes += inflight;
         Ok(BudgetGuard {
-            reader: self,
+            state: Arc::clone(&self.budget),
             staging,
             registered,
             inflight,
@@ -679,13 +725,13 @@ impl RailReader {
         placement: &pb::PlacementDescriptor,
         transport: &T,
         cancel: Option<&RailCancel>,
-    ) -> Result<Vec<u8>, RailReadError> {
+    ) -> Result<StagedRailRead, RailReadError> {
         let mut available = self.routes.clone();
         for (route, counters) in available.iter_mut().zip(&self.counters) {
             route.enabled = counters.is_available();
         }
         let plan = RailPlan::build(descriptor, placement, &available)?;
-        let _budget = self.reserve(&plan)?;
+        let mut budget = self.reserve(&plan)?;
         if cancel.is_some_and(RailCancel::is_cancelled) {
             return Err(RailReadError::Cancelled);
         }
@@ -771,7 +817,11 @@ impl RailReader {
                 });
             }
         }
-        Ok(staged)
+        budget.finish_transfer();
+        Ok(StagedRailRead {
+            bytes: staged,
+            _budget: budget,
+        })
     }
 
     fn read_into_with<T: RailTransport>(
@@ -792,7 +842,11 @@ impl RailReader {
             });
         }
         let staged = self.read_staged_with(descriptor, placement, transport, cancel)?;
-        destination[..size].copy_from_slice(&staged);
+        if let Some(cancel) = cancel {
+            cancel.publish_if_live(|| destination[..size].copy_from_slice(staged.as_bytes()))?;
+        } else {
+            destination[..size].copy_from_slice(staged.as_bytes());
+        }
         Ok(size)
     }
 
@@ -804,7 +858,7 @@ impl RailReader {
         descriptor: &pb::ObjectDescriptor,
         placement: &pb::PlacementDescriptor,
         cancel: Option<&RailCancel>,
-    ) -> Result<Vec<u8>, RailReadError> {
+    ) -> Result<StagedRailRead, RailReadError> {
         self.read_staged_with(descriptor, placement, &VerbsTransport, cancel)
     }
 

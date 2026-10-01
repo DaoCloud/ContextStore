@@ -335,10 +335,19 @@ every returned object. Set the server's cache policy and disk-read forcing
 identically for both runs; these flags cannot prove a network bottleneck by
 themselves. The SDK's `KvClient::read_multi_rail_into` rechecks descriptor and
 placement identity after the transfer and publishes bytes only after all
-rails and checksums succeed. A failed or cancelled read leaves its caller
-buffer unchanged. Each rail owns a compact registered receive buffer, and
-the reader bounds active requests, in-flight bytes, staging, and registered
-memory. No in-request transparent retry is attempted.
+rails and available checksums succeed. To enforce per-stripe checksum
+validation, enable `verify_stripe_checksums` on the server and rewrite the
+objects being tested so their placements contain checksums. With the server's
+default setting, older placements may have no checksums. Cancellation and
+publishing share a gate, so whichever starts first determines the result;
+a failed or cancelled read
+leaves its caller buffer unchanged. Each rail owns a compact registered
+receive buffer. The reader retains the active-read and final-staging budget
+through the post-read lookup and publish step; transfer and MR reservations
+end after all rail workers finish. No in-request transparent retry is attempted.
+The server's stripe-subset fallback also honors tag-15 scatter destinations
+when its registered slab cannot provide staging space. A fallback WRITE with
+uncertain completion retains its source and MR until its QP is destroyed.
 
 For hardware-independent scheduling and failure checks, run
 `cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma

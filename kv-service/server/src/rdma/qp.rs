@@ -1,9 +1,11 @@
 //! Reliable Connection QP — one-to-one connection with a client; use ibv_post_send WRITE after handshake
 
-use crate::rdma::context::RdmaContext;
+use crate::rdma::context::{MemRegion, RdmaContext};
 use anyhow::{anyhow, Result};
+use prost::bytes::Bytes;
 use rdma_sys::*;
 use std::ptr::{self, NonNull};
+use std::sync::Mutex;
 
 /// An RC QP (Reliable Connection Queue Pair).
 ///
@@ -15,6 +17,9 @@ use std::ptr::{self, NonNull};
 /// 5. `qp.post_write(...)` — actual operation
 pub struct RcQp {
     qp: NonNull<ibv_qp>,
+    // A timed-out WRITE may still read its local MR. These buffers are
+    // released only after Drop destroys the QP.
+    retired_writes: Mutex<Vec<(MemRegion, Bytes)>>,
     /// Local QP info, sent to remote over the control plane
     pub local: QpInfo,
 }
@@ -105,7 +110,11 @@ impl RcQp {
 
             tracing::info!("RcQp created: qpn={} psn=0x{:x}", local.qpn, local.psn);
 
-            Ok(Self { qp, local })
+            Ok(Self {
+                qp,
+                retired_writes: Mutex::new(Vec::new()),
+                local,
+            })
         }
     }
 
@@ -309,6 +318,12 @@ impl RcQp {
             }
             Ok(n as usize)
         }
+    }
+
+    /// Retain an uncertain local WRITE source until this QP is destroyed.
+    /// Used when polling cannot prove a signaled WRITE has quiesced.
+    pub fn retain_uncertain_write(&self, mr: MemRegion, source: Bytes) {
+        self.retired_writes.lock().unwrap().push((mr, source));
     }
 }
 

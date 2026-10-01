@@ -166,6 +166,74 @@ fn registration_budget_rejects_before_transport() {
 }
 
 #[test]
+fn completed_payload_keeps_staging_and_active_read_reserved_until_drop() {
+    let mock = MockTransport::new(vec![0x42; 64]);
+    let limits = RailLimits {
+        max_active_reads: 1,
+        ..RailLimits::default()
+    };
+    let reader = RailReader::new(routes(), limits).unwrap();
+    let (descriptor, placement) = fixture(64, 8);
+    let staged = reader
+        .read_staged_with(&descriptor, &placement, &mock, None)
+        .unwrap();
+    assert_eq!(reader.budget.lock().unwrap().active_reads, 1);
+    assert!(reader.budget.lock().unwrap().staging_bytes >= 64);
+    assert!(matches!(
+        reader.read_staged_with(&descriptor, &placement, &mock, None),
+        Err(RailReadError::ResourceExhausted(_))
+    ));
+    drop(staged);
+    assert_eq!(reader.budget.lock().unwrap().active_reads, 0);
+}
+
+#[test]
+fn cancellation_before_publish_preserves_caller_buffer() {
+    let (descriptor, placement) = fixture(64, 8);
+    let lookup = crate::ObjectLookup {
+        descriptor,
+        placement: Some(placement),
+    };
+    let cancel = RailCancel::default();
+    cancel.cancel();
+    let mut destination = vec![0xA5; 64];
+    assert!(matches!(
+        commit_if_unchanged(
+            &lookup,
+            &lookup,
+            &[0x42; 64],
+            &mut destination,
+            Some(&cancel)
+        ),
+        Err(RailReadError::Cancelled)
+    ));
+    assert_eq!(destination, vec![0xA5; 64]);
+}
+
+#[test]
+fn cancellation_and_publish_have_one_order() {
+    use std::sync::mpsc;
+    let token = RailCancel::default();
+    let (publishing_tx, publishing_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let committing = token.clone();
+    let publish = std::thread::spawn(move || {
+        committing.publish_if_live(|| {
+            publishing_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+    });
+    publishing_rx.recv().unwrap();
+    let cancelling = token.clone();
+    let cancel = std::thread::spawn(move || cancelling.cancel());
+    assert!(!token.is_cancelled());
+    release_tx.send(()).unwrap();
+    publish.join().unwrap().unwrap();
+    cancel.join().unwrap();
+    assert!(token.is_cancelled());
+}
+
+#[test]
 fn descriptor_identity_rejects_generation_and_layout_changes() {
     let (original, _) = fixture(64, 8);
     let mut changed = original.clone();
@@ -502,20 +570,20 @@ fn changed_generation_cannot_publish_completed_rail_bytes() {
     current.descriptor.object_generation += 1;
     let mut destination = vec![0xA5; 64];
     assert!(matches!(
-        commit_if_unchanged(&initial, &current, &[0x42; 64], &mut destination),
+        commit_if_unchanged(&initial, &current, &[0x42; 64], &mut destination, None),
         Err(RailReadError::VersionChanged)
     ));
     assert_eq!(destination, vec![0xA5; 64]);
     current = initial.clone();
     current.placement.as_mut().unwrap().layout_hash = "moved".into();
     assert!(matches!(
-        commit_if_unchanged(&initial, &current, &[0x42; 64], &mut destination),
+        commit_if_unchanged(&initial, &current, &[0x42; 64], &mut destination, None),
         Err(RailReadError::VersionChanged)
     ));
     assert_eq!(destination, vec![0xA5; 64]);
     current = initial.clone();
     assert_eq!(
-        commit_if_unchanged(&initial, &current, &[0x42; 64], &mut destination).unwrap(),
+        commit_if_unchanged(&initial, &current, &[0x42; 64], &mut destination, None).unwrap(),
         64
     );
     assert_eq!(destination, vec![0x42; 64]);

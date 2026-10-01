@@ -251,15 +251,22 @@ impl KvClient {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("lookup returned no RDMA placement"))?;
         let descriptor = initial.descriptor.clone();
+        let fetch_cancel = cancel.clone();
         let payload = tokio::task::spawn_blocking(move || {
-            reader.read_staged(&descriptor, &placement, cancel.as_ref())
+            reader.read_staged(&descriptor, &placement, fetch_cancel.as_ref())
         })
         .await??;
         let current = self
             .lookup_object(namespace, object_key)
             .await?
             .ok_or(rail_read::RailReadError::VersionChanged)?;
-        let copied = rail_read::commit_if_unchanged(&initial, &current, &payload, destination)?;
+        let copied = rail_read::commit_if_unchanged(
+            &initial,
+            &current,
+            payload.as_bytes(),
+            destination,
+            cancel.as_ref(),
+        )?;
         Ok(Some(copied))
     }
 

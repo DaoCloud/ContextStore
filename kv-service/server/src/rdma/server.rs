@@ -1089,6 +1089,27 @@ fn map_range_to_segments(
     Ok(out)
 }
 
+fn fallback_write_targets(
+    segments: &[(u64, u32, u64)],
+    dst_addr: u64,
+    dst_rkey: u32,
+    stripe_index: usize,
+    chunk_size: u64,
+    length: usize,
+) -> Result<Vec<(u64, u32, u64)>> {
+    let offset = (stripe_index as u64)
+        .checked_mul(chunk_size)
+        .ok_or_else(|| anyhow!("stripe destination offset overflow"))?;
+    if segments.is_empty() {
+        let addr = dst_addr
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("stripe destination address overflow"))?;
+        Ok(vec![(addr, dst_rkey, length as u64)])
+    } else {
+        map_range_to_segments(segments, offset, length as u64)
+    }
+}
+
 fn serve_get_stripes_fallback(
     kv_ctx: &Arc<KVServiceContext>,
     rdma: &Arc<RdmaContext>,
@@ -1111,11 +1132,20 @@ fn serve_get_stripes_fallback(
     };
 
     let mut total = 0u64;
-    let mut mrs = Vec::with_capacity(segments.len());
-    for (write_index, (stripe_index, segment)) in segments.iter().enumerate() {
+    let chunk_count = segments.len() as u32;
+    let mut write_index = 0u64;
+    for (stripe_index, segment) in segments {
         if segment.is_empty() {
             continue;
         }
+        let targets = fallback_write_targets(
+            &req.dst_segments,
+            req.dst_addr,
+            req.dst_rkey,
+            stripe_index,
+            striping.chunk_size,
+            segment.len(),
+        )?;
         let mr = unsafe {
             rdma.register_mr_raw(
                 segment.as_ptr() as *mut u8,
@@ -1123,22 +1153,29 @@ fn serve_get_stripes_fallback(
                 ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
             )?
         };
-        qp.post_write(
-            write_index as u64,
-            mr.addr,
-            mr.lkey,
-            req.dst_addr + *stripe_index as u64 * striping.chunk_size,
-            req.dst_rkey,
-            segment.len() as u32,
-            write_index + 1 == segments.len(),
-        )?;
+        let mut source_addr = mr.addr;
+        for (target_addr, target_rkey, length) in targets {
+            let length = u32::try_from(length)
+                .map_err(|_| anyhow!("fallback RDMA WRITE length exceeds u32"))?;
+            qp.post_write(
+                write_index,
+                source_addr,
+                mr.lkey,
+                target_addr,
+                target_rkey,
+                length,
+                true,
+            )?;
+            if let Err(error) = RcQp::poll_n(client_cq, 1) {
+                qp.retain_uncertain_write(mr, segment);
+                return Err(error);
+            }
+            source_addr += u64::from(length);
+            write_index += 1;
+        }
         total += segment.len() as u64;
-        mrs.push(mr);
     }
-    if !mrs.is_empty() {
-        RcQp::poll_n(client_cq, 1)?;
-    }
-    Ok((true, total, segments.len() as u32))
+    Ok((true, total, chunk_count))
 }
 
 /// Serve a stripe-subset descriptor GET (tag 12): read each requested stripe
@@ -1204,8 +1241,22 @@ fn serve_get_stripes(
             return Ok((false, 0, 0));
         }
         let stripe_offset = idx as u64 * chunk_size;
+        let stripe_length = chunk_size.min(striping.total_size.saturating_sub(stripe_offset));
+        if fallback_write_targets(
+            &req.dst_segments,
+            req.dst_addr,
+            req.dst_rkey,
+            idx,
+            chunk_size,
+            stripe_length as usize,
+        )
+        .is_err()
+        {
+            tracing::warn!("stripe-subset GET destination does not cover stripe {}", idx);
+            return Ok((false, 0, 0));
+        }
         staged_bytes = staged_bytes
-            .checked_add(chunk_size.min(striping.total_size.saturating_sub(stripe_offset)) as usize)
+            .checked_add(stripe_length as usize)
             .ok_or_else(|| anyhow!("stripe subset staging size overflow"))?;
     }
 
@@ -2011,7 +2062,7 @@ mod tests {
 
 #[cfg(test)]
 mod sge_tests {
-    use super::map_range_to_segments;
+    use super::{fallback_write_targets, map_range_to_segments};
 
     #[test]
     fn range_within_one_segment() {
@@ -2038,5 +2089,23 @@ mod sge_tests {
         let segs = [(0x1000, 7, 64u64), (0x9000, 8, 64)];
         let m = map_range_to_segments(&segs, 64, 64).unwrap();
         assert_eq!(m, vec![(0x9000, 8, 64)]);
+    }
+
+    #[test]
+    fn fallback_targets_use_compact_sge_addresses_for_noncontiguous_stripes() {
+        let segs = [
+            (0x1000, 11, 64),
+            (0x9000, 12, 64),
+            (0x1040, 11, 64),
+            (0x9000, 12, 64),
+        ];
+        assert_eq!(
+            fallback_write_targets(&segs, 0x1000, 11, 2, 64, 64).unwrap(),
+            vec![(0x1040, 11, 64)]
+        );
+        assert_eq!(
+            fallback_write_targets(&segs, 0x1000, 11, 3, 64, 64).unwrap(),
+            vec![(0x9000, 12, 64)]
+        );
     }
 }
