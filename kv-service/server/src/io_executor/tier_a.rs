@@ -60,6 +60,15 @@ enum Job {
         path: std::path::PathBuf,
         resp: channel::Sender<Result<Bytes>>,
     },
+    /// Read a physical range directly into caller-owned staging memory.
+    /// Completion must be consumed before the caller can release the pointer.
+    ReadIntoPtr {
+        req: IORequest,
+        ptr: MutPtrWrapper,
+        capacity: usize,
+        index: usize,
+        resp: channel::Sender<(usize, Result<usize>)>,
+    },
     Shutdown,
 }
 
@@ -68,6 +77,9 @@ enum Job {
 /// until join returns.
 struct PtrWrapper(*const u8);
 unsafe impl Send for PtrWrapper {}
+
+struct MutPtrWrapper(*mut u8);
+unsafe impl Send for MutPtrWrapper {}
 
 impl TierAExecutor {
     pub fn new(num_workers: usize) -> Self {
@@ -124,6 +136,30 @@ impl TierAExecutor {
                     Ok(Job::ReadAligned { path, resp }) => {
                         let _ = resp.send(read_aligned_impl(&path));
                     }
+                    Ok(Job::ReadIntoPtr {
+                        req,
+                        ptr,
+                        capacity,
+                        index,
+                        resp,
+                    }) => {
+                        let result = read_into_ptr_impl(&req, ptr.0, capacity);
+                        if let Err(error) = &result {
+                            log_io_error(
+                                IoLogContext {
+                                    executor: "tier_a",
+                                    operation: "read",
+                                    mode: "into_ptr_stream",
+                                    device_id: -1,
+                                    job_id: index as u64,
+                                },
+                                &req,
+                                req.length,
+                                error,
+                            );
+                        }
+                        let _ = resp.send((index, result));
+                    }
                     Ok(Job::Shutdown) | Err(_) => break,
                 }
             }));
@@ -166,6 +202,33 @@ fn read_file_impl(req: &IORequest) -> Result<Vec<u8>> {
         f.read_to_end(&mut buf)?;
     }
     Ok(buf)
+}
+
+fn read_into_ptr_impl(req: &IORequest, ptr: *mut u8, capacity: usize) -> Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(&req.path)?;
+    let length = if req.length == 0 {
+        let file_size = file.metadata()?.len();
+        usize::try_from(file_size.saturating_sub(req.offset))
+            .map_err(|_| KVError::InvalidArgument("file range exceeds address space".into()))?
+    } else {
+        req.length
+    };
+    if length > capacity {
+        return Err(KVError::InvalidArgument(format!(
+            "pointer read needs {length} bytes but capacity is {capacity}"
+        )));
+    }
+    if length == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::Start(req.offset))?;
+    // SAFETY: IOExecutor's pointer contract requires writable memory through
+    // completion. This worker sends its completion only after read_exact ends.
+    let target = unsafe { std::slice::from_raw_parts_mut(ptr, length) };
+    file.read_exact(target)?;
+    Ok(length)
 }
 
 fn write_file_impl(req: &IORequest, data: &[u8]) -> Result<()> {
@@ -822,6 +885,48 @@ impl IOExecutor for TierAExecutor {
         );
         results
     }
+
+    fn read_aligned_into_ptr_batch(
+        &self,
+        requests: Vec<(IORequest, *mut u8, usize)>,
+    ) -> Vec<Result<usize>> {
+        let expected = requests.len();
+        let mut completed: Vec<Option<Result<usize>>> =
+            std::iter::repeat_with(|| None).take(expected).collect();
+        for (index, result) in self.read_aligned_into_ptr_stream(requests) {
+            if let Some(slot) = completed.get_mut(index) {
+                *slot = Some(result);
+            }
+        }
+        completed
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(KVError::Internal("pointer read completion missing".into()))
+                })
+            })
+            .collect()
+    }
+
+    fn read_aligned_into_ptr_stream(
+        &self,
+        requests: Vec<(IORequest, *mut u8, usize)>,
+    ) -> channel::Receiver<(usize, Result<usize>)> {
+        let (sender, receiver) = channel::unbounded();
+        for (index, (req, ptr, capacity)) in requests.into_iter().enumerate() {
+            let request = Job::ReadIntoPtr {
+                req,
+                ptr: MutPtrWrapper(ptr),
+                capacity,
+                index,
+                resp: sender.clone(),
+            };
+            if self.sender.send(request).is_err() {
+                let _ = sender.send((index, Err(KVError::Internal("executor closed".into()))));
+            }
+        }
+        receiver
+    }
 }
 
 #[cfg(test)]
@@ -865,5 +970,49 @@ mod tests {
         for (i, r) in results.iter().enumerate() {
             assert_eq!(r.as_ref().unwrap(), format!("data-{}", i).as_bytes());
         }
+    }
+
+    #[test]
+    fn pointer_stream_reports_every_range_and_fills_aligned_destination() {
+        let tmp = TempDir::new().unwrap();
+        let exec = TierAExecutor::new(2);
+        let first = tmp.path().join("first.bin");
+        let second = tmp.path().join("second.bin");
+        exec.write_file(&first, &vec![0x11; DIRECT_IO_ALIGN])
+            .unwrap();
+        exec.write_file(&second, &vec![0x22; DIRECT_IO_ALIGN])
+            .unwrap();
+        let mut buffer = AlignedBuffer::new(2 * DIRECT_IO_ALIGN, DIRECT_IO_ALIGN);
+        let base = buffer.as_mut_ptr();
+        let completions: Vec<_> = exec
+            .read_aligned_into_ptr_stream(vec![
+                (
+                    IORequest {
+                        path: first,
+                        offset: 0,
+                        length: DIRECT_IO_ALIGN,
+                    },
+                    base,
+                    DIRECT_IO_ALIGN,
+                ),
+                (
+                    IORequest {
+                        path: second,
+                        offset: 0,
+                        length: DIRECT_IO_ALIGN,
+                    },
+                    unsafe { base.add(DIRECT_IO_ALIGN) },
+                    DIRECT_IO_ALIGN,
+                ),
+            ])
+            .iter()
+            .collect();
+        assert_eq!(completions.len(), 2);
+        for (index, result) in completions {
+            assert_eq!(result.unwrap(), DIRECT_IO_ALIGN, "range {index}");
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(base, 2 * DIRECT_IO_ALIGN) };
+        assert!(bytes[..DIRECT_IO_ALIGN].iter().all(|byte| *byte == 0x11));
+        assert!(bytes[DIRECT_IO_ALIGN..].iter().all(|byte| *byte == 0x22));
     }
 }

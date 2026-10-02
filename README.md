@@ -340,11 +340,10 @@ validation, enable `verify_stripe_checksums` on the server and rewrite the
 objects being tested so their placements contain checksums. With the server's
 default setting, older placements may have no checksums. Cancellation and
 publishing share a gate, so whichever starts first determines the result;
-a failed or cancelled read
-leaves its caller buffer unchanged. Each rail owns a compact registered
-receive buffer. The reader bounds concurrent tasks and aggregate in-flight
-bytes per rail across simultaneous requests. It retains the active-read and
-final-staging budget through the post-read lookup and publish step; transfer
+a failed or cancelled read leaves its caller buffer unchanged. Each rail owns
+a compact registered receive buffer. The reader bounds concurrent tasks and
+aggregate in-flight bytes per rail across simultaneous requests. It retains
+the active-read and final-staging budget through the post-read lookup and publish step; transfer
 and MR reservations end after all rail workers finish. No in-request
 transparent retry is attempted.
 The server's stripe-subset fallback also honors tag-15 scatter destinations
@@ -353,8 +352,16 @@ uncertain completion retains its source and MR until its QP is destroyed.
 
 For hardware-independent scheduling and failure checks, run
 `cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
-rail_read::tests`. The ignored `rail_read_e2e` tests require two reachable
-RDMA listeners and the `CS_RAIL_*` endpoint/device environment variables.
+rail_read::tests`. The ignored `rail_read_e2e` suite contains five single
+real-Rail checks and three dual-Rail checks. Select a test with `--ignored
+--exact <test_name> --nocapture` and configure `CS_RAIL_COORDINATOR`,
+`CS_RAIL_LISTENER0/1`, `CS_RAIL_DEVICE0/1`, and `CS_RAIL_GID0/1` as needed.
+`CS_RDMA_SLAB_MB=0` on the server exercises the registered-buffer fallback.
+On an isolated server only, `CS_RDMA_TEST_PRE_WRITE_DELAY_MS=3000` delays
+stripe-subset WRITEs for the late-completion test; the delay is bounded to
+five seconds and must be unset after that test. A physical-stripe corruption
+test additionally requires checksum verification enabled before writing its
+object and a reversible fault injection into one test-only stripe file.
 The ignored `software_only_mock_benchmark` exercises scheduling and memory
 copies; its throughput is **not** an RDMA hardware result. Reproduce its
 paired 1/2-rail matrix and save all per-read samples with

@@ -1110,6 +1110,15 @@ fn fallback_write_targets(
     }
 }
 
+fn ensure_subset_complete(expected_bytes: usize, actual_bytes: u64) -> Result<()> {
+    if actual_bytes != expected_bytes as u64 {
+        return Err(anyhow!(
+            "stripe-subset stream incomplete: expected {expected_bytes} bytes, wrote {actual_bytes}"
+        ));
+    }
+    Ok(())
+}
+
 fn serve_get_stripes_fallback(
     kv_ctx: &Arc<KVServiceContext>,
     rdma: &Arc<RdmaContext>,
@@ -1298,6 +1307,21 @@ fn serve_get_stripes(
         }
     };
     let stream_setup_us = stream_start.elapsed().as_micros() as u64;
+    // Isolated hardware fault injection: let the client time out and retire
+    // its QP/MR before this server attempts a late WRITE. Unset in production.
+    if let Ok(raw_delay) = std::env::var("CS_RDMA_TEST_PRE_WRITE_DELAY_MS") {
+        if let Ok(delay_ms) = raw_delay.parse::<u64>() {
+            if delay_ms > 0 {
+                let bounded_ms = delay_ms.min(5_000);
+                tracing::warn!(
+                    event = "rdma_test_pre_write_delay",
+                    delay_ms = bounded_ms,
+                    "delaying stripe-subset WRITEs for fault injection"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(bounded_ms));
+            }
+        }
+    }
     let view = extent.view(nic_idx);
     const COMPLETION_WINDOW: usize = RcQp::MAX_SEND_WR / 2;
     let mut outstanding = 0usize;
@@ -1307,6 +1331,7 @@ fn serve_get_stripes(
     let mut first_io_us = None;
     let mut last_io_us = 0u64;
     let mut first_error = None;
+    let mut uncertain_write = false;
 
     while let Ok((stripe_index, source_offset, object_offset, length, result)) = stream.recv() {
         let completion_us = stream_start.elapsed().as_micros() as u64;
@@ -1362,8 +1387,16 @@ fn serve_get_stripes(
                     // 完成事件 → 流水线断流. 现在仅当 SQ 接近满时才阻塞等 1 个腾位.
                     let poll_start = std::time::Instant::now();
                     match RcQp::poll_available(client_cq, outstanding) {
-                        Ok(n) => outstanding -= n,
+                        Ok((n, completion_error)) => {
+                            outstanding -= n;
+                            if let Some(error) = completion_error {
+                                uncertain_write = true;
+                                first_error =
+                                    Some(format!("poll RDMA completion window: {error}"));
+                            }
+                        }
                         Err(error) => {
+                            uncertain_write = true;
                             first_error =
                                 Some(format!("poll RDMA completion window: {error}"))
                         }
@@ -1372,6 +1405,7 @@ fn serve_get_stripes(
                         match RcQp::poll_n(client_cq, 1) {
                             Ok(()) => outstanding -= 1,
                             Err(error) => {
+                                uncertain_write = true;
                                 first_error =
                                     Some(format!("poll RDMA completion window: {error}"))
                             }
@@ -1392,12 +1426,18 @@ fn serve_get_stripes(
         }
     }
 
-    if outstanding > 0 {
+    if outstanding > 0 && !uncertain_write {
         let poll_start = std::time::Instant::now();
         let poll_result = RcQp::poll_n(client_cq, outstanding);
         poll_us += poll_start.elapsed().as_micros() as u64;
         if let Err(error) = poll_result {
+            uncertain_write = true;
             first_error.get_or_insert_with(|| format!("poll final RDMA completions: {error}"));
+        }
+    }
+    if first_error.is_none() {
+        if let Err(error) = ensure_subset_complete(staged_bytes, total) {
+            first_error = Some(error.to_string());
         }
     }
     let total_us = total_start.elapsed().as_micros() as u64;
@@ -1416,6 +1456,9 @@ fn serve_get_stripes(
     );
 
     if let Some(error) = first_error {
+        if uncertain_write {
+            qp.retain_uncertain_extent(extent);
+        }
         tracing::warn!(
             key = %kv_key.to_string_key(),
             error = %error,
@@ -2062,7 +2105,7 @@ mod tests {
 
 #[cfg(test)]
 mod sge_tests {
-    use super::{fallback_write_targets, map_range_to_segments};
+    use super::{ensure_subset_complete, fallback_write_targets, map_range_to_segments};
 
     #[test]
     fn range_within_one_segment() {
@@ -2107,5 +2150,13 @@ mod sge_tests {
             fallback_write_targets(&segs, 0x1000, 11, 3, 64, 64).unwrap(),
             vec![(0x9000, 12, 64)]
         );
+    }
+
+    #[test]
+    fn missing_or_duplicate_stream_completions_cannot_report_success() {
+        assert!(ensure_subset_complete(64, 0).is_err());
+        assert!(ensure_subset_complete(64, 32).is_err());
+        assert!(ensure_subset_complete(64, 128).is_err());
+        assert!(ensure_subset_complete(64, 64).is_ok());
     }
 }

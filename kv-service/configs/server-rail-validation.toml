@@ -1,0 +1,52 @@
+# Isolated rail validation. Set reachable API/RDMA addresses, storage paths,
+# and the dedicated Redis port before use. Configure listeners separately via
+# CS_RDMA_DEVICES=device:ip:port:gid[,device:ip:port:gid].
+[api]
+listen = "127.0.0.1:55151"
+max_connections = 100
+
+[cluster]
+node_id = "rail-validation"
+grpc_advertise = "127.0.0.1:55151"
+rdma_advertise = "127.0.0.1:55153"
+data_nodes = []
+
+[storage]
+# Distinct directories exercise striping logic; use separate NVMe mounts to
+# measure disk aggregation rather than one filesystem's cache.
+devices = ["./data/rail0", "./data/rail1"]
+data_subdir = "contextstore"
+striping_threshold = 4194304
+striping_chunk_size = 4194304
+rdma_stream_chunk_size = 1048576
+verify_stripe_checksums = true
+
+[memory_tier]
+capacity_mb = 128
+slab_size_mb = 4
+use_pinned_memory = false
+
+[io_executor]
+kind = "tier_a"
+thread_pool_size = 8
+io_uring_depth = 32
+
+[router]
+strategy = "object_hash"
+
+[metadata]
+redis_url = "redis://127.0.0.1:6388/"
+redis_key_prefix = "contextstore:rail-validation:"
+redis_connect_timeout_ms = 1000
+redis_command_timeout_ms = 1000
+
+[gc]
+enabled = false
+interval_seconds = 300
+grace_seconds = 600
+max_tasks_per_run = 1000
+task_lease_seconds = 300
+
+[metrics]
+enabled = false
+listen = "127.0.0.1:55190"

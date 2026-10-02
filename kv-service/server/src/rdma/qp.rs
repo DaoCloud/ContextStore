@@ -1,6 +1,7 @@
 //! Reliable Connection QP — one-to-one connection with a client; use ibv_post_send WRITE after handshake
 
 use crate::rdma::context::{MemRegion, RdmaContext};
+use crate::rdma::slab::SlabExtent;
 use anyhow::{anyhow, Result};
 use prost::bytes::Bytes;
 use rdma_sys::*;
@@ -20,6 +21,7 @@ pub struct RcQp {
     // A timed-out WRITE may still read its local MR. These buffers are
     // released only after Drop destroys the QP.
     retired_writes: Mutex<Vec<(MemRegion, Bytes)>>,
+    retired_extents: Mutex<Vec<SlabExtent>>,
     /// Local QP info, sent to remote over the control plane
     pub local: QpInfo,
 }
@@ -113,6 +115,7 @@ impl RcQp {
             Ok(Self {
                 qp,
                 retired_writes: Mutex::new(Vec::new()),
+                retired_extents: Mutex::new(Vec::new()),
                 local,
             })
         }
@@ -295,7 +298,7 @@ impl RcQp {
 
     /// 非阻塞收割: poll 当前已完成的 CQE (最多 `max`), 立即返回收到的数量.
     /// 用于流水线中的机会式回收 — post 间隙顺手清 CQ, 避免凑满窗口后长阻塞.
-    pub fn poll_available(cq: NonNull<ibv_cq>, max: usize) -> Result<usize> {
+    pub fn poll_available(cq: NonNull<ibv_cq>, max: usize) -> Result<(usize, Option<String>)> {
         unsafe {
             let cap = max.max(1);
             let mut wcs: Vec<ibv_wc> = Vec::with_capacity(cap);
@@ -306,24 +309,35 @@ impl RcQp {
             if n < 0 {
                 return Err(anyhow!("ibv_poll_cq error"));
             }
-            for wc in wcs.iter().take(n as usize) {
-                if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
-                    return Err(anyhow!(
-                        "WR {} failed: status={} ({})",
-                        wc.wr_id,
-                        wc.status,
-                        wc_status_str(wc.status),
-                    ));
-                }
-            }
-            Ok(n as usize)
+            Ok(Self::summarize_completions(&wcs[..n as usize]))
         }
+    }
+
+    fn summarize_completions(wcs: &[ibv_wc]) -> (usize, Option<String>) {
+        let first_error = wcs
+            .iter()
+            .find(|wc| wc.status != ibv_wc_status::IBV_WC_SUCCESS)
+            .map(|wc| {
+                format!(
+                    "WR {} failed: status={} ({})",
+                    wc.wr_id,
+                    wc.status,
+                    wc_status_str(wc.status)
+                )
+            });
+        (wcs.len(), first_error)
     }
 
     /// Retain an uncertain local WRITE source until this QP is destroyed.
     /// Used when polling cannot prove a signaled WRITE has quiesced.
     pub fn retain_uncertain_write(&self, mr: MemRegion, source: Bytes) {
         self.retired_writes.lock().unwrap().push((mr, source));
+    }
+
+    /// Keep a slab allocation pinned until QP destruction when a CQ poll
+    /// cannot prove every WRITE has stopped using it.
+    pub fn retain_uncertain_extent(&self, extent: SlabExtent) {
+        self.retired_extents.lock().unwrap().push(extent);
     }
 }
 
@@ -347,5 +361,20 @@ impl Drop for RcQp {
         unsafe {
             ibv_destroy_qp(self.qp.as_ptr());
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn failed_cqe_is_still_counted_as_consumed() {
+        let mut completion: ibv_wc = unsafe { std::mem::zeroed() };
+        completion.wr_id = 9;
+        completion.status = 12;
+        let (count, error) = RcQp::summarize_completions(&[completion]);
+        assert_eq!(count, 1);
+        assert!(error.expect("failed status").contains("WR 9 failed"));
     }
 }

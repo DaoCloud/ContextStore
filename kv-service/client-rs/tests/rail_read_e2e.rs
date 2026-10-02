@@ -5,12 +5,12 @@
 
 #![cfg(feature = "rdma")]
 
-use contextstore_client_rs::rail_read::{RailLimits, RailReader, RailRoute};
+use contextstore_client_rs::rail_read::{RailCancel, RailLimits, RailReader, RailRoute};
 use contextstore_client_rs::rdma::RdmaClientConfig;
 use contextstore_client_rs::KvClient;
 use prost::bytes::Bytes;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn setting(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -81,6 +81,175 @@ async fn seeded_object() -> (KvClient, String, Vec<u8>, String) {
         "this test requires one storage node with two RDMA listeners"
     );
     (client, key, payload, advertised)
+}
+
+#[tokio::test]
+#[ignore = "requires one reachable HCA or RXE listener and a striped KVService"]
+async fn single_real_rail_restores_verified_object() {
+    let (mut client, key, payload, advertised) = seeded_object().await;
+    let listener = setting("CS_RAIL_LISTENER0", &advertised);
+    let reader = Arc::new(
+        RailReader::new(
+            vec![route(&advertised, 0, &listener)],
+            RailLimits::default(),
+        )
+        .expect("single rail"),
+    );
+    let mut destination = vec![0xA5; payload.len()];
+    assert_eq!(
+        client
+            .read_multi_rail_into(
+                Arc::clone(&reader),
+                "rail-e2e",
+                &key,
+                &mut destination,
+                None
+            )
+            .await
+            .expect("real rail read"),
+        Some(payload.len())
+    );
+    assert_eq!(destination, payload);
+    assert_eq!(reader.snapshots()[0].bytes, payload.len() as u64);
+}
+
+#[tokio::test]
+#[ignore = "requires a striped KVService and an injected dead RDMA listener"]
+async fn dead_single_real_rail_leaves_destination_unchanged() {
+    let (mut client, key, payload, advertised) = seeded_object().await;
+    let dead = setting("CS_RAIL_DEAD_LISTENER", "127.0.0.1:59999");
+    let reader = Arc::new(
+        RailReader::new(
+            vec![route(&advertised, 0, &dead)],
+            RailLimits {
+                io_timeout: Duration::from_secs(3),
+                ..RailLimits::default()
+            },
+        )
+        .expect("dead rail"),
+    );
+    let mut destination = vec![0xA5; payload.len()];
+    assert!(client
+        .read_multi_rail_into(reader, "rail-e2e", &key, &mut destination, None)
+        .await
+        .is_err());
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+}
+
+#[tokio::test]
+#[ignore = "requires one reachable HCA or RXE listener and a large striped object"]
+async fn cancellation_after_real_transfer_starts_cannot_write_reused_buffer() {
+    let (mut client, key, payload, advertised) = seeded_object().await;
+    let listener = setting("CS_RAIL_LISTENER0", &advertised);
+    let reader = Arc::new(
+        RailReader::new(
+            vec![route(&advertised, 0, &listener)],
+            RailLimits::default(),
+        )
+        .expect("single rail"),
+    );
+    let cancel = RailCancel::default();
+    let task_reader = Arc::clone(&reader);
+    let task_cancel = cancel.clone();
+    let read_task = tokio::spawn(async move {
+        let mut destination = vec![0xA5; payload.len()];
+        let result = client
+            .read_multi_rail_into(
+                task_reader,
+                "rail-e2e",
+                &key,
+                &mut destination,
+                Some(task_cancel),
+            )
+            .await;
+        (result, destination)
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reader.snapshots()[0].inflight_requests == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "real RDMA transfer never started"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    cancel.cancel();
+    let (result, mut destination) = tokio::time::timeout(Duration::from_secs(40), read_task)
+        .await
+        .expect("cancelled transfer did not quiesce")
+        .expect("read task joined");
+    assert!(result
+        .expect_err("cancelled transfer must fail")
+        .to_string()
+        .contains("cancelled"));
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+    destination.fill(0x33);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(destination.iter().all(|byte| *byte == 0x33));
+    assert_eq!(reader.snapshots()[0].inflight_requests, 0);
+    assert_eq!(reader.snapshots()[0].registered_bytes, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires an existing striped object with one deliberately corrupted physical stripe"]
+async fn corrupted_real_stripe_does_not_publish_bytes() {
+    let coordinator = setting("CS_RAIL_COORDINATOR", "http://127.0.0.1:50051");
+    let namespace = setting("CS_RAIL_EXISTING_NAMESPACE", "rust-bench");
+    let key = setting("CS_RAIL_EXISTING_KEY", "railtest0/__combined__");
+    let mut client = KvClient::connect(coordinator).await.expect("connect gRPC");
+    let lookup = client
+        .lookup_object(&namespace, &key)
+        .await
+        .expect("lookup")
+        .expect("object exists");
+    let placement = lookup.placement.expect("placement");
+    assert!(
+        placement
+            .chunks
+            .iter()
+            .all(|chunk| !chunk.checksum.is_empty()),
+        "checksum injection requires a newly written, checksummed object"
+    );
+    let advertised = placement.chunks[0].rdma_endpoint.clone();
+    let listener = setting("CS_RAIL_LISTENER0", &advertised);
+    let reader = Arc::new(
+        RailReader::new(
+            vec![route(&advertised, 0, &listener)],
+            RailLimits::default(),
+        )
+        .expect("single rail"),
+    );
+    let mut destination = vec![0xA5; lookup.descriptor.size as usize];
+    assert!(client
+        .read_multi_rail_into(reader, &namespace, &key, &mut destination, None)
+        .await
+        .is_err());
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+}
+
+#[tokio::test]
+#[ignore = "requires CS_RDMA_TEST_PRE_WRITE_DELAY_MS=3000 on an isolated real RDMA server"]
+async fn late_server_write_after_timeout_cannot_corrupt_reused_buffer() {
+    let (mut client, key, payload, advertised) = seeded_object().await;
+    let listener = setting("CS_RAIL_LISTENER0", &advertised);
+    let reader = Arc::new(
+        RailReader::new(
+            vec![route(&advertised, 0, &listener)],
+            RailLimits {
+                io_timeout: Duration::from_secs(1),
+                ..RailLimits::default()
+            },
+        )
+        .expect("single rail"),
+    );
+    let mut destination = vec![0xA5; payload.len()];
+    assert!(client
+        .read_multi_rail_into(reader, "rail-e2e", &key, &mut destination, None)
+        .await
+        .is_err());
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+    destination.fill(0x33);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(destination.iter().all(|byte| *byte == 0x33));
 }
 
 #[tokio::test]
