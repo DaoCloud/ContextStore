@@ -307,6 +307,11 @@ make bench
 
 ### Multi-rail descriptor reads (experimental)
 
+The [five-act competition story](docs/story.md) explains the problem, mechanism
+and evidence boundary. The [design and verification note](docs/multi-rail-design.md)
+records route semantics, memory ownership, failure behavior, budgets, upgrade
+order and measured limits.
+
 The Rust SDK can read one striped object over multiple local RDMA devices and
 listeners on the same owning storage node. This uses the existing descriptor
 GET and tag-15 SGE protocol; object placement and disk stripes are unchanged.
