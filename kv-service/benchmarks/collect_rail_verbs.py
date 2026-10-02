@@ -63,7 +63,8 @@ def main() -> None:
     expected_hashes: dict[int, str] = {}
     for trial in range(1, args.trials + 1):
         for size_mib, key in objects:
-            for rails in (1, 2):
+            # Alternate order to reduce a systematic warm-cache advantage.
+            for rails in (1, 2) if trial % 2 else (2, 1):
                 command = [
                     str(args.binary),
                     "--environment",
