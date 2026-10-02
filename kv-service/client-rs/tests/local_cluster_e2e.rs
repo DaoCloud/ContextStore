@@ -219,12 +219,13 @@ rdma_endpoint = ""
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "{} exited: {}",
-                node,
-                fs::read_to_string(&log_path).unwrap_or_default()
-            );
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "{} exited ({status}): {}",
+                    node,
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                );
+            }
             if let Ok(mut client) =
                 KvClient::connect(format!("http://{}", self.endpoint(node))).await
             {
@@ -234,6 +235,8 @@ rdma_endpoint = ""
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let _ = child.kill();
+        let _ = child.wait();
         panic!(
             "{} did not become healthy: {}",
             node,

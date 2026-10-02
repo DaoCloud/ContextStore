@@ -1,0 +1,160 @@
+ContextStore Soft-RoCE two-rail test receipts
+
+Environment: two isolated Ubuntu 22.04 KVM guests; two independent virtio/tap/bridge RXE paths.
+Expected failure is a deliberate red or resource-boundary result; it is not a passed E2E test.
+Full raw logs are retained in the local outputs/remote_evidence/softroce_* folders.
+
+=== client/dual-success-e2e.log | passed | single and dual rail byte equality ===
+
+running 1 test
+test same_object_matches_single_and_dual_rail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 1.66s
+
+
+=== client/dual-dead-listener-e2e.log | passed | second listener unavailable leaves caller buffer unchanged ===
+
+running 1 test
+test failed_second_rail_does_not_publish_partial_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.66s
+
+
+=== client/dual-stale-generation-e2e.log | passed | old descriptor rejected after rewrite ===
+
+running 1 test
+test old_generation_is_rejected_without_publishing_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 1.43s
+
+
+=== client/dual-cancel-inflight.log | passed | both rails active, cancellation and buffer reuse ===
+
+running 1 test
+test cancellation_during_two_rail_transfer_preserves_reused_buffer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 3.27s
+
+
+=== client/dual-stripe1-corruption.log | passed | stripe one checksum failure on second rail ===
+
+running 1 test
+test corrupt_stripe_on_second_rail_cannot_publish_partial_object ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.33s
+
+
+=== client/dual-late-after-retire-fix.log | passed | first rail complete and second rail late WRITE safe failure ===
+
+running 1 test
+test late_second_rail_after_first_completion_cannot_publish_or_corrupt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 9.72s
+
+
+=== client/dual-fallback-verbs.log | passed | two rails restore one object with slab disabled ===
+route,id=r0,device=rxe_c0,port=1,gid=1,weight=1,advertised=10.31.0.2:55153,listener=10.31.0.2:55153
+route,id=r1,device=rxe_c1,port=1,gid=1,weight=1,advertised=10.31.0.2:55153,listener=10.32.0.2:55154
+sample,environment=soft-roce,rails=2,iteration=1,bytes=67108864,latency_us=347917,gib_per_s=0.180,xxh3=a0a4cbfa5cad46af
+sample,environment=soft-roce,rails=2,iteration=2,bytes=67108864,latency_us=355554,gib_per_s=0.176,xxh3=a0a4cbfa5cad46af
+sample,environment=soft-roce,rails=2,iteration=3,bytes=67108864,latency_us=341445,gib_per_s=0.183,xxh3=a0a4cbfa5cad46af
+summary,environment=soft-roce,rails=2,bytes_per_iter=67108864,iters=3,median_us=347917,cpu_user_us=176731,cpu_system_us=246551,peak_rss_kb=211160,rail_bytes=[100663296, 100663296]
+rail_stats,id=r0,device=rxe_c0,listener=10.31.0.2:55153,numa=None,pci=None,healthy=true,cooldown_ms=0,reads_ok=4,reads_err=0,bytes=134217728,avg_us=274448,inflight_requests=0,inflight_bytes=0,peak_inflight_bytes=33554432,registered_bytes_reserved=0,peak_registered_bytes=37748736
+rail_stats,id=r1,device=rxe_c1,listener=10.32.0.2:55154,numa=None,pci=None,healthy=true,cooldown_ms=0,reads_ok=4,reads_err=0,bytes=134217728,avg_us=269701,inflight_requests=0,inflight_bytes=0,peak_inflight_bytes=33554432,registered_bytes_reserved=0,peak_registered_bytes=37748736
+
+=== client/cq-retire-red.log | expected failure | old client accepted a stale reply after GET timeout; server CQ retirement alone was insufficient ===
+
+running 1 test
+
+thread 'uncertain_completion_retires_old_server_connection' panicked at kv-service/client-rs/tests/rail_read_e2e.rs:446:5:
+server must close the old QP/CQ rather than return a stale response
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test uncertain_completion_retires_old_server_connection ... FAILED
+
+failures:
+
+failures:
+    uncertain_completion_retires_old_server_connection
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 11 filtered out; finished in 8.01s
+
+
+=== client/cq-retire-green-client-fix.log | passed | connection retired after control timeout ===
+
+running 1 test
+test uncertain_completion_retires_old_server_connection ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 7.51s
+
+
+=== client/legacy-get-timeout-safe.log | passed | handshake completes before 1ms GET deadline; reused destination stays unchanged for six seconds ===
+running 1 test
+test legacy_get_timeout_retires_qp_before_buffer_reuse ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 6.67s
+
+=== server/server-legacy-timeout-safe.log | diagnostic | old complete-object GET retires QP after uncertain CQ completion; no same-QP fallback ===
+2026-10-02T06:45:21.385603Z  WARN RDMA client 10.31.0.1:53048 (nic_idx=0) disconnected: RDMA connection retired after uncertain legacy GET: poll RDMA write completion window: poll_n timeout after 2000ms, got 0/64
+
+=== client/memlock-preflight.log | expected resource rejection | finite RLIMIT_MEMLOCK rejects fourth concurrent registration before dispatch ===
+route,id=r0,device=rxe_c0,port=1,gid=1,weight=1,advertised=10.31.0.2:55153,listener=10.31.0.2:55153
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=0,bytes=134217728,latency_us=1505892,xxh3=6c7a2ea2bc98454c
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=1,bytes=134217728,latency_us=1453796,xxh3=6c7a2ea2bc98454c
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=3,bytes=134217728,latency_us=1357929,xxh3=6c7a2ea2bc98454c
+Error: rail resource limit: registered bytes exceed configured or process memlock budget (409609831 bytes)
+exit_code=1
+
+=== client/memlock-unlimited-success.log | passed | same 128 MiB by four cell after isolated VM memlock increase ===
+route,id=r0,device=rxe_c0,port=1,gid=1,weight=1,advertised=10.31.0.2:55153,listener=10.31.0.2:55153
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=0,bytes=134217728,latency_us=1829333,xxh3=6c7a2ea2bc98454c
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=1,bytes=134217728,latency_us=1915528,xxh3=6c7a2ea2bc98454c
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=2,bytes=134217728,latency_us=1655936,xxh3=6c7a2ea2bc98454c
+sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=3,bytes=134217728,latency_us=1873385,xxh3=6c7a2ea2bc98454c
+batch,environment=soft-roce,rails=1,concurrency=4,iteration=1,wall_us=1976160
+summary_concurrent,environment=soft-roce,rails=1,concurrency=4,bytes_per_read=134217728,batches=1,median_request_us=1873385,median_batch_us=1976160,aggregate_gib_per_s=0.253,cpu_user_us=496302,cpu_system_us=570090,peak_rss_kb=1290684,rail_bytes=[536870912]
+
+=== server/server-dual-late-cq2s.log | diagnostic | second rail CQ deadline 2 seconds and source retained ===
+2026-10-02T05:06:13.426978Z  INFO RDMA client connected: 10.31.0.1:39878 (nic_idx=0)
+2026-10-02T05:06:13.427313Z  INFO RDMA client connected: 10.32.0.1:33862 (nic_idx=1)
+2026-10-02T05:06:13.454721Z  WARN delaying stripe-subset WRITEs for fault injection event="rdma_test_pre_write_delay" nic_idx=1 delay_ms=3000
+2026-10-02T05:06:13.579388Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790917572956012522 bytes=33554432 stripes=8 requests=32 alloc_us=4 stream_setup_us=1626 first_io_us=9309 last_io_us=20327 poll_us=106765 total_us=127074
+2026-10-02T05:06:18.456047Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790917572956012522 bytes=33554432 stripes=8 requests=32 alloc_us=3 stream_setup_us=154 first_io_us=3000455 last_io_us=3001451 poll_us=2000091 total_us=5001494
+2026-10-02T05:06:18.456446Z  WARN RDMA stripe-subset stream failed without deleting object metadata key=8:rail-e2erail-e2e-1790917572956012522 error=poll final RDMA completions: poll_n timeout after 2000ms, got 0/32
+
+=== server/server-cq-retire-green.log | diagnostic | uncertain completion tears down server QP/CQ connection ===
+2026-10-02T06:00:37.226226Z  INFO RDMA client connected: 10.32.0.1:59304 (nic_idx=1)
+2026-10-02T06:00:37.252949Z  WARN delaying stripe-subset WRITEs for fault injection event="rdma_test_pre_write_delay" nic_idx=1 delay_ms=3000
+2026-10-02T06:00:40.276172Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790920836691090604 bytes=4194304 stripes=1 requests=4 alloc_us=4 stream_setup_us=2023 first_io_us=3002276 last_io_us=3003113 poll_us=22144 total_us=3025263
+2026-10-02T06:00:44.259687Z  WARN delaying stripe-subset WRITEs for fault injection event="rdma_test_pre_write_delay" nic_idx=1 delay_ms=3000
+2026-10-02T06:00:49.260707Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790920836691090604 bytes=4194304 stripes=1 requests=4 alloc_us=4 stream_setup_us=1767 first_io_us=3001971 last_io_us=3002769 poll_us=2000013 total_us=5002802
+2026-10-02T06:00:49.261107Z  WARN RDMA stripe-subset stream failed without deleting object metadata key=8:rail-e2erail-e2e-1790920836691090604 error=poll final RDMA completions: poll_n timeout after 2000ms, got 0/4
+2026-10-02T06:00:49.261257Z  WARN RDMA client 10.32.0.1:59304 (nic_idx=1) disconnected: RDMA connection retired after uncertain stripe-subset completion: poll final RDMA completions: poll_n timeout after 2000ms, got 0/4
+2026-10-02T06:04:52.924240Z  INFO RDMA client connected: 10.32.0.1:46986 (nic_idx=1)
+2026-10-02T06:04:52.965148Z  WARN delaying stripe-subset WRITEs for fault injection event="rdma_test_pre_write_delay" nic_idx=1 delay_ms=3000
+2026-10-02T06:04:57.966983Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790921092474562138 bytes=4194304 stripes=1 requests=4 alloc_us=38 stream_setup_us=2025 first_io_us=3002426 last_io_us=3003833 poll_us=2000036 total_us=5003920
+2026-10-02T06:04:57.967021Z  WARN RDMA stripe-subset stream failed without deleting object metadata key=8:rail-e2erail-e2e-1790921092474562138 error=poll final RDMA completions: poll_n timeout after 2000ms, got 0/4
+2026-10-02T06:04:57.967205Z  WARN RDMA client 10.32.0.1:46986 (nic_idx=1) disconnected: RDMA connection retired after uncertain stripe-subset completion: poll final RDMA completions: poll_n timeout after 2000ms, got 0/4
+2026-10-02T06:05:36.317812Z  INFO RDMA client connected: 10.32.0.1:35712 (nic_idx=1)
+2026-10-02T06:05:36.317829Z  INFO RDMA client connected: 10.31.0.1:51894 (nic_idx=0)
+2026-10-02T06:05:36.373606Z  WARN delaying stripe-subset WRITEs for fault injection event="rdma_test_pre_write_delay" nic_idx=1 delay_ms=3000
+2026-10-02T06:05:36.496798Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790921135831858189 bytes=33554432 stripes=8 requests=32 alloc_us=13 stream_setup_us=8272 first_io_us=11138 last_io_us=45542 poll_us=91384 total_us=136914
+2026-10-02T06:05:41.375004Z  INFO RDMA_SUBSET_DETAIL key=8:rail-e2erail-e2e-1790921135831858189 bytes=33554432 stripes=8 requests=32 alloc_us=3 stream_setup_us=5996 first_io_us=3006276 last_io_us=3007338 poll_us=2000048 total_us=5007399
+2026-10-02T06:05:41.375048Z  WARN RDMA stripe-subset stream failed without deleting object metadata key=8:rail-e2erail-e2e-1790921135831858189 error=poll final RDMA completions: poll_n timeout after 2000ms, got 0/32
+2026-10-02T06:05:41.375230Z  WARN RDMA client 10.32.0.1:35712 (nic_idx=1) disconnected: RDMA connection retired after uncertain stripe-subset completion: poll final RDMA completions: poll_n timeout after 2000ms, got 0/32
+
+=== server/server-dual-fallback.log | diagnostic | both listeners entered registered-buffer fallback ===
+2026-10-02T06:09:35.661301Z  INFO RDMA client connected: 10.31.0.1:52500 (nic_idx=0)
+2026-10-02T06:09:35.661666Z  INFO RDMA client connected: 10.32.0.1:55962 (nic_idx=1)
+2026-10-02T06:09:35.687778Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:35.687856Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:36.079058Z  INFO RDMA client connected: 10.32.0.1:38304 (nic_idx=1)
+2026-10-02T06:09:36.079285Z  INFO RDMA client connected: 10.31.0.1:44688 (nic_idx=0)
+2026-10-02T06:09:36.107049Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:36.107217Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:36.442372Z  INFO RDMA client connected: 10.32.0.1:38306 (nic_idx=1)
+2026-10-02T06:09:36.442533Z  INFO RDMA client connected: 10.31.0.1:44694 (nic_idx=0)
+2026-10-02T06:09:36.468840Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:36.471706Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:36.816234Z  INFO RDMA client connected: 10.32.0.1:38322 (nic_idx=1)
+2026-10-02T06:09:36.816252Z  INFO RDMA client connected: 10.31.0.1:44704 (nic_idx=0)
+2026-10-02T06:09:36.842161Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable
+2026-10-02T06:09:36.843856Z  WARN RDMA stripe-subset slab path unavailable; using registered-buffer fallback key=10:rust-benchrxetest0/__combined__ error=RDMA slab is unavailable

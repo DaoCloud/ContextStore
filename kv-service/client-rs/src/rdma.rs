@@ -16,7 +16,7 @@ use rdma_sys::*;
 use std::ffi::{c_void, CStr};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,6 +59,8 @@ pub struct RdmaClientConfig {
     pub port: u8,
     /// GID index used to construct the RoCE address handle.
     pub gid_index: u8,
+    /// Deadline for TCP connect, control replies, and control writes.
+    pub io_timeout: Duration,
 }
 
 impl RdmaClientConfig {
@@ -69,6 +71,7 @@ impl RdmaClientConfig {
             device: device.into(),
             port: 1,
             gid_index: 3,
+            io_timeout: Duration::from_secs(30),
         }
     }
 
@@ -83,10 +86,56 @@ impl RdmaClientConfig {
         self.gid_index = gid_index;
         self
     }
+
+    /// Bound TCP connection and control-message operations.
+    pub fn with_io_timeout(mut self, timeout: Duration) -> Self {
+        self.io_timeout = timeout;
+        self
+    }
+}
+
+fn open_control_stream(endpoint: &str, timeout: Duration) -> Result<TcpStream> {
+    if timeout.is_zero() {
+        return Err(anyhow!("RDMA control timeout must be positive"));
+    }
+    let mut last_error = None;
+    for address in endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("resolve RDMA control endpoint {endpoint}"))?
+    {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                stream.set_nodelay(true).context("set RDMA TCP_NODELAY")?;
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .context("set RDMA control read timeout")?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .context("set RDMA control write timeout")?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow!(
+        "connect RDMA control endpoint {endpoint}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no resolved addresses".to_string())
+    ))
 }
 
 /// Result of an RDMA read. `None` means the object did not exist.
 pub type RdmaReadResult = Option<usize>;
+
+/// Complete GET acknowledgement from the server, including its chunk count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RdmaReadOutcome {
+    /// Payload bytes acknowledged by the server.
+    pub bytes: usize,
+    /// Number of stripes/chunks acknowledged by the server.
+    pub chunks: u32,
+}
 
 /// A connected ContextStore RDMA client.
 ///
@@ -94,7 +143,7 @@ pub type RdmaReadResult = Option<usize>;
 /// control messages. Create one connection per concurrent transfer worker.
 pub struct RdmaClient {
     resources: Arc<RdmaResources>,
-    qp: NonNull<ibv_qp>,
+    qp: Option<NonNull<ibv_qp>>,
     stream: TcpStream,
     /// Cached memory registrations keyed by (base pointer, length).
     ///
@@ -296,13 +345,7 @@ impl RdmaClient {
         }
 
         let result = (|| -> Result<TcpStream> {
-            let mut stream = TcpStream::connect(&config.endpoint)
-                .with_context(|| format!("connect RDMA control endpoint {}", config.endpoint))?;
-            // 控制面小包必须即时发出: Nagle + delayed-ACK 在多连接并发时会给每个
-            // 请求注入 ~40-200ms 延迟 (数据面 RDMA WRITE 不经 TCP, 不受影响).
-            stream
-                .set_nodelay(true)
-                .context("set TCP_NODELAY on RDMA control stream")?;
+            let mut stream = open_control_stream(&config.endpoint, config.io_timeout)?;
             let local = QpInfo {
                 qpn: unsafe { (*qp.as_ptr()).qp_num },
                 psn: random_psn(),
@@ -318,7 +361,7 @@ impl RdmaClient {
         match result {
             Ok(stream) => Ok(Self {
                 resources,
-                qp,
+                qp: Some(qp),
                 stream,
                 mr_cache: Vec::new(),
             }),
@@ -327,6 +370,41 @@ impl RdmaClient {
                 Err(error)
             }
         }
+    }
+
+    /// Change the control-channel deadline after the QP handshake has completed.
+    /// This also lets callers bound a GET independently of connection setup.
+    pub fn set_io_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
+    fn retire_after_control_error(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(qp) = self.qp.take() {
+            unsafe { ibv_destroy_qp(qp.as_ptr()) };
+        }
+        self.mr_cache.clear();
+    }
+
+    fn exchange_get_detailed(&mut self, request: &[u8]) -> Result<Option<RdmaReadOutcome>> {
+        if self.qp.is_none() {
+            return Err(anyhow!(
+                "RDMA connection retired after an earlier control error"
+            ));
+        }
+        let response = (|| {
+            self.stream.write_all(request)?;
+            self.stream.flush()?;
+            read_get_response_detailed(&mut self.stream)
+        })();
+        if response.is_err() {
+            // A timeout does not prove that the server stopped writing. Tear
+            // down the QP before the caller may deregister or reuse its MR.
+            self.retire_after_control_error();
+        }
+        response
     }
 
     /// Like [`Self::register_raw_buffer`], but caches the registration inside
@@ -447,9 +525,8 @@ impl RdmaClient {
             rkey,
             available as u64,
         )?;
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     /// Read only `stripes` of a striped object into `buffer[offset..]`.
@@ -493,9 +570,8 @@ impl RdmaClient {
         for idx in stripes {
             request.extend_from_slice(&idx.to_le_bytes());
         }
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     /// [`Self::get_descriptor_stripes_into`] for a cached [`BufferView`]
@@ -530,9 +606,8 @@ impl RdmaClient {
                 request.extend_from_slice(&idx.to_le_bytes());
             }
         }
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     /// Stripe-subset GET with a scatter destination list (wire tag 15): the
@@ -547,6 +622,17 @@ impl RdmaClient {
         stripes: &[u32],
         segments: &[(u64, u32, u64)],
     ) -> Result<RdmaReadResult> {
+        self.get_descriptor_stripes_sge_detailed(descriptor, stripes, segments)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
+    }
+
+    /// SGE stripe GET with server-reported bytes and chunk count.
+    pub fn get_descriptor_stripes_sge_detailed(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        segments: &[(u64, u32, u64)],
+    ) -> Result<Option<RdmaReadOutcome>> {
         if segments.is_empty() {
             return Err(anyhow!("SGE GET requires at least one destination segment"));
         }
@@ -577,9 +663,7 @@ impl RdmaClient {
             request.extend_from_slice(&rkey.to_le_bytes());
             request.extend_from_slice(&len.to_le_bytes());
         }
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
     }
 
     /// Write `buffer[offset..offset + size]` through the RDMA PUT data path.
@@ -777,9 +861,8 @@ impl RdmaClient {
     ) -> Result<RdmaReadResult> {
         let (dst_addr, rkey, available) = buffer.destination(offset)?;
         let request = build_get_request(key, dst_addr, rkey, available as u64)?;
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     fn write_remote(
@@ -805,7 +888,10 @@ impl RdmaClient {
                 len: len as u32,
                 signaled: index + 1 == writes,
             };
-            post_write(self.qp, &write)?;
+            let qp = self
+                .qp
+                .ok_or_else(|| anyhow!("RDMA connection retired after an earlier control error"))?;
+            post_write(qp, &write)?;
             transferred += len;
             index += 1;
         }
@@ -815,10 +901,10 @@ impl RdmaClient {
 
 impl Drop for RdmaClient {
     fn drop(&mut self) {
-        let _ = self.stream.write_all(&[MSG_BYE]);
-        let _ = self.stream.flush();
-        unsafe {
-            ibv_destroy_qp(self.qp.as_ptr());
+        if let Some(qp) = self.qp.take() {
+            let _ = self.stream.write_all(&[MSG_BYE]);
+            let _ = self.stream.flush();
+            unsafe { ibv_destroy_qp(qp.as_ptr()) };
         }
     }
 }
@@ -1136,7 +1222,7 @@ fn read_string(stream: &mut TcpStream, field: &str) -> Result<String> {
     String::from_utf8(buf).map_err(|e| anyhow!("RDMA {field} utf8: {e}"))
 }
 
-fn read_get_response(stream: &mut TcpStream) -> Result<RdmaReadResult> {
+fn read_get_response_detailed(stream: &mut TcpStream) -> Result<Option<RdmaReadOutcome>> {
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag)?;
     if tag[0] != MSG_GET_RESP {
@@ -1149,7 +1235,8 @@ fn read_get_response(stream: &mut TcpStream) -> Result<RdmaReadResult> {
     }
     let bytes = u64::from_le_bytes(body[1..9].try_into().expect("fixed get response length"));
     let bytes = usize::try_from(bytes).map_err(|_| anyhow!("RDMA read size exceeds usize"))?;
-    Ok(Some(bytes))
+    let chunks = u32::from_le_bytes(body[9..13].try_into().expect("fixed get response length"));
+    Ok(Some(RdmaReadOutcome { bytes, chunks }))
 }
 
 struct PutReady {
@@ -1288,7 +1375,7 @@ mod tests {
     fn request_rejects_oversized_wire_string() {
         let key = "x".repeat(u16::MAX as usize + 1);
         assert!(build_get_request(&key, 1, 2, 3).is_err());
-        assert!(build_put_request(MSG_PUT_REQ, &key, 3).is_err());
+        assert!(build_put_request(MSG_PUT_REQ, &key, 3, 0).is_err());
     }
 
     #[test]
@@ -1296,5 +1383,37 @@ mod tests {
         let config = RdmaClientConfig::new("10.0.0.1:50053", "mlx5_0");
         assert_eq!(config.port, 1);
         assert_eq!(config.gid_index, 3);
+    }
+
+    #[test]
+    fn descriptor_reply_preserves_server_chunk_count() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut frame = vec![MSG_GET_RESP, 1];
+            frame.extend_from_slice(&8u64.to_le_bytes());
+            frame.extend_from_slice(&2u32.to_le_bytes());
+            stream.write_all(&frame).unwrap();
+        });
+        let mut stream = TcpStream::connect(endpoint).unwrap();
+        let outcome = read_get_response_detailed(&mut stream).unwrap().unwrap();
+        assert_eq!(outcome.bytes, 8);
+        assert_eq!(outcome.chunks, 2);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn control_socket_timeout_bounds_missing_get_reply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut stream =
+            open_control_stream(&endpoint.to_string(), Duration::from_millis(20)).unwrap();
+        assert!(read_get_response_detailed(&mut stream).is_err());
+        server.join().unwrap();
     }
 }

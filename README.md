@@ -305,6 +305,193 @@ Run the Python benchmark wrapper through the root Makefile with:
 make bench
 ```
 
+### Multi-rail descriptor reads (experimental)
+
+The [five-act competition story](docs/story.md) explains the problem, mechanism
+and evidence boundary. The [design and verification note](docs/multi-rail-design.md)
+records route semantics, memory ownership, failure behavior, budgets, upgrade
+order and measured limits.
+
+The Rust SDK can read one striped object over multiple local RDMA devices and
+listeners on the same owning storage node. This uses the existing descriptor
+GET and tag-15 SGE protocol; object placement and disk stripes are unchanged.
+`LookupObject` advertises one primary RDMA endpoint per node. New servers can
+also attach optional, ephemeral fabric/listener capabilities to Placement;
+`RailReader::discover_from_placement` matches those with locally configured
+fabric/device/port/GID paths. The server does not need to change or persist
+the object's disk stripes. Old clients ignore the extra protobuf field, and
+existing explicit `RailRoute` configurations remain usable with old servers.
+Different rail entries for one node must use different local device/port pairs
+and different remote listeners. A seventh comma-separated rail field may set
+a positive relative scheduling weight; omitted weights default to 1. The
+reader also reports each local device's sysfs NUMA node and PCI address when
+the host exposes them.
+
+```bash
+# Manual listener mapping against an already stored striped object.
+# Set the server's CS_RDMA_DEVICES for both listeners.
+./target/release/cs-rail-read-bench \
+  --environment physical --coordinator http://10.0.0.1:50051 \
+  --namespace bench --object-key large-object \
+  --rail 'r0,mlx5_0,10.0.0.1:50053,10.0.0.1:50053,1,3' \
+  --rail 'r1,mlx5_1,10.0.0.1:50053,10.0.1.1:50054,1,3' \
+  --warmup 1 --iterations 5
+```
+
+For discovered listeners, configure `[[cluster.rdma_rails]]` on the owning
+server, as in [the two-RXE example](kv-service/configs/server-softroce-vm.toml).
+The client still selects trusted local Verbs devices and fabric IDs, while
+`LookupObject` supplies the remote listeners:
+
+```bash
+./target/release/cs-rail-read-bench \
+  --environment soft-roce --coordinator http://10.31.0.2:55151 \
+  --namespace rust-bench --object-key large-object \
+  --local-rail 'r0,fabric-a,rxe_c0,1,1' \
+  --local-rail 'r1,fabric-b,rxe_c1,1,1' \
+  --warmup 1 --iterations 5
+```
+
+The CLI looks up the object before constructing its reader. SDK callers can
+call `lookup_object`, then `RailReader::discover_from_placement`, then the
+unchanged `read_multi_rail_into` entry point. Discovery rejects an owner or
+fabric mismatch; if advertised capabilities change, rebuild the reader. It
+does not silently fall back to an arbitrary listener; use
+the explicit `--rail` mode for a server without advertised capabilities.
+A fixed limit of 32 configured routes caps per-request worker/QP creation
+before any RDMA connection is opened, without changing the public `RailLimits`
+struct shape.
+The [discovery design and upgrade tests](docs/rail-capability-discovery.md)
+record the wire contract and one/two-rail compatibility behavior.
+
+Use only the first `--rail` or `--local-rail` for a comparable single-rail run. The CLI labels
+physical RDMA and Soft-RoCE separately, reports per-rail bytes, and hashes
+every returned object. Set the server's cache policy and disk-read forcing
+identically for both runs; these flags cannot prove a network bottleneck by
+themselves. The SDK's `KvClient::read_multi_rail_into` rechecks descriptor and
+placement identity after the transfer and publishes bytes only after all
+rails and available checksums succeed. To enforce per-stripe checksum
+validation, enable `verify_stripe_checksums` on the server and rewrite the
+objects being tested so their placements contain checksums. With the server's
+default setting, older placements may have no checksums. Cancellation and
+publishing share a gate, so whichever starts first determines the result;
+a failed or cancelled read leaves its caller buffer unchanged. Each rail owns
+a compact registered receive buffer. The reader bounds concurrent tasks and
+aggregate in-flight bytes per rail across simultaneous requests. It retains
+the active-read and final-staging budget through the post-read lookup and
+publish step; transfer and MR reservations end after all rail workers finish.
+On Linux, the reader caps its registered-memory budget at 80% of the process's
+soft `RLIMIT_MEMLOCK` when finite, rejecting excess reads before dispatch.
+Multiple independent RailReader instances still need a deployment-wide
+budget. No in-request transparent retry is attempted.
+The server's stripe-subset fallback also honors tag-15 scatter destinations
+when its registered slab cannot provide staging space. A fallback WRITE with
+uncertain completion retains its source and MR until its QP is destroyed.
+Uncertain CQ completion terminates the server connection rather than reusing
+that CQ for another request; a client GET control error likewise destroys its
+QP so a late reply cannot be mistaken for a new request's response. This also
+applies to the older complete-object GET: cache-hit slab pins, cache-miss slab
+extents, and per-chunk fallback MRs remain alive until their QP is destroyed
+when a posted WRITE has uncertain completion. A cache-miss CQ error cannot
+enter fallback on the same QP/CQ.
+
+For hardware-independent scheduling and failure checks, run
+`cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
+rail_read::tests`. The ignored `rail_read_e2e` suite contains six single
+real-Rail checks and seven dual-Rail/control-connection checks. Select a test with `--ignored
+--exact <test_name> --nocapture` and configure `CS_RAIL_COORDINATOR`,
+`CS_RAIL_LISTENER0/1`, `CS_RAIL_DEVICE0/1`, and `CS_RAIL_GID0/1` as needed.
+`CS_RDMA_SLAB_MB=0` on the server exercises the registered-buffer fallback.
+On an isolated server only, `CS_RDMA_TEST_PRE_WRITE_DELAY_MS=3000` delays
+stripe-subset WRITEs for the late-completion test; the delay is bounded to
+five seconds. Add `CS_RDMA_TEST_PRE_WRITE_NIC_IDX=1` to delay only the second
+listener and exercise partial completion. `CS_RDMA_CQ_TIMEOUT_MS` bounds the
+stripe-subset and legacy GET CQ polls between 100 and 30,000 ms (default
+30,000); use 2,000 ms for isolated late-WRITE injection. Unset both
+fault-injection variables after testing. With `CS_FORCE_DISK_READ=1` on an
+isolated server, the ignored `legacy_get_timeout_retires_qp_before_buffer_reuse`
+test completes the QP handshake first, then applies a 1 ms GET deadline. The
+matching RXE receipt records a 2 s server CQ timeout, connection retirement,
+and an unchanged reused destination after six seconds. A physical-stripe corruption
+test additionally requires checksum verification enabled before writing its
+object and a reversible fault injection into one test-only stripe file.
+The ignored `software_only_mock_benchmark` exercises scheduling and memory
+copies; its throughput is **not** an RDMA hardware result. Reproduce its
+paired 1/2-rail matrix and save all per-read samples with
+`python kv-service/benchmarks/collect_rail_mock.py --sizes 64,256,512`.
+The checked-in `kv-service/benchmarks/results/2026-10-02-independent-rail-mock-*`
+files contain one Linux ARM64 software-only run, including environment details.
+The `2026-10-02-skv-x86-rail-mock-*` files repeat the same paired matrix on
+an x86_64 two-socket host; their much lower absolute copy rate is a reminder
+that Mock results are host-specific software measurements.
+The separate `kv-service/benchmarks/results/2026-10-02-skv-single-hca.json`
+records physical single-rail Verbs reads, HCA port-counter deltas, fault tests,
+and the storage/topology boundary. It does not measure two-rail aggregation.
+Use `kv-service/configs/server-rail-validation.toml` as a small, checksummed
+server example. For real Verbs performance,
+`kv-service/benchmarks/collect_rail_verbs.py` pairs one
+and two rails on the same prewritten objects and saves every latency sample,
+CPU time, RSS, and per-rail bytes. Label RXE runs `soft-roce`: RXE executes the
+Verbs path but does not establish HCA offload or physical link aggregation.
+The CLI's `--concurrency N` option (1–8) runs N complete object reads within
+one process and one shared RailReader, reporting per-request latency and
+aggregate throughput. `kv-service/benchmarks/collect_rail_concurrent.py`
+collects paired 1/2-rail batches for concurrency levels above one; it preserves
+the same object, server, layout, and concurrency within each comparison.
+
+#### Reproduce two independent Soft-RoCE rails in isolated VMs
+
+The scripts in `kv-service/deploy/softroce-vm/` build two Ubuntu 22.04 KVM
+guests on a Linux x86_64 host. They create two test-only tap/bridge pairs with
+no production NIC attached. Each guest receives two virtio NICs; four RXE
+devices expose separate GIDs and listeners. The VM uses about 8 GiB RAM total
+plus sparse qcow2 overlays. Install QEMU/KVM, `genisoimage`, `iproute2`,
+`curl`, `tmux`, and Rust/Verbs build dependencies on the host first.
+
+```bash
+export CS_VM_DIR=/absolute/path/to/test-only/vm
+export CS_VM_SSH_PUBLIC_KEY=/absolute/path/to/test-key.pub
+export CS_VM_TAP_USER="$(id -un)"
+kv-service/deploy/softroce-vm/prepare-pair.sh
+kv-service/deploy/softroce-vm/setup-host-bridges.sh
+kv-service/deploy/softroce-vm/start-pair.sh
+```
+
+`prepare-pair.sh` verifies Ubuntu's published SHA-256 before boot. Copy
+`kv-service/deploy/softroce-vm/ssh_config.example` outside the repository,
+replace its KVM host alias and private key path, and set `CS_VM_SSH_CONFIG` to
+that file. Run `install-guest-prereqs.sh` and `setup-guest-paths.sh server`
+inside the server guest; use `setup-guest-paths.sh client` inside the client
+guest. The latter creates `rxe_c0/rxe_c1` and `rxe_s0/rxe_s1` over distinct
+`10.31.0.0/24` and `10.32.0.0/24` virtual paths. Check both links with
+`rdma link show` and `ping` before running ContextStore.
+
+Build Linux x86_64 binaries with `build-verbs.sh`. From the Linux build host,
+set `CS_VM_SSH_CONFIG` and run `deploy-verbs.sh`; set `CS_E2E_BIN` to the
+executable printed by `cargo test --test rail_read_e2e --no-run` if deploying
+the ignored hardware tests. The example server config assumes guest user
+`railtest`; edit its paths when using another user. Start
+`start-guest-server.sh` inside the server guest, then write a striped object
+from the client guest with `cs-bench --combined --stream --bytes-pass --only-put`.
+Use `cs-rail-read-bench` with one `--rail` and then both rails, or the paired
+`collect_rail_verbs.py` script. Every measurement must be labeled `soft-roce`.
+
+The recorded VM run has [90 sequential samples](kv-service/benchmarks/results/softroce-vm-paired-samples.csv),
+[concurrent samples](kv-service/benchmarks/results/softroce-vm-concurrent-64-128-samples.csv),
+and [topology/counter evidence](kv-service/benchmarks/results/softroce-vm-topology.json).
+`analyze_rail_verbs.py` recomputes descriptive medians and p95 from those
+CSVs. For cleanup, stop the test server, run `teardown-guest-paths.sh` in
+both guests, power them off, run `stop-pair.sh` if needed, then
+`teardown-host-bridges.sh`. These names target only the test-only resources.
+
+| Deployment / data path | Build and behavior evidence | Performance conclusion |
+| --- | --- | --- |
+| gRPC-only Rust SDK, no `rdma` feature | Builds without libibverbs; prior Redis two-node integration and Python suites pass | Existing path unchanged |
+| One ConnectX-6 Dx HCA rail, Linux x86_64 | Real Verbs object, failure, checksum, late-WRITE and buffer-reuse checks | Single-rail only; test stripes share one SATA SSD |
+| Two RXE rails in isolated Ubuntu KVM guests | Real Verbs single/dual reads, generation, checksum, path fault, cancellation, partial completion, late WRITE and registered-memory limits | Software RoCE/QEMU scaling only; no HCA or separate-NVMe claim |
+| Two physical HCA rails | Not run: only one HCA port was online on each available SKV node | No physical aggregation claim |
+| Linux ARM64 | Earlier RDMA/Mock and server feature suites pass; latest CQ/timeout changes were checked on x86_64 | No ARM64 hardware measurement |
+
 ---
 
 ## Deployment shapes

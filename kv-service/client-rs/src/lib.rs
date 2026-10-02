@@ -19,6 +19,10 @@ pub mod pb {
 #[cfg(feature = "rdma")]
 pub mod rdma;
 
+/// Failure-atomic multi-rail descriptor reads over the native RDMA path.
+#[cfg(feature = "rdma")]
+pub mod rail_read;
+
 use pb::kv_service_client::KvServiceClient;
 use prost::bytes::Bytes;
 use tonic::transport::Channel;
@@ -217,6 +221,53 @@ impl KvClient {
             descriptor,
             placement: resp.placement,
         }))
+    }
+
+    /// Look up, read via several RDMA rails, and recheck identity before
+    /// publishing bytes to the caller. A concurrent rewrite fails atomically.
+    #[cfg(feature = "rdma")]
+    pub async fn read_multi_rail_into(
+        &mut self,
+        reader: std::sync::Arc<rail_read::RailReader>,
+        namespace: &str,
+        object_key: &str,
+        destination: &mut [u8],
+        cancel: Option<rail_read::RailCancel>,
+    ) -> anyhow::Result<Option<usize>> {
+        let initial = match self.lookup_object(namespace, object_key).await? {
+            Some(lookup) => lookup,
+            None => return Ok(None),
+        };
+        let size = usize::try_from(initial.descriptor.size)?;
+        if destination.len() < size {
+            return Err(rail_read::RailReadError::BufferTooSmall {
+                need: size,
+                have: destination.len(),
+            }
+            .into());
+        }
+        let placement = initial
+            .placement
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("lookup returned no RDMA placement"))?;
+        let descriptor = initial.descriptor.clone();
+        let fetch_cancel = cancel.clone();
+        let payload = tokio::task::spawn_blocking(move || {
+            reader.read_staged(&descriptor, &placement, fetch_cancel.as_ref())
+        })
+        .await??;
+        let current = self
+            .lookup_object(namespace, object_key)
+            .await?
+            .ok_or(rail_read::RailReadError::VersionChanged)?;
+        let copied = rail_read::commit_if_unchanged(
+            &initial,
+            &current,
+            payload.as_bytes(),
+            destination,
+            cancel.as_ref(),
+        )?;
+        Ok(Some(copied))
     }
 
     /// Batched [`Self::lookup_object`]: one round trip for N keys. Results
@@ -625,9 +676,9 @@ impl KvClient {
             let offset = usize::try_from(chunk.offset).map_err(|_| {
                 tonic::Status::internal(format!("negative chunk offset {}", chunk.offset))
             })?;
-            let end = offset.checked_add(chunk.data.len()).ok_or_else(|| {
-                tonic::Status::internal("chunk offset + length overflows usize")
-            })?;
+            let end = offset
+                .checked_add(chunk.data.len())
+                .ok_or_else(|| tonic::Status::internal("chunk offset + length overflows usize"))?;
             if end > dst.len() {
                 return Err(tonic::Status::internal(format!(
                     "chunk [{offset}, {end}) exceeds destination buffer of {} bytes",

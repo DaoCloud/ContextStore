@@ -16,20 +16,20 @@
 //! ```
 
 use crate::metadata::{BlockMeta, StripingInfo};
-use crate::rdma::context::RdmaContext;
+use crate::rdma::context::{MemRegion, RdmaContext};
 use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
     self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, PutStripeLocation,
     PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ,
-    MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ, MSG_GET_REQ,
-    MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ, MSG_PUT_REQ,
-    MSG_PUT_STRIPES_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
-    PUT_RESULT_STORED,
+    MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ, MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ,
+    MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ, MSG_PUT_REQ, MSG_PUT_STRIPES_REQ, MSG_PUT_WITH_OPTIONS_REQ,
+    PUT_RESULT_EXISTS, PUT_RESULT_FAILED, PUT_RESULT_STORED,
 };
 use crate::router::ObjectKey;
 use crate::KVServiceContext;
 use anyhow::{anyhow, Result};
+use prost::bytes::Bytes;
 use rdma_sys::ibv_access_flags;
 use std::net::{TcpListener, TcpStream};
 use std::ptr::NonNull;
@@ -430,6 +430,11 @@ fn handle_client(
                         (false, 0u64, 0u32)
                     }
                     Err(e) => {
+                        if e.downcast_ref::<RetireLegacyGet>().is_some() {
+                            // A posted WRITE may still read its slab extent. The source is
+                            // pinned by the QP; return now so neither the CQ nor QP is reused.
+                            return Err(e);
+                        }
                         // Slab path failed (slab full / I/O error) → fall back to the old path
                         tracing::warn!(
                             "RDMA GET slab fast path failed, fallback to per-chunk reg_mr: {}",
@@ -549,6 +554,21 @@ fn handle_client(
 /// (no leak) whenever `handle_client` exits (client BYE / protocol error / I/O error).
 struct CqGuard(NonNull<rdma_sys::ibv_cq>);
 
+#[derive(Debug)]
+struct RetireLegacyGet(String);
+
+impl std::fmt::Display for RetireLegacyGet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RDMA connection retired after uncertain legacy GET: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RetireLegacyGet {}
+
 impl Drop for CqGuard {
     fn drop(&mut self) {
         unsafe {
@@ -595,7 +615,7 @@ fn serve_get_slab(
     while offset < total {
         let len = (total - offset).min(MAX_WRITE_BYTES);
         let signaled = idx + 1 == n_writes; // Only signal on the last WRITE (RC guarantees prior completions)
-        qp.post_write(
+        if let Err(error) = qp.post_write(
             idx,
             src_base + offset,
             lkey,
@@ -603,12 +623,18 @@ fn serve_get_slab(
             dst_rkey,
             len as u32,
             signaled,
-        )?;
+        ) {
+            qp.retain_uncertain_pin(placement._pin.clone());
+            return Err(anyhow!(RetireLegacyGet(error.to_string())));
+        }
         offset += len;
         idx += 1;
     }
     let t_poll_start = std::time::Instant::now();
-    RcQp::poll_n(client_cq, 1)?;
+    if let Err(error) = RcQp::poll_n_timeout(client_cq, 1, subset_cq_timeout()) {
+        qp.retain_uncertain_pin(placement._pin.clone());
+        return Err(anyhow!(RetireLegacyGet(error.to_string())));
+    }
     let t_poll_done = std::time::Instant::now();
 
     let post_us = t_poll_start.duration_since(t_post_start).as_micros() as u64;
@@ -640,24 +666,34 @@ fn serve_get_fallback(
         return Ok((false, 0, 0, 0, 0));
     }
     let n = segments.len();
+    let last_nonempty = segments.iter().rposition(|segment| !segment.is_empty());
     let mut offset: u64 = 0;
     // Hold the MR until poll completes (drop = dereg).
-    let mut mrs = Vec::with_capacity(n);
+    let mut mrs: Vec<(MemRegion, Bytes)> = Vec::with_capacity(n);
     let t_reg_post_start = std::time::Instant::now();
     for (i, seg) in segments.iter().enumerate() {
         if seg.is_empty() {
             continue;
         }
         // RDMA WRITE source side only needs LOCAL access; the LOCAL_WRITE flag matches the slab path convention.
-        let mr = unsafe {
+        let mr_result = unsafe {
             rdma.register_mr_raw(
                 seg.as_ptr() as *mut u8,
                 seg.len(),
                 ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
-            )?
+            )
         };
-        let signaled = i + 1 == n; // Only signal on the last one
-        qp.post_write(
+        let mr = match mr_result {
+            Ok(mr) => mr,
+            Err(error) => {
+                for (posted_mr, source) in mrs {
+                    qp.retain_uncertain_write(posted_mr, source);
+                }
+                return Err(error);
+            }
+        };
+        let signaled = Some(i) == last_nonempty; // Last nonempty WRITE signals completion.
+        if let Err(error) = qp.post_write(
             i as u64,
             mr.addr,
             mr.lkey,
@@ -665,13 +701,26 @@ fn serve_get_fallback(
             dst_rkey,
             seg.len() as u32,
             signaled,
-        )?;
+        ) {
+            qp.retain_uncertain_write(mr, seg.clone());
+            for (posted_mr, source) in mrs {
+                qp.retain_uncertain_write(posted_mr, source);
+            }
+            return Err(error);
+        }
         offset += seg.len() as u64;
-        mrs.push(mr);
+        mrs.push((mr, seg.clone()));
     }
     let t_poll_start = std::time::Instant::now();
     // Wait for the last WRITE to complete (RC guarantees prior ones did too).
-    RcQp::poll_n(client_cq, 1)?;
+    if !mrs.is_empty() {
+        if let Err(error) = RcQp::poll_n_timeout(client_cq, 1, subset_cq_timeout()) {
+            for (posted_mr, source) in mrs {
+                qp.retain_uncertain_write(posted_mr, source);
+            }
+            return Err(error);
+        }
+    }
     let t_poll_done = std::time::Instant::now();
     // At this point mrs drop and dereg.
     let reg_post_us = t_poll_start.duration_since(t_reg_post_start).as_micros() as u64;
@@ -779,6 +828,7 @@ fn try_serve_get_via_slab_with_meta(
     let t_post_start = std::time::Instant::now();
     let mut n_writes_posted = 0u64;
     let mut outstanding_writes = 0usize;
+    let mut uncertain_write = false;
     let mut poll_us = 0u64;
     let mut had_error: Option<String> = None;
     let mut first_stream_completion_us: Option<u64> = None;
@@ -799,6 +849,7 @@ fn try_serve_get_via_slab_with_meta(
                     stripe_len as u32,
                     true, // signaled
                 ) {
+                    uncertain_write = true;
                     had_error = Some(format!(
                         "post RDMA write for stripe {}: {}",
                         stripe_idx, error
@@ -808,12 +859,17 @@ fn try_serve_get_via_slab_with_meta(
                     outstanding_writes += 1;
                     if outstanding_writes == RDMA_WRITE_COMPLETION_WINDOW {
                         let poll_start = std::time::Instant::now();
-                        if let Err(error) = RcQp::poll_n(client_cq, outstanding_writes) {
+                        if let Err(error) =
+                            RcQp::poll_n_timeout(client_cq, outstanding_writes, subset_cq_timeout())
+                        {
+                            uncertain_write = true;
                             had_error =
                                 Some(format!("poll RDMA write completion window: {}", error));
                         }
                         poll_us += poll_start.elapsed().as_micros() as u64;
-                        outstanding_writes = 0;
+                        if !uncertain_write {
+                            outstanding_writes = 0;
+                        }
                     }
                 }
             }
@@ -834,9 +890,9 @@ fn try_serve_get_via_slab_with_meta(
 
     // 5. Drain every posted WRITE before returning, including when a later stripe
     // failed. The slab extent backs in-flight RNIC DMA and must not be released early.
-    let poll_result = if outstanding_writes > 0 {
+    let poll_result = if outstanding_writes > 0 && !uncertain_write {
         let poll_start = std::time::Instant::now();
-        let result = RcQp::poll_n(client_cq, outstanding_writes);
+        let result = RcQp::poll_n_timeout(client_cq, outstanding_writes, subset_cq_timeout());
         poll_us += poll_start.elapsed().as_micros() as u64;
         result
     } else {
@@ -844,6 +900,19 @@ fn try_serve_get_via_slab_with_meta(
     };
 
     let post_us = t_post_done;
+
+    if let Err(error) = &poll_result {
+        uncertain_write = true;
+        had_error.get_or_insert_with(|| format!("poll final RDMA completions: {error}"));
+    }
+    if uncertain_write {
+        // The extent remains pinned until Drop destroys this QP. The caller must
+        // not run a fallback GET on the old QP/CQ after a partial/late WRITE.
+        qp.retain_uncertain_extent(extent);
+        return Err(anyhow!(RetireLegacyGet(
+            had_error.unwrap_or_else(|| "RDMA WRITE completion uncertain".to_string())
+        )));
+    }
 
     if let Some(error) = had_error {
         return Err(anyhow!("RDMA GET stream failed: {}", error));
@@ -1051,7 +1120,6 @@ fn allocate_subset_staging(kv_ctx: &KVServiceContext, size: usize) -> Result<Sla
     ))
 }
 
-
 /// 把对象字节区间 [object_offset, object_offset+length) 映射到 scatter 段表.
 /// 段表按序覆盖对象字节范围; 一个区间可能跨多个段, 产出多条 (dst_addr, rkey, len).
 /// 返回 Err 当区间超出段表覆盖范围.
@@ -1089,6 +1157,60 @@ fn map_range_to_segments(
     Ok(out)
 }
 
+fn fallback_write_targets(
+    segments: &[(u64, u32, u64)],
+    dst_addr: u64,
+    dst_rkey: u32,
+    stripe_index: usize,
+    chunk_size: u64,
+    length: usize,
+) -> Result<Vec<(u64, u32, u64)>> {
+    let offset = (stripe_index as u64)
+        .checked_mul(chunk_size)
+        .ok_or_else(|| anyhow!("stripe destination offset overflow"))?;
+    if segments.is_empty() {
+        let addr = dst_addr
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("stripe destination address overflow"))?;
+        Ok(vec![(addr, dst_rkey, length as u64)])
+    } else {
+        map_range_to_segments(segments, offset, length as u64)
+    }
+}
+
+fn ensure_subset_complete(expected_bytes: usize, actual_bytes: u64) -> Result<()> {
+    if actual_bytes != expected_bytes as u64 {
+        return Err(anyhow!(
+            "stripe-subset stream incomplete: expected {expected_bytes} bytes, wrote {actual_bytes}"
+        ));
+    }
+    Ok(())
+}
+
+fn subset_failure_result(uncertain_completion: bool, error: &str) -> Result<(bool, u64, u32)> {
+    if uncertain_completion {
+        // A late CQE must never be consumed by a later request on this QP.
+        // Propagating an error exits handle_client and destroys the QP/CQ.
+        Err(anyhow!(
+            "RDMA connection retired after uncertain stripe-subset completion: {error}"
+        ))
+    } else {
+        Ok((false, 0, 0))
+    }
+}
+
+fn parse_subset_cq_timeout(raw_ms: Option<&str>) -> std::time::Duration {
+    let millis = raw_ms
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(30_000)
+        .clamp(100, 30_000);
+    std::time::Duration::from_millis(millis)
+}
+
+fn subset_cq_timeout() -> std::time::Duration {
+    parse_subset_cq_timeout(std::env::var("CS_RDMA_CQ_TIMEOUT_MS").ok().as_deref())
+}
+
 fn serve_get_stripes_fallback(
     kv_ctx: &Arc<KVServiceContext>,
     rdma: &Arc<RdmaContext>,
@@ -1097,6 +1219,7 @@ fn serve_get_stripes_fallback(
     striping: &StripingInfo,
     req: &DescriptorGetReqMsg,
 ) -> Result<(bool, u64, u32)> {
+    let cq_timeout = subset_cq_timeout();
     let indices = req
         .stripes
         .iter()
@@ -1111,11 +1234,20 @@ fn serve_get_stripes_fallback(
     };
 
     let mut total = 0u64;
-    let mut mrs = Vec::with_capacity(segments.len());
-    for (write_index, (stripe_index, segment)) in segments.iter().enumerate() {
+    let chunk_count = segments.len() as u32;
+    let mut write_index = 0u64;
+    for (stripe_index, segment) in segments {
         if segment.is_empty() {
             continue;
         }
+        let targets = fallback_write_targets(
+            &req.dst_segments,
+            req.dst_addr,
+            req.dst_rkey,
+            stripe_index,
+            striping.chunk_size,
+            segment.len(),
+        )?;
         let mr = unsafe {
             rdma.register_mr_raw(
                 segment.as_ptr() as *mut u8,
@@ -1123,22 +1255,29 @@ fn serve_get_stripes_fallback(
                 ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
             )?
         };
-        qp.post_write(
-            write_index as u64,
-            mr.addr,
-            mr.lkey,
-            req.dst_addr + *stripe_index as u64 * striping.chunk_size,
-            req.dst_rkey,
-            segment.len() as u32,
-            write_index + 1 == segments.len(),
-        )?;
+        let mut source_addr = mr.addr;
+        for (target_addr, target_rkey, length) in targets {
+            let length = u32::try_from(length)
+                .map_err(|_| anyhow!("fallback RDMA WRITE length exceeds u32"))?;
+            qp.post_write(
+                write_index,
+                source_addr,
+                mr.lkey,
+                target_addr,
+                target_rkey,
+                length,
+                true,
+            )?;
+            if let Err(error) = RcQp::poll_n_timeout(client_cq, 1, cq_timeout) {
+                qp.retain_uncertain_write(mr, segment);
+                return Err(error);
+            }
+            source_addr += u64::from(length);
+            write_index += 1;
+        }
         total += segment.len() as u64;
-        mrs.push(mr);
     }
-    if !mrs.is_empty() {
-        RcQp::poll_n(client_cq, 1)?;
-    }
-    Ok((true, total, segments.len() as u32))
+    Ok((true, total, chunk_count))
 }
 
 /// Serve a stripe-subset descriptor GET (tag 12): read each requested stripe
@@ -1204,8 +1343,25 @@ fn serve_get_stripes(
             return Ok((false, 0, 0));
         }
         let stripe_offset = idx as u64 * chunk_size;
+        let stripe_length = chunk_size.min(striping.total_size.saturating_sub(stripe_offset));
+        if fallback_write_targets(
+            &req.dst_segments,
+            req.dst_addr,
+            req.dst_rkey,
+            idx,
+            chunk_size,
+            stripe_length as usize,
+        )
+        .is_err()
+        {
+            tracing::warn!(
+                "stripe-subset GET destination does not cover stripe {}",
+                idx
+            );
+            return Ok((false, 0, 0));
+        }
         staged_bytes = staged_bytes
-            .checked_add(chunk_size.min(striping.total_size.saturating_sub(stripe_offset)) as usize)
+            .checked_add(stripe_length as usize)
             .ok_or_else(|| anyhow!("stripe subset staging size overflow"))?;
     }
 
@@ -1247,8 +1403,29 @@ fn serve_get_stripes(
         }
     };
     let stream_setup_us = stream_start.elapsed().as_micros() as u64;
+    // Isolated hardware fault injection: let the client time out and retire
+    // its QP/MR before this server attempts a late WRITE. Unset in production.
+    if let Ok(raw_delay) = std::env::var("CS_RDMA_TEST_PRE_WRITE_DELAY_MS") {
+        if let Ok(delay_ms) = raw_delay.parse::<u64>() {
+            let nic_matches = match std::env::var("CS_RDMA_TEST_PRE_WRITE_NIC_IDX") {
+                Ok(raw_nic) => raw_nic.parse::<usize>().ok() == Some(nic_idx),
+                Err(_) => true,
+            };
+            if delay_ms > 0 && nic_matches {
+                let bounded_ms = delay_ms.min(5_000);
+                tracing::warn!(
+                    event = "rdma_test_pre_write_delay",
+                    nic_idx,
+                    delay_ms = bounded_ms,
+                    "delaying stripe-subset WRITEs for fault injection"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(bounded_ms));
+            }
+        }
+    }
     let view = extent.view(nic_idx);
     const COMPLETION_WINDOW: usize = RcQp::MAX_SEND_WR / 2;
+    let cq_timeout = subset_cq_timeout();
     let mut outstanding = 0usize;
     let mut writes_posted = 0usize;
     let mut total = 0u64;
@@ -1256,6 +1433,7 @@ fn serve_get_stripes(
     let mut first_io_us = None;
     let mut last_io_us = 0u64;
     let mut first_error = None;
+    let mut uncertain_write = false;
 
     while let Ok((stripe_index, source_offset, object_offset, length, result)) = stream.recv() {
         let completion_us = stream_start.elapsed().as_micros() as u64;
@@ -1266,7 +1444,11 @@ fn serve_get_stripes(
                 // tag-15 (SGE): 数据区间按段表映射, 可能拆成多条 WRITE;
                 // tag-12: 单一连续目标, 等价于一个覆盖全对象的段.
                 let targets: Vec<(u64, u32, u64)> = if req.dst_segments.is_empty() {
-                    vec![(req.dst_addr + object_offset as u64, req.dst_rkey, length as u64)]
+                    vec![(
+                        req.dst_addr + object_offset as u64,
+                        req.dst_rkey,
+                        length as u64,
+                    )]
                 } else {
                     match map_range_to_segments(
                         &req.dst_segments,
@@ -1297,6 +1479,7 @@ fn serve_get_stripes(
                         first_error = Some(format!(
                             "post RDMA write for stripe {stripe_index}: {error}"
                         ));
+                        uncertain_write = true;
                         post_failed = true;
                         break;
                     }
@@ -1311,18 +1494,24 @@ fn serve_get_stripes(
                     // 完成事件 → 流水线断流. 现在仅当 SQ 接近满时才阻塞等 1 个腾位.
                     let poll_start = std::time::Instant::now();
                     match RcQp::poll_available(client_cq, outstanding) {
-                        Ok(n) => outstanding -= n,
+                        Ok((n, completion_error)) => {
+                            outstanding -= n;
+                            if let Some(error) = completion_error {
+                                uncertain_write = true;
+                                first_error = Some(format!("poll RDMA completion window: {error}"));
+                            }
+                        }
                         Err(error) => {
-                            first_error =
-                                Some(format!("poll RDMA completion window: {error}"))
+                            uncertain_write = true;
+                            first_error = Some(format!("poll RDMA completion window: {error}"))
                         }
                     }
                     while first_error.is_none() && outstanding >= COMPLETION_WINDOW {
-                        match RcQp::poll_n(client_cq, 1) {
+                        match RcQp::poll_n_timeout(client_cq, 1, cq_timeout) {
                             Ok(()) => outstanding -= 1,
                             Err(error) => {
-                                first_error =
-                                    Some(format!("poll RDMA completion window: {error}"))
+                                uncertain_write = true;
+                                first_error = Some(format!("poll RDMA completion window: {error}"))
                             }
                         }
                     }
@@ -1341,12 +1530,18 @@ fn serve_get_stripes(
         }
     }
 
-    if outstanding > 0 {
+    if outstanding > 0 && !uncertain_write {
         let poll_start = std::time::Instant::now();
-        let poll_result = RcQp::poll_n(client_cq, outstanding);
+        let poll_result = RcQp::poll_n_timeout(client_cq, outstanding, cq_timeout);
         poll_us += poll_start.elapsed().as_micros() as u64;
         if let Err(error) = poll_result {
+            uncertain_write = true;
             first_error.get_or_insert_with(|| format!("poll final RDMA completions: {error}"));
+        }
+    }
+    if first_error.is_none() {
+        if let Err(error) = ensure_subset_complete(staged_bytes, total) {
+            first_error = Some(error.to_string());
         }
     }
     let total_us = total_start.elapsed().as_micros() as u64;
@@ -1365,12 +1560,15 @@ fn serve_get_stripes(
     );
 
     if let Some(error) = first_error {
+        if uncertain_write {
+            qp.retain_uncertain_extent(extent);
+        }
         tracing::warn!(
             key = %kv_key.to_string_key(),
             error = %error,
             "RDMA stripe-subset stream failed without deleting object metadata"
         );
-        return Ok((false, 0, 0));
+        return subset_failure_result(uncertain_write, &error);
     }
     Ok((true, total, req.stripes.len() as u32))
 }
@@ -2011,7 +2209,10 @@ mod tests {
 
 #[cfg(test)]
 mod sge_tests {
-    use super::map_range_to_segments;
+    use super::{
+        ensure_subset_complete, fallback_write_targets, map_range_to_segments,
+        parse_subset_cq_timeout, subset_failure_result,
+    };
 
     #[test]
     fn range_within_one_segment() {
@@ -2038,5 +2239,60 @@ mod sge_tests {
         let segs = [(0x1000, 7, 64u64), (0x9000, 8, 64)];
         let m = map_range_to_segments(&segs, 64, 64).unwrap();
         assert_eq!(m, vec![(0x9000, 8, 64)]);
+    }
+
+    #[test]
+    fn fallback_targets_use_compact_sge_addresses_for_noncontiguous_stripes() {
+        let segs = [
+            (0x1000, 11, 64),
+            (0x9000, 12, 64),
+            (0x1040, 11, 64),
+            (0x9000, 12, 64),
+        ];
+        assert_eq!(
+            fallback_write_targets(&segs, 0x1000, 11, 2, 64, 64).unwrap(),
+            vec![(0x1040, 11, 64)]
+        );
+        assert_eq!(
+            fallback_write_targets(&segs, 0x1000, 11, 3, 64, 64).unwrap(),
+            vec![(0x9000, 12, 64)]
+        );
+    }
+
+    #[test]
+    fn missing_or_duplicate_stream_completions_cannot_report_success() {
+        assert!(ensure_subset_complete(64, 0).is_err());
+        assert!(ensure_subset_complete(64, 32).is_err());
+        assert!(ensure_subset_complete(64, 128).is_err());
+        assert!(ensure_subset_complete(64, 64).is_ok());
+    }
+
+    #[test]
+    fn cq_timeout_configuration_is_bounded() {
+        assert_eq!(
+            parse_subset_cq_timeout(None),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_subset_cq_timeout(Some("2000")),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse_subset_cq_timeout(Some("0")),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            parse_subset_cq_timeout(Some("999999")),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn uncertain_cq_completion_forces_connection_error() {
+        assert!(subset_failure_result(true, "CQ timed out").is_err());
+        assert_eq!(
+            subset_failure_result(false, "checksum failure").unwrap(),
+            (false, 0, 0)
+        );
     }
 }

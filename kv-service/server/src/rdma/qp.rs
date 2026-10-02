@@ -1,9 +1,12 @@
 //! Reliable Connection QP — one-to-one connection with a client; use ibv_post_send WRITE after handshake
 
-use crate::rdma::context::RdmaContext;
+use crate::rdma::context::{MemRegion, RdmaContext};
+use crate::rdma::slab::SlabExtent;
 use anyhow::{anyhow, Result};
+use prost::bytes::Bytes;
 use rdma_sys::*;
 use std::ptr::{self, NonNull};
+use std::sync::{Arc, Mutex};
 
 /// An RC QP (Reliable Connection Queue Pair).
 ///
@@ -15,6 +18,11 @@ use std::ptr::{self, NonNull};
 /// 5. `qp.post_write(...)` — actual operation
 pub struct RcQp {
     qp: NonNull<ibv_qp>,
+    // A timed-out WRITE may still read its local MR. These buffers are
+    // released only after Drop destroys the QP.
+    retired_writes: Mutex<Vec<(MemRegion, Bytes)>>,
+    retired_extents: Mutex<Vec<SlabExtent>>,
+    retired_pins: Mutex<Vec<Arc<SlabExtent>>>,
     /// Local QP info, sent to remote over the control plane
     pub local: QpInfo,
 }
@@ -48,7 +56,9 @@ impl QpInfo {
         let mut buf = [0u8; 24];
         buf[0..4].copy_from_slice(&self.qpn.to_le_bytes());
         buf[4..8].copy_from_slice(&self.psn.to_le_bytes());
-        unsafe { buf[8..24].copy_from_slice(&self.gid.raw[..]); }
+        unsafe {
+            buf[8..24].copy_from_slice(&self.gid.raw[..]);
+        }
         buf
     }
 
@@ -56,7 +66,9 @@ impl QpInfo {
         let qpn = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let psn = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         let mut gid: ibv_gid = unsafe { std::mem::zeroed() };
-        unsafe { gid.raw[..].copy_from_slice(&buf[8..24]); }
+        unsafe {
+            gid.raw[..].copy_from_slice(&buf[8..24]);
+        }
         Self { qpn, psn, gid }
     }
 }
@@ -86,8 +98,9 @@ impl RcQp {
                 sq_sig_all: 0, // do not signal every wr; caller controls explicitly
             };
             let qp_raw = ibv_create_qp(ctx.pd.as_ptr(), &mut attr);
-            let qp = NonNull::new(qp_raw)
-                .ok_or_else(|| anyhow!("ibv_create_qp failed: {}", std::io::Error::last_os_error()))?;
+            let qp = NonNull::new(qp_raw).ok_or_else(|| {
+                anyhow!("ibv_create_qp failed: {}", std::io::Error::last_os_error())
+            })?;
 
             // Pick a random PSN (Packet Serial Number). Cryptographic randomness not required.
             // Use the low 24 bits of the timestamp.
@@ -105,7 +118,13 @@ impl RcQp {
 
             tracing::info!("RcQp created: qpn={} psn=0x{:x}", local.qpn, local.psn);
 
-            Ok(Self { qp, local })
+            Ok(Self {
+                qp,
+                retired_writes: Mutex::new(Vec::new()),
+                retired_extents: Mutex::new(Vec::new()),
+                retired_pins: Mutex::new(Vec::new()),
+                local,
+            })
         }
     }
 
@@ -119,7 +138,8 @@ impl RcQp {
             // Allow remote WRITE/READ on our MR (direction here is server WRITE to client, but symmetric permissions ease debugging)
             attr.qp_access_flags = (ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
                 | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-                | ibv_access_flags::IBV_ACCESS_REMOTE_READ.0) as i32 as u32;
+                | ibv_access_flags::IBV_ACCESS_REMOTE_READ.0)
+                as i32 as u32;
 
             let mask = ibv_qp_attr_mask::IBV_QP_STATE
                 | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
@@ -127,7 +147,11 @@ impl RcQp {
                 | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
             let rc = ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask.0 as i32);
             if rc != 0 {
-                return Err(anyhow!("modify_qp -> INIT failed: rc={} errno={}", rc, std::io::Error::last_os_error()));
+                return Err(anyhow!(
+                    "modify_qp -> INIT failed: rc={} errno={}",
+                    rc,
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -165,7 +189,11 @@ impl RcQp {
                 | ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
             let rc = ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask.0 as i32);
             if rc != 0 {
-                return Err(anyhow!("modify_qp -> RTR failed: rc={} errno={}", rc, std::io::Error::last_os_error()));
+                return Err(anyhow!(
+                    "modify_qp -> RTR failed: rc={} errno={}",
+                    rc,
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -190,7 +218,11 @@ impl RcQp {
                 | ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
             let rc = ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask.0 as i32);
             if rc != 0 {
-                return Err(anyhow!("modify_qp -> RTS failed: rc={} errno={}", rc, std::io::Error::last_os_error()));
+                return Err(anyhow!(
+                    "modify_qp -> RTS failed: rc={} errno={}",
+                    rc,
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -240,6 +272,15 @@ impl RcQp {
 
     /// Wait for N work completions. Simple busy poll for PoC use.
     pub fn poll_n(cq: NonNull<ibv_cq>, expected: usize) -> Result<()> {
+        Self::poll_n_timeout(cq, expected, std::time::Duration::from_secs(30))
+    }
+
+    /// Wait for N work completions within a caller-selected deadline.
+    pub fn poll_n_timeout(
+        cq: NonNull<ibv_cq>,
+        expected: usize,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         unsafe {
             // ibv_wc does not implement Clone; use push instead of vec!.
             let mut wcs: Vec<ibv_wc> = Vec::with_capacity(expected.max(1));
@@ -273,8 +314,13 @@ impl RcQp {
                     }
                     got += n as usize;
                 }
-                if start.elapsed().as_secs() > 30 {
-                    return Err(anyhow!("poll_n timeout after 30s, got {}/{}", got, expected));
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "poll_n timeout after {}ms, got {}/{}",
+                        timeout.as_millis(),
+                        got,
+                        expected
+                    ));
                 }
             }
             match first_error {
@@ -286,7 +332,7 @@ impl RcQp {
 
     /// 非阻塞收割: poll 当前已完成的 CQE (最多 `max`), 立即返回收到的数量.
     /// 用于流水线中的机会式回收 — post 间隙顺手清 CQ, 避免凑满窗口后长阻塞.
-    pub fn poll_available(cq: NonNull<ibv_cq>, max: usize) -> Result<usize> {
+    pub fn poll_available(cq: NonNull<ibv_cq>, max: usize) -> Result<(usize, Option<String>)> {
         unsafe {
             let cap = max.max(1);
             let mut wcs: Vec<ibv_wc> = Vec::with_capacity(cap);
@@ -297,18 +343,40 @@ impl RcQp {
             if n < 0 {
                 return Err(anyhow!("ibv_poll_cq error"));
             }
-            for wc in wcs.iter().take(n as usize) {
-                if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
-                    return Err(anyhow!(
-                        "WR {} failed: status={} ({})",
-                        wc.wr_id,
-                        wc.status,
-                        wc_status_str(wc.status),
-                    ));
-                }
-            }
-            Ok(n as usize)
+            Ok(Self::summarize_completions(&wcs[..n as usize]))
         }
+    }
+
+    fn summarize_completions(wcs: &[ibv_wc]) -> (usize, Option<String>) {
+        let first_error = wcs
+            .iter()
+            .find(|wc| wc.status != ibv_wc_status::IBV_WC_SUCCESS)
+            .map(|wc| {
+                format!(
+                    "WR {} failed: status={} ({})",
+                    wc.wr_id,
+                    wc.status,
+                    wc_status_str(wc.status)
+                )
+            });
+        (wcs.len(), first_error)
+    }
+
+    /// Retain an uncertain local WRITE source until this QP is destroyed.
+    /// Used when polling cannot prove a signaled WRITE has quiesced.
+    pub fn retain_uncertain_write(&self, mr: MemRegion, source: Bytes) {
+        self.retired_writes.lock().unwrap().push((mr, source));
+    }
+
+    /// Keep a slab allocation pinned until QP destruction when a CQ poll
+    /// cannot prove every WRITE has stopped using it.
+    pub fn retain_uncertain_extent(&self, extent: SlabExtent) {
+        self.retired_extents.lock().unwrap().push(extent);
+    }
+
+    /// Keep a cached slab entry pinned until the QP can no longer read it.
+    pub fn retain_uncertain_pin(&self, pin: Arc<SlabExtent>) {
+        self.retired_pins.lock().unwrap().push(pin);
     }
 }
 
@@ -332,5 +400,20 @@ impl Drop for RcQp {
         unsafe {
             ibv_destroy_qp(self.qp.as_ptr());
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn failed_cqe_is_still_counted_as_consumed() {
+        let mut completion: ibv_wc = unsafe { std::mem::zeroed() };
+        completion.wr_id = 9;
+        completion.status = 12;
+        let (count, error) = RcQp::summarize_completions(&[completion]);
+        assert_eq!(count, 1);
+        assert!(error.expect("failed status").contains("WR 9 failed"));
     }
 }

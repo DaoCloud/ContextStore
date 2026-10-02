@@ -1,0 +1,17 @@
+{
+  "environment": "Mock software-only; no RDMA Verbs or disk I/O",
+  "environment_note": "Apple M5 Pro host; Debian 12 Linux aarch64 native OrbStack container",
+  "git_commit": "fe778d0",
+  "platform": "Linux-6.12.15-orbstack-00304-gd0ddcf70447d-aarch64-with-glibc2.36",
+  "machine": "aarch64",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "sizes_mib": [
+    64,
+    256,
+    512
+  ],
+  "trials": 3,
+  "iterations": 10,
+  "stripe_mib": 4,
+  "warmup_reads": 1
+}

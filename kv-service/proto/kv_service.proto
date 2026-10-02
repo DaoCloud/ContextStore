@@ -96,6 +96,15 @@ message PlacementChunk {
   string checksum = 9;          // Optional xxh3-64 checksum, set when stripe integrity is enabled
 }
 
+// Optional, ephemeral network capabilities for a node already owning stripes.
+// Old clients ignore this field; it does not alter the stored stripe layout.
+message RdmaRailEndpoint {
+  string node_id = 1;
+  string advertised_endpoint = 2;  // The existing PlacementChunk.rdma_endpoint
+  string fabric_id = 3;            // Matches a configured local Verbs path
+  string listener_endpoint = 4;    // Reachable control listener for this fabric
+}
+
 message PlacementDescriptor {
   ObjectKey key = 1;
   uint64 placement_epoch = 2;    // Current cluster placement-rule/topology version
@@ -105,6 +114,7 @@ message PlacementDescriptor {
   string primary_grpc_endpoint = 6;
   string primary_rdma_endpoint = 7;
   repeated PlacementChunk chunks = 8;
+  repeated RdmaRailEndpoint rdma_rails = 9;
 }
 
 enum CompressionType {

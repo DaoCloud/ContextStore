@@ -23,7 +23,7 @@
 
 use super::{
     log_io_batch, log_io_error, log_io_request, AlignedBuffer, IOExecutor, IORequest, IoBatchStats,
-    IoLogContext,
+    IoLogContext, O_DIRECT_FLAG,
 };
 use crate::error::{KVError, Result};
 use crossbeam_channel as channel;
@@ -42,7 +42,6 @@ const DEFAULT_QUEUE_DEPTH: u32 = 256;
 
 /// O_DIRECT / 4KB alignment — must match tier_a's AlignedBuffer value.
 /// (Copied from tier_a::DIRECT_IO_ALIGN; duplicated here to avoid a cross-module pub.)
-const O_DIRECT_FLAG: i32 = 0o40000;
 const DIRECT_IO_ALIGN: usize = 4096;
 
 /// Per-device worker.
@@ -485,8 +484,7 @@ fn ring_worker_loop(device_idx: usize, rx: channel::Receiver<RingJob>, queue_dep
                 });
                 let batch_len = batch.len();
                 let requested_bytes: usize = reqs.iter().map(|r| r.2).sum();
-                let completed_bytes: usize =
-                    ok_bytes_per_req.iter().filter_map(|x| *x).sum();
+                let completed_bytes: usize = ok_bytes_per_req.iter().filter_map(|x| *x).sum();
                 let success_count = ok_bytes_per_req.iter().filter(|r| r.is_some()).count();
                 let context = IoLogContext {
                     executor: "tier_b",
@@ -1336,8 +1334,7 @@ fn do_read_aligned_into_ptr_batch_incremental(
                     results[i] = Ok(0);
                     continue;
                 }
-                let aligned_len =
-                    (requested_len + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
+                let aligned_len = (requested_len + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
                 if capacity < aligned_len {
                     results[i] = Err(KVError::Internal(format!(
                         "read_aligned_into_ptr: capacity {} < aligned requested range {} \
@@ -2281,6 +2278,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn direct_io_flag_matches_native_platform() {
+        assert_eq!(O_DIRECT_FLAG, libc::O_DIRECT);
+    }
+
     fn setup_executor(tmp: &TempDir, n_devices: usize) -> TierBExecutor {
         let mut exec = TierBExecutor::new(64, n_devices).unwrap();
         for i in 0..n_devices {
@@ -2353,7 +2355,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, payload)| {
-                let path = tmp.path().join(format!("nvme{}/stripe-{}.bin", index % 2, index));
+                let path = tmp
+                    .path()
+                    .join(format!("nvme{}/stripe-{}.bin", index % 2, index));
                 std::fs::write(&path, payload).unwrap();
                 path
             })
@@ -2386,9 +2390,8 @@ mod tests {
             assert_eq!(bytes_read.unwrap(), DIRECT_IO_ALIGN);
             assert!(!seen[index], "duplicate completion for stripe {}", index);
             seen[index] = true;
-            let actual = unsafe {
-                std::slice::from_raw_parts(buffers[index].as_mut_ptr(), DIRECT_IO_ALIGN)
-            };
+            let actual =
+                unsafe { std::slice::from_raw_parts(buffers[index].as_mut_ptr(), DIRECT_IO_ALIGN) };
             assert_eq!(actual, payloads[index].as_slice());
         }
         assert_eq!(seen, vec![true; payloads.len()]);

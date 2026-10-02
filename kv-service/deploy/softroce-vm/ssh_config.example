@@ -1,0 +1,20 @@
+# Copy outside the repository, then replace KVM_HOST_ALIAS and PRIVATE_KEY_PATH.
+Host cs-railvm-server
+    HostName 127.0.0.1
+    User railtest
+    Port 22222
+    ProxyCommand ssh KVM_HOST_ALIAS -W %h:%p
+    IdentityFile PRIVATE_KEY_PATH
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking accept-new
+
+Host cs-railvm-client
+    HostName 127.0.0.1
+    User railtest
+    Port 22223
+    ProxyCommand ssh KVM_HOST_ALIAS -W %h:%p
+    IdentityFile PRIVATE_KEY_PATH
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking accept-new

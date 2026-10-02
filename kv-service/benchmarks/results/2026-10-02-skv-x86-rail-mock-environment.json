@@ -1,0 +1,17 @@
+{
+  "environment": "Mock software-only; no RDMA Verbs or disk I/O",
+  "environment_note": "skv-node1 x86_64 Xeon Gold 5218R; Mock copy only, no RDMA or disk",
+  "git_commit": "8245ae4",
+  "platform": "Linux-5.4.0-80-generic-x86_64-with-glibc2.29",
+  "machine": "x86_64",
+  "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+  "sizes_mib": [
+    64,
+    256,
+    512
+  ],
+  "trials": 3,
+  "iterations": 10,
+  "stripe_mib": 4,
+  "warmup_reads": 1
+}
