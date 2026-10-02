@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use prost::bytes::Bytes;
 use rdma_sys::*;
 use std::ptr::{self, NonNull};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// An RC QP (Reliable Connection Queue Pair).
 ///
@@ -22,6 +22,7 @@ pub struct RcQp {
     // released only after Drop destroys the QP.
     retired_writes: Mutex<Vec<(MemRegion, Bytes)>>,
     retired_extents: Mutex<Vec<SlabExtent>>,
+    retired_pins: Mutex<Vec<Arc<SlabExtent>>>,
     /// Local QP info, sent to remote over the control plane
     pub local: QpInfo,
 }
@@ -55,7 +56,9 @@ impl QpInfo {
         let mut buf = [0u8; 24];
         buf[0..4].copy_from_slice(&self.qpn.to_le_bytes());
         buf[4..8].copy_from_slice(&self.psn.to_le_bytes());
-        unsafe { buf[8..24].copy_from_slice(&self.gid.raw[..]); }
+        unsafe {
+            buf[8..24].copy_from_slice(&self.gid.raw[..]);
+        }
         buf
     }
 
@@ -63,7 +66,9 @@ impl QpInfo {
         let qpn = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let psn = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         let mut gid: ibv_gid = unsafe { std::mem::zeroed() };
-        unsafe { gid.raw[..].copy_from_slice(&buf[8..24]); }
+        unsafe {
+            gid.raw[..].copy_from_slice(&buf[8..24]);
+        }
         Self { qpn, psn, gid }
     }
 }
@@ -93,8 +98,9 @@ impl RcQp {
                 sq_sig_all: 0, // do not signal every wr; caller controls explicitly
             };
             let qp_raw = ibv_create_qp(ctx.pd.as_ptr(), &mut attr);
-            let qp = NonNull::new(qp_raw)
-                .ok_or_else(|| anyhow!("ibv_create_qp failed: {}", std::io::Error::last_os_error()))?;
+            let qp = NonNull::new(qp_raw).ok_or_else(|| {
+                anyhow!("ibv_create_qp failed: {}", std::io::Error::last_os_error())
+            })?;
 
             // Pick a random PSN (Packet Serial Number). Cryptographic randomness not required.
             // Use the low 24 bits of the timestamp.
@@ -116,6 +122,7 @@ impl RcQp {
                 qp,
                 retired_writes: Mutex::new(Vec::new()),
                 retired_extents: Mutex::new(Vec::new()),
+                retired_pins: Mutex::new(Vec::new()),
                 local,
             })
         }
@@ -131,7 +138,8 @@ impl RcQp {
             // Allow remote WRITE/READ on our MR (direction here is server WRITE to client, but symmetric permissions ease debugging)
             attr.qp_access_flags = (ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
                 | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-                | ibv_access_flags::IBV_ACCESS_REMOTE_READ.0) as i32 as u32;
+                | ibv_access_flags::IBV_ACCESS_REMOTE_READ.0)
+                as i32 as u32;
 
             let mask = ibv_qp_attr_mask::IBV_QP_STATE
                 | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
@@ -139,7 +147,11 @@ impl RcQp {
                 | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
             let rc = ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask.0 as i32);
             if rc != 0 {
-                return Err(anyhow!("modify_qp -> INIT failed: rc={} errno={}", rc, std::io::Error::last_os_error()));
+                return Err(anyhow!(
+                    "modify_qp -> INIT failed: rc={} errno={}",
+                    rc,
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -177,7 +189,11 @@ impl RcQp {
                 | ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
             let rc = ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask.0 as i32);
             if rc != 0 {
-                return Err(anyhow!("modify_qp -> RTR failed: rc={} errno={}", rc, std::io::Error::last_os_error()));
+                return Err(anyhow!(
+                    "modify_qp -> RTR failed: rc={} errno={}",
+                    rc,
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -202,7 +218,11 @@ impl RcQp {
                 | ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
             let rc = ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask.0 as i32);
             if rc != 0 {
-                return Err(anyhow!("modify_qp -> RTS failed: rc={} errno={}", rc, std::io::Error::last_os_error()));
+                return Err(anyhow!(
+                    "modify_qp -> RTS failed: rc={} errno={}",
+                    rc,
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -352,6 +372,11 @@ impl RcQp {
     /// cannot prove every WRITE has stopped using it.
     pub fn retain_uncertain_extent(&self, extent: SlabExtent) {
         self.retired_extents.lock().unwrap().push(extent);
+    }
+
+    /// Keep a cached slab entry pinned until the QP can no longer read it.
+    pub fn retain_uncertain_pin(&self, pin: Arc<SlabExtent>) {
+        self.retired_pins.lock().unwrap().push(pin);
     }
 }
 

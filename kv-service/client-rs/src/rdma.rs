@@ -372,6 +372,14 @@ impl RdmaClient {
         }
     }
 
+    /// Change the control-channel deadline after the QP handshake has completed.
+    /// This also lets callers bound a GET independently of connection setup.
+    pub fn set_io_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
     fn retire_after_control_error(&mut self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         if let Some(qp) = self.qp.take() {

@@ -75,6 +75,22 @@
     },
     {
       "side": "client",
+      "file": "legacy-get-timeout-safe.log",
+      "status": "passed",
+      "purpose": "legacy full-object GET retires QP on 1ms GET-only client timeout after handshake; reused destination stays unchanged after six seconds",
+      "raw_sha256": "092cad25d8e73201e5f96b099e5b5144d11a9af9511458671762d2c22ad07b1d",
+      "raw_bytes": 397
+    },
+    {
+      "side": "server",
+      "file": "server-legacy-timeout-safe.log",
+      "status": "diagnostic",
+      "purpose": "legacy slab cache-miss GET retires connection after 2s CQ timeout with 0 of 64 completions; no per-chunk fallback",
+      "raw_sha256": "33678982a48e3572936e3f644bbfce76a107d8662affa72fd8b3320f386f264a",
+      "raw_bytes": 2475
+    },
+    {
+      "side": "client",
       "file": "memlock-preflight.log",
       "status": "expected resource rejection",
       "purpose": "finite RLIMIT_MEMLOCK rejects fourth concurrent registration before dispatch",

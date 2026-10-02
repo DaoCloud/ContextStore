@@ -354,11 +354,15 @@ when its registered slab cannot provide staging space. A fallback WRITE with
 uncertain completion retains its source and MR until its QP is destroyed.
 Uncertain CQ completion terminates the server connection rather than reusing
 that CQ for another request; a client GET control error likewise destroys its
-QP so a late reply cannot be mistaken for a new request's response.
+QP so a late reply cannot be mistaken for a new request's response. This also
+applies to the older complete-object GET: cache-hit slab pins, cache-miss slab
+extents, and per-chunk fallback MRs remain alive until their QP is destroyed
+when a posted WRITE has uncertain completion. A cache-miss CQ error cannot
+enter fallback on the same QP/CQ.
 
 For hardware-independent scheduling and failure checks, run
 `cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
-rail_read::tests`. The ignored `rail_read_e2e` suite contains five single
+rail_read::tests`. The ignored `rail_read_e2e` suite contains six single
 real-Rail checks and seven dual-Rail/control-connection checks. Select a test with `--ignored
 --exact <test_name> --nocapture` and configure `CS_RAIL_COORDINATOR`,
 `CS_RAIL_LISTENER0/1`, `CS_RAIL_DEVICE0/1`, and `CS_RAIL_GID0/1` as needed.
@@ -367,9 +371,13 @@ On an isolated server only, `CS_RDMA_TEST_PRE_WRITE_DELAY_MS=3000` delays
 stripe-subset WRITEs for the late-completion test; the delay is bounded to
 five seconds. Add `CS_RDMA_TEST_PRE_WRITE_NIC_IDX=1` to delay only the second
 listener and exercise partial completion. `CS_RDMA_CQ_TIMEOUT_MS` bounds the
-stripe-subset CQ poll between 100 and 30,000 ms (default 30,000); use 2,000
-ms for isolated late-WRITE injection. Unset both fault-injection variables
-after testing. A physical-stripe corruption
+stripe-subset and legacy GET CQ polls between 100 and 30,000 ms (default
+30,000); use 2,000 ms for isolated late-WRITE injection. Unset both
+fault-injection variables after testing. With `CS_FORCE_DISK_READ=1` on an
+isolated server, the ignored `legacy_get_timeout_retires_qp_before_buffer_reuse`
+test completes the QP handshake first, then applies a 1 ms GET deadline. The
+matching RXE receipt records a 2 s server CQ timeout, connection retirement,
+and an unchanged reused destination after six seconds. A physical-stripe corruption
 test additionally requires checksum verification enabled before writing its
 object and a reversible fault injection into one test-only stripe file.
 The ignored `software_only_mock_benchmark` exercises scheduling and memory

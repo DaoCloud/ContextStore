@@ -16,7 +16,7 @@
 //! ```
 
 use crate::metadata::{BlockMeta, StripingInfo};
-use crate::rdma::context::RdmaContext;
+use crate::rdma::context::{MemRegion, RdmaContext};
 use crate::rdma::qp::RcQp;
 use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
@@ -29,6 +29,7 @@ use crate::rdma::wire::{
 use crate::router::ObjectKey;
 use crate::KVServiceContext;
 use anyhow::{anyhow, Result};
+use prost::bytes::Bytes;
 use rdma_sys::ibv_access_flags;
 use std::net::{TcpListener, TcpStream};
 use std::ptr::NonNull;
@@ -429,6 +430,11 @@ fn handle_client(
                         (false, 0u64, 0u32)
                     }
                     Err(e) => {
+                        if e.downcast_ref::<RetireLegacyGet>().is_some() {
+                            // A posted WRITE may still read its slab extent. The source is
+                            // pinned by the QP; return now so neither the CQ nor QP is reused.
+                            return Err(e);
+                        }
                         // Slab path failed (slab full / I/O error) → fall back to the old path
                         tracing::warn!(
                             "RDMA GET slab fast path failed, fallback to per-chunk reg_mr: {}",
@@ -548,6 +554,21 @@ fn handle_client(
 /// (no leak) whenever `handle_client` exits (client BYE / protocol error / I/O error).
 struct CqGuard(NonNull<rdma_sys::ibv_cq>);
 
+#[derive(Debug)]
+struct RetireLegacyGet(String);
+
+impl std::fmt::Display for RetireLegacyGet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RDMA connection retired after uncertain legacy GET: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RetireLegacyGet {}
+
 impl Drop for CqGuard {
     fn drop(&mut self) {
         unsafe {
@@ -594,7 +615,7 @@ fn serve_get_slab(
     while offset < total {
         let len = (total - offset).min(MAX_WRITE_BYTES);
         let signaled = idx + 1 == n_writes; // Only signal on the last WRITE (RC guarantees prior completions)
-        qp.post_write(
+        if let Err(error) = qp.post_write(
             idx,
             src_base + offset,
             lkey,
@@ -602,12 +623,18 @@ fn serve_get_slab(
             dst_rkey,
             len as u32,
             signaled,
-        )?;
+        ) {
+            qp.retain_uncertain_pin(placement._pin.clone());
+            return Err(anyhow!(RetireLegacyGet(error.to_string())));
+        }
         offset += len;
         idx += 1;
     }
     let t_poll_start = std::time::Instant::now();
-    RcQp::poll_n(client_cq, 1)?;
+    if let Err(error) = RcQp::poll_n_timeout(client_cq, 1, subset_cq_timeout()) {
+        qp.retain_uncertain_pin(placement._pin.clone());
+        return Err(anyhow!(RetireLegacyGet(error.to_string())));
+    }
     let t_poll_done = std::time::Instant::now();
 
     let post_us = t_poll_start.duration_since(t_post_start).as_micros() as u64;
@@ -639,24 +666,34 @@ fn serve_get_fallback(
         return Ok((false, 0, 0, 0, 0));
     }
     let n = segments.len();
+    let last_nonempty = segments.iter().rposition(|segment| !segment.is_empty());
     let mut offset: u64 = 0;
     // Hold the MR until poll completes (drop = dereg).
-    let mut mrs = Vec::with_capacity(n);
+    let mut mrs: Vec<(MemRegion, Bytes)> = Vec::with_capacity(n);
     let t_reg_post_start = std::time::Instant::now();
     for (i, seg) in segments.iter().enumerate() {
         if seg.is_empty() {
             continue;
         }
         // RDMA WRITE source side only needs LOCAL access; the LOCAL_WRITE flag matches the slab path convention.
-        let mr = unsafe {
+        let mr_result = unsafe {
             rdma.register_mr_raw(
                 seg.as_ptr() as *mut u8,
                 seg.len(),
                 ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0,
-            )?
+            )
         };
-        let signaled = i + 1 == n; // Only signal on the last one
-        qp.post_write(
+        let mr = match mr_result {
+            Ok(mr) => mr,
+            Err(error) => {
+                for (posted_mr, source) in mrs {
+                    qp.retain_uncertain_write(posted_mr, source);
+                }
+                return Err(error);
+            }
+        };
+        let signaled = Some(i) == last_nonempty; // Last nonempty WRITE signals completion.
+        if let Err(error) = qp.post_write(
             i as u64,
             mr.addr,
             mr.lkey,
@@ -664,13 +701,26 @@ fn serve_get_fallback(
             dst_rkey,
             seg.len() as u32,
             signaled,
-        )?;
+        ) {
+            qp.retain_uncertain_write(mr, seg.clone());
+            for (posted_mr, source) in mrs {
+                qp.retain_uncertain_write(posted_mr, source);
+            }
+            return Err(error);
+        }
         offset += seg.len() as u64;
-        mrs.push(mr);
+        mrs.push((mr, seg.clone()));
     }
     let t_poll_start = std::time::Instant::now();
     // Wait for the last WRITE to complete (RC guarantees prior ones did too).
-    RcQp::poll_n(client_cq, 1)?;
+    if !mrs.is_empty() {
+        if let Err(error) = RcQp::poll_n_timeout(client_cq, 1, subset_cq_timeout()) {
+            for (posted_mr, source) in mrs {
+                qp.retain_uncertain_write(posted_mr, source);
+            }
+            return Err(error);
+        }
+    }
     let t_poll_done = std::time::Instant::now();
     // At this point mrs drop and dereg.
     let reg_post_us = t_poll_start.duration_since(t_reg_post_start).as_micros() as u64;
@@ -778,6 +828,7 @@ fn try_serve_get_via_slab_with_meta(
     let t_post_start = std::time::Instant::now();
     let mut n_writes_posted = 0u64;
     let mut outstanding_writes = 0usize;
+    let mut uncertain_write = false;
     let mut poll_us = 0u64;
     let mut had_error: Option<String> = None;
     let mut first_stream_completion_us: Option<u64> = None;
@@ -798,6 +849,7 @@ fn try_serve_get_via_slab_with_meta(
                     stripe_len as u32,
                     true, // signaled
                 ) {
+                    uncertain_write = true;
                     had_error = Some(format!(
                         "post RDMA write for stripe {}: {}",
                         stripe_idx, error
@@ -807,12 +859,17 @@ fn try_serve_get_via_slab_with_meta(
                     outstanding_writes += 1;
                     if outstanding_writes == RDMA_WRITE_COMPLETION_WINDOW {
                         let poll_start = std::time::Instant::now();
-                        if let Err(error) = RcQp::poll_n(client_cq, outstanding_writes) {
+                        if let Err(error) =
+                            RcQp::poll_n_timeout(client_cq, outstanding_writes, subset_cq_timeout())
+                        {
+                            uncertain_write = true;
                             had_error =
                                 Some(format!("poll RDMA write completion window: {}", error));
                         }
                         poll_us += poll_start.elapsed().as_micros() as u64;
-                        outstanding_writes = 0;
+                        if !uncertain_write {
+                            outstanding_writes = 0;
+                        }
                     }
                 }
             }
@@ -833,9 +890,9 @@ fn try_serve_get_via_slab_with_meta(
 
     // 5. Drain every posted WRITE before returning, including when a later stripe
     // failed. The slab extent backs in-flight RNIC DMA and must not be released early.
-    let poll_result = if outstanding_writes > 0 {
+    let poll_result = if outstanding_writes > 0 && !uncertain_write {
         let poll_start = std::time::Instant::now();
-        let result = RcQp::poll_n(client_cq, outstanding_writes);
+        let result = RcQp::poll_n_timeout(client_cq, outstanding_writes, subset_cq_timeout());
         poll_us += poll_start.elapsed().as_micros() as u64;
         result
     } else {
@@ -843,6 +900,19 @@ fn try_serve_get_via_slab_with_meta(
     };
 
     let post_us = t_post_done;
+
+    if let Err(error) = &poll_result {
+        uncertain_write = true;
+        had_error.get_or_insert_with(|| format!("poll final RDMA completions: {error}"));
+    }
+    if uncertain_write {
+        // The extent remains pinned until Drop destroys this QP. The caller must
+        // not run a fallback GET on the old QP/CQ after a partial/late WRITE.
+        qp.retain_uncertain_extent(extent);
+        return Err(anyhow!(RetireLegacyGet(
+            had_error.unwrap_or_else(|| "RDMA WRITE completion uncertain".to_string())
+        )));
+    }
 
     if let Some(error) = had_error {
         return Err(anyhow!("RDMA GET stream failed: {}", error));

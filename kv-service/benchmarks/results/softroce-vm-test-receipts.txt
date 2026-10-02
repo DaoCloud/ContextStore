@@ -87,6 +87,14 @@ test uncertain_completion_retires_old_server_connection ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 7.51s
 
 
+=== client/legacy-get-timeout-safe.log | passed | handshake completes before 1ms GET deadline; reused destination stays unchanged for six seconds ===
+running 1 test
+test legacy_get_timeout_retires_qp_before_buffer_reuse ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 6.67s
+
+=== server/server-legacy-timeout-safe.log | diagnostic | old complete-object GET retires QP after uncertain CQ completion; no same-QP fallback ===
+2026-10-02T06:45:21.385603Z  WARN RDMA client 10.31.0.1:53048 (nic_idx=0) disconnected: RDMA connection retired after uncertain legacy GET: poll RDMA write completion window: poll_n timeout after 2000ms, got 0/64
+
 === client/memlock-preflight.log | expected resource rejection | finite RLIMIT_MEMLOCK rejects fourth concurrent registration before dispatch ===
 route,id=r0,device=rxe_c0,port=1,gid=1,weight=1,advertised=10.31.0.2:55153,listener=10.31.0.2:55153
 sample,environment=soft-roce,rails=1,concurrency=4,batch=1,worker=0,bytes=134217728,latency_us=1505892,xxh3=6c7a2ea2bc98454c

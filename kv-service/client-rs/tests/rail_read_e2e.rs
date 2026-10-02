@@ -415,6 +415,35 @@ async fn late_second_rail_after_first_completion_cannot_publish_or_corrupt() {
 }
 
 #[tokio::test]
+#[ignore = "requires an isolated RXE server with CS_FORCE_DISK_READ=1 and a 64 MiB object"]
+async fn legacy_get_timeout_retires_qp_before_buffer_reuse() {
+    let (_client, key, payload, advertised) = seeded_object().await;
+    let listener = setting("CS_RAIL_LISTENER0", &advertised);
+    let device = setting("CS_RAIL_DEVICE0", "rxe_c0");
+    let gid = setting("CS_RAIL_GID0", "1")
+        .parse::<u8>()
+        .expect("GID index");
+    let mut rdma = RdmaClient::connect(RdmaClientConfig::new(listener, device).with_gid_index(gid))
+        .expect("connect legacy GET");
+    rdma.set_io_timeout(Duration::from_millis(1))
+        .expect("set GET deadline after handshake");
+    let mut destination = vec![0xA5; payload.len()];
+    let registered = rdma
+        .register_buffer(&mut destination)
+        .expect("register buffer");
+    assert!(rdma.get_into("rail-e2e", &key, &registered, 0).is_err());
+    assert!(
+        rdma.get_into("rail-e2e", &key, &registered, 0).is_err(),
+        "failed legacy GET must not reuse the old QP"
+    );
+    drop(rdma);
+    drop(registered);
+    destination.fill(0x33);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(destination.iter().all(|byte| *byte == 0x33));
+}
+
+#[tokio::test]
 #[ignore = "requires a three-second delay on server nic_idx=1 and a two-second CQ deadline"]
 async fn uncertain_completion_retires_old_server_connection() {
     let (mut client, key, _payload, _advertised) = seeded_object().await;
