@@ -1,0 +1,99 @@
+{
+  "label": "Soft-RoCE RXE through two isolated KVM guest-to-guest virtio Ethernet paths; not physical HCA",
+  "host": "skv-node1, Intel Xeon Gold 5218R, QEMU 4.2.1",
+  "guests": [
+    {
+      "role": "client",
+      "hostname": "cs-railvm-client",
+      "kernel": "Ubuntu 22.04.5 Linux 5.15.0-194-generic",
+      "resources": {
+        "vcpus": 4,
+        "memory_gib": 4
+      },
+      "rails": [
+        {
+          "id": "rxe_c0",
+          "netdev": "enp0s3",
+          "ipv4": "10.31.0.1/24",
+          "gid_index": 1,
+          "gid": "::ffff:10.31.0.1",
+          "bridge": "csrb0"
+        },
+        {
+          "id": "rxe_c1",
+          "netdev": "enp0s4",
+          "ipv4": "10.32.0.1/24",
+          "gid_index": 1,
+          "gid": "::ffff:10.32.0.1",
+          "bridge": "csrb1"
+        }
+      ]
+    },
+    {
+      "role": "server",
+      "hostname": "cs-railvm",
+      "kernel": "Ubuntu 22.04.5 Linux 5.15.0-194-generic",
+      "resources": {
+        "vcpus": 4,
+        "memory_gib": 4
+      },
+      "rails": [
+        {
+          "id": "rxe_s0",
+          "netdev": "enp0s3",
+          "ipv4": "10.31.0.2/24",
+          "gid_index": 1,
+          "gid": "::ffff:10.31.0.2",
+          "bridge": "csrb0",
+          "listener": "10.31.0.2:55153"
+        },
+        {
+          "id": "rxe_s1",
+          "netdev": "enp0s4",
+          "ipv4": "10.32.0.2/24",
+          "gid_index": 1,
+          "gid": "::ffff:10.32.0.2",
+          "bridge": "csrb1",
+          "listener": "10.32.0.2:55154"
+        }
+      ]
+    }
+  ],
+  "common": {
+    "rdma_core": "39.0-1",
+    "source_base": "DaoCloud main b5c6451",
+    "server_binary_sha256": "f4f2df78e278da5ec6f47a3a0f23f31b0865eaa0709f1b03ca9fc6883c744e01",
+    "paired_client_source_commit": "52b933d",
+    "concurrent_client_source_commit": "cd529b5",
+    "object_layout": "4 MiB stripes across two directories on one server VM virtual disk; verify_stripe_checksums=true",
+    "storage_boundary": "QEMU qcow2 virtual disk on skv-node1 /home SATA SSD; no independent NVMe, HCA, PCIe or NUMA path"
+  },
+  "counter_probe_64m_5_reads": {
+    "object_payload_bytes": 335544320,
+    "rail0": {
+      "payload_bytes": 167772160,
+      "server_netdev_tx_before": 13972899714,
+      "server_netdev_tx_after": 14150221207,
+      "server_netdev_tx_delta": 177321493,
+      "client_netdev_rx_before": 13972898798,
+      "client_netdev_rx_after": 14150220291,
+      "client_netdev_rx_delta": 177321493
+    },
+    "rail1": {
+      "payload_bytes": 167772160,
+      "server_netdev_tx_before": 4819518568,
+      "server_netdev_tx_after": 4996867049,
+      "server_netdev_tx_delta": 177348481,
+      "client_netdev_rx_before": 4819517492,
+      "client_netdev_rx_after": 4996865973,
+      "client_netdev_rx_delta": 177348481
+    },
+    "caveat": "The netdev counters include protocol overhead and any concurrent traffic; measured around a five-read benchmark with no other test activity."
+  },
+  "limitations": [
+    "RXE is software processing; QEMU/virtio/bridges run on one physical host.",
+    "Per-guest NUMA and PCI topology are virtual and do not validate HCA offload.",
+    "One virtual disk backs both stripe directories; no multi-disk bandwidth conclusion.",
+    "Measurements are paired within each size/concurrency cell; trial count is descriptive, not a confidence interval."
+  ]
+}

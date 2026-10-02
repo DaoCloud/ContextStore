@@ -1,0 +1,20 @@
+{
+  "environment": "soft-roce",
+  "source_commit": "52b933d",
+  "platform": "Linux-5.15.0-194-generic-x86_64-with-glibc2.35",
+  "machine": "x86_64",
+  "notes": "Two Ubuntu 22.04 KVM guests, two isolated Linux bridges and virtio Ethernet links, four RXE devices, 4 vCPU and 4 GiB each, two stripe directories on one guest virtual disk",
+  "objects_mib": [
+    64,
+    128,
+    256
+  ],
+  "trials": 3,
+  "iterations_per_trial": 5,
+  "warmup_reads": 1,
+  "coordinator": "http://10.31.0.2:55151",
+  "rails": [
+    "r0,rxe_c0,10.31.0.2:55153,10.31.0.2:55153,1,1",
+    "r1,rxe_c1,10.31.0.2:55153,10.32.0.2:55154,1,1"
+  ]
+}

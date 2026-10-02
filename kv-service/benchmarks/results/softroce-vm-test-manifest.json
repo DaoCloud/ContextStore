@@ -1,0 +1,117 @@
+{
+  "environment": "soft-roce KVM, not physical HCA",
+  "receipts": [
+    {
+      "side": "client",
+      "file": "dual-success-e2e.log",
+      "status": "passed",
+      "purpose": "single and dual rail byte equality",
+      "raw_sha256": "caa6f2a69d8b3c8733a5adc17d03aeb8dfc147d6d4254c22e35942174840ddd0",
+      "raw_bytes": 166
+    },
+    {
+      "side": "client",
+      "file": "dual-dead-listener-e2e.log",
+      "status": "passed",
+      "purpose": "second listener unavailable leaves caller buffer unchanged",
+      "raw_sha256": "52d920ca094f13d4087fb065ccbc77f914ac41cf132c6ccac7376e8f9af4dcad",
+      "raw_bytes": 175
+    },
+    {
+      "side": "client",
+      "file": "dual-stale-generation-e2e.log",
+      "status": "passed",
+      "purpose": "old descriptor rejected after rewrite",
+      "raw_sha256": "a91d4512559943a08bb9679bfe71a21d86979675a5c6cb6be3f680f411b165c3",
+      "raw_bytes": 177
+    },
+    {
+      "side": "client",
+      "file": "dual-cancel-inflight.log",
+      "status": "passed",
+      "purpose": "both rails active, cancellation and buffer reuse",
+      "raw_sha256": "12cd4c32457bb5d034e8ddee0601180a617ba715e62a7289654e7455fcf760db",
+      "raw_bytes": 187
+    },
+    {
+      "side": "client",
+      "file": "dual-stripe1-corruption.log",
+      "status": "passed",
+      "purpose": "stripe one checksum failure on second rail",
+      "raw_sha256": "6bf6abbd2df12bded04cef0ee377099a54ff8e6d1fb0d5d75702340c94d2dce5",
+      "raw_bytes": 184
+    },
+    {
+      "side": "client",
+      "file": "dual-late-after-retire-fix.log",
+      "status": "passed",
+      "purpose": "first rail complete and second rail late WRITE safe failure",
+      "raw_sha256": "e4af8b5c70b07b5855a33bb1a66e35fe789c866bb88851c926a0cf2b896ed254",
+      "raw_bytes": 191
+    },
+    {
+      "side": "client",
+      "file": "dual-fallback-verbs.log",
+      "status": "passed",
+      "purpose": "two rails restore one object with slab disabled",
+      "raw_sha256": "0f8b66e434e26bc8dff2bc6d24d10d1910e9372cf73ee8cd147b6b5bb83a87ad",
+      "raw_bytes": 1300
+    },
+    {
+      "side": "client",
+      "file": "cq-retire-red.log",
+      "status": "expected failure",
+      "purpose": "old client and server reused stale control response",
+      "raw_sha256": "6c5637e5924edfbc41a8034cd1d3dbe7af2567c45c57271175c02c6145b9f6f9",
+      "raw_bytes": 531
+    },
+    {
+      "side": "client",
+      "file": "cq-retire-green-client-fix.log",
+      "status": "passed",
+      "purpose": "connection retired after control timeout",
+      "raw_sha256": "c363fc9c87caff7c7b9bf54b55411f78da8b6c9ce3c463073f4cf1cea0c8604c",
+      "raw_bytes": 176
+    },
+    {
+      "side": "client",
+      "file": "memlock-preflight.log",
+      "status": "expected resource rejection",
+      "purpose": "finite RLIMIT_MEMLOCK rejects fourth concurrent registration before dispatch",
+      "raw_sha256": "05d2d7dd31a05c59e67ec3c498bb993bc775aa459938fd90bb9bd9a73cda9a6e",
+      "raw_bytes": 594
+    },
+    {
+      "side": "client",
+      "file": "memlock-unlimited-success.log",
+      "status": "passed",
+      "purpose": "same 128 MiB by four cell after isolated VM memlock increase",
+      "raw_sha256": "28686e6231ddced491fbaf1fe9cee89af53543d4d8e12ef98f7aaa7686760286",
+      "raw_bytes": 935
+    },
+    {
+      "side": "server",
+      "file": "server-dual-late-cq2s.log",
+      "status": "diagnostic",
+      "purpose": "second rail CQ deadline 2 seconds and source retained",
+      "raw_sha256": "9f8605a171f061007699fac3e6c13758292edef17d919dfd8fbac6f31efe5f67",
+      "raw_bytes": 3492
+    },
+    {
+      "side": "server",
+      "file": "server-cq-retire-green.log",
+      "status": "diagnostic",
+      "purpose": "uncertain completion tears down server QP/CQ connection",
+      "raw_sha256": "23e368667d5562be2cd30a0fabc22f54b2860a0d969f45cdd84d3c049638b59d",
+      "raw_bytes": 6693
+    },
+    {
+      "side": "server",
+      "file": "server-dual-fallback.log",
+      "status": "diagnostic",
+      "purpose": "both listeners entered registered-buffer fallback",
+      "raw_sha256": "864aabe8c1d5792a7606bab0963c636036ef9c4c89e852554455dabfdaea55dc",
+      "raw_bytes": 5804
+    }
+  ]
+}

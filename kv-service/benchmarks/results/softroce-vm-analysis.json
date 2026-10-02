@@ -1,0 +1,235 @@
+{
+  "interpretation": "Descriptive paired measurements; no statistical confidence interval or HCA offload claim",
+  "groups": {
+    "softroce-vm-paired": [
+      {
+        "size_mib": 64,
+        "concurrency": 1,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 352.824,
+          "p95_request_ms": 394.774,
+          "aggregate_gib_per_s": 0.17714214452531574,
+          "cpu_ms_per_read": 123.132,
+          "peak_rss_mib": 198.2734375,
+          "object_xxh3": "a0a4cbfa5cad46af",
+          "runs": 3,
+          "raw_request_samples": 15
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 329.447,
+          "p95_request_ms": 346.031,
+          "aggregate_gib_per_s": 0.18971185046456637,
+          "cpu_ms_per_read": 136.51239999999999,
+          "peak_rss_mib": 206.359375,
+          "object_xxh3": "a0a4cbfa5cad46af",
+          "runs": 3,
+          "raw_request_samples": 15
+        },
+        "aggregate_throughput_ratio": 1.0709583028529626,
+        "two_rail_scaling_efficiency": 0.5354791514264813
+      },
+      {
+        "size_mib": 128,
+        "concurrency": 1,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 703.299,
+          "p95_request_ms": 748.001,
+          "aggregate_gib_per_s": 0.17773379458807706,
+          "cpu_ms_per_read": 235.071,
+          "peak_rss_mib": 390.31640625,
+          "object_xxh3": "6c7a2ea2bc98454c",
+          "runs": 3,
+          "raw_request_samples": 15
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 647.801,
+          "p95_request_ms": 663.332,
+          "aggregate_gib_per_s": 0.19296049249692424,
+          "cpu_ms_per_read": 250.19920000000002,
+          "peak_rss_mib": 398.16015625,
+          "object_xxh3": "6c7a2ea2bc98454c",
+          "runs": 3,
+          "raw_request_samples": 15
+        },
+        "aggregate_throughput_ratio": 1.0856713713007544,
+        "two_rail_scaling_efficiency": 0.5428356856503772
+      },
+      {
+        "size_mib": 256,
+        "concurrency": 1,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 1424.505,
+          "p95_request_ms": 1598.908,
+          "aggregate_gib_per_s": 0.17549955949610568,
+          "cpu_ms_per_read": 440.4614,
+          "peak_rss_mib": 774.2421875,
+          "object_xxh3": "fe51c755b1336171",
+          "runs": 3,
+          "raw_request_samples": 15
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 1279.419,
+          "p95_request_ms": 1389.539,
+          "aggregate_gib_per_s": 0.19540119382313376,
+          "cpu_ms_per_read": 463.818,
+          "peak_rss_mib": 782.30078125,
+          "object_xxh3": "fe51c755b1336171",
+          "runs": 3,
+          "raw_request_samples": 15
+        },
+        "aggregate_throughput_ratio": 1.1133999104280925,
+        "two_rail_scaling_efficiency": 0.5566999552140462
+      }
+    ],
+    "softroce-vm-concurrent-64-128": [
+      {
+        "size_mib": 64,
+        "concurrency": 2,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 581.23,
+          "p95_request_ms": 599.33,
+          "aggregate_gib_per_s": 0.207,
+          "cpu_ms_per_read": 140.90866666666665,
+          "peak_rss_mib": 454.52734375,
+          "object_xxh3": "a0a4cbfa5cad46af",
+          "runs": 2,
+          "raw_request_samples": 12
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 522.294,
+          "p95_request_ms": 536.04,
+          "aggregate_gib_per_s": 0.2265,
+          "cpu_ms_per_read": 150.62341666666669,
+          "peak_rss_mib": 470.71484375,
+          "object_xxh3": "a0a4cbfa5cad46af",
+          "runs": 2,
+          "raw_request_samples": 12
+        },
+        "aggregate_throughput_ratio": 1.0942028985507248,
+        "two_rail_scaling_efficiency": 0.5471014492753624
+      },
+      {
+        "size_mib": 64,
+        "concurrency": 4,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 934.8985,
+          "p95_request_ms": 987.519,
+          "aggregate_gib_per_s": 0.2525,
+          "cpu_ms_per_read": 148.35825,
+          "peak_rss_mib": 837.662109375,
+          "object_xxh3": "a0a4cbfa5cad46af",
+          "runs": 2,
+          "raw_request_samples": 24
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 912.668,
+          "p95_request_ms": 959.521,
+          "aggregate_gib_per_s": 0.257,
+          "cpu_ms_per_read": 153.86858333333333,
+          "peak_rss_mib": 815.591796875,
+          "object_xxh3": "a0a4cbfa5cad46af",
+          "runs": 2,
+          "raw_request_samples": 24
+        },
+        "aggregate_throughput_ratio": 1.0178217821782178,
+        "two_rail_scaling_efficiency": 0.5089108910891089
+      },
+      {
+        "size_mib": 128,
+        "concurrency": 2,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 1097.5775,
+          "p95_request_ms": 1157.407,
+          "aggregate_gib_per_s": 0.2135,
+          "cpu_ms_per_read": 260.68516666666665,
+          "peak_rss_mib": 789.76953125,
+          "object_xxh3": "6c7a2ea2bc98454c",
+          "runs": 2,
+          "raw_request_samples": 12
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 1008.9295,
+          "p95_request_ms": 1042.112,
+          "aggregate_gib_per_s": 0.238,
+          "cpu_ms_per_read": 279.73075,
+          "peak_rss_mib": 918.78515625,
+          "object_xxh3": "6c7a2ea2bc98454c",
+          "runs": 2,
+          "raw_request_samples": 12
+        },
+        "aggregate_throughput_ratio": 1.1147540983606556,
+        "two_rail_scaling_efficiency": 0.5573770491803278
+      },
+      {
+        "size_mib": 128,
+        "concurrency": 4,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 1902.2805,
+          "p95_request_ms": 1965.519,
+          "aggregate_gib_per_s": 0.2485,
+          "cpu_ms_per_read": 272.177,
+          "peak_rss_mib": 1371.53125,
+          "object_xxh3": "6c7a2ea2bc98454c",
+          "runs": 2,
+          "raw_request_samples": 24
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 1764.8325,
+          "p95_request_ms": 1847.11,
+          "aggregate_gib_per_s": 0.268,
+          "cpu_ms_per_read": 283.3401666666667,
+          "peak_rss_mib": 1555.58984375,
+          "object_xxh3": "6c7a2ea2bc98454c",
+          "runs": 2,
+          "raw_request_samples": 24
+        },
+        "aggregate_throughput_ratio": 1.0784708249496984,
+        "two_rail_scaling_efficiency": 0.5392354124748492
+      }
+    ],
+    "softroce-vm-concurrent-256": [
+      {
+        "size_mib": 256,
+        "concurrency": 2,
+        "single": {
+          "rails": 1,
+          "median_request_ms": 2315.1275,
+          "p95_request_ms": 2487.62,
+          "aggregate_gib_per_s": 0.20750000000000002,
+          "cpu_ms_per_read": 507.721,
+          "peak_rss_mib": 1791.810546875,
+          "object_xxh3": "fe51c755b1336171",
+          "runs": 2,
+          "raw_request_samples": 12
+        },
+        "dual": {
+          "rails": 2,
+          "median_request_ms": 1983.32,
+          "p95_request_ms": 2079.975,
+          "aggregate_gib_per_s": 0.2395,
+          "cpu_ms_per_read": 525.6972499999999,
+          "peak_rss_mib": 1814.5546875,
+          "object_xxh3": "fe51c755b1336171",
+          "runs": 2,
+          "raw_request_samples": 12
+        },
+        "aggregate_throughput_ratio": 1.1542168674698794,
+        "two_rail_scaling_efficiency": 0.5771084337349397
+      }
+    ]
+  }
+}

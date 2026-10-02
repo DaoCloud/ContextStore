@@ -1,0 +1,21 @@
+{
+  "environment": "soft-roce",
+  "source_commit": "cd529b5",
+  "platform": "Linux-5.15.0-194-generic-x86_64-with-glibc2.35",
+  "machine": "x86_64",
+  "notes": "Two KVM guests, two virtual RXE rails, 4 vCPU and 4 GiB each; RLIMIT_MEMLOCK raised to unlimited inside the isolated client guest for a fair concurrent matrix",
+  "objects_mib": [
+    256
+  ],
+  "concurrency": [
+    2
+  ],
+  "trials": 2,
+  "batches_per_trial": 3,
+  "warmup_reads": 1,
+  "coordinator": "http://10.31.0.2:55151",
+  "rails": [
+    "r0,rxe_c0,10.31.0.2:55153,10.31.0.2:55153,1,1",
+    "r1,rxe_c1,10.31.0.2:55153,10.32.0.2:55154,1,1"
+  ]
+}
