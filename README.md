@@ -368,6 +368,9 @@ paired 1/2-rail matrix and save all per-read samples with
 `python kv-service/benchmarks/collect_rail_mock.py --sizes 64,256,512`.
 The checked-in `kv-service/benchmarks/results/2026-10-02-independent-rail-mock-*`
 files contain one Linux ARM64 software-only run, including environment details.
+The separate `kv-service/benchmarks/results/2026-10-02-skv-single-hca.json`
+records physical single-rail Verbs reads, HCA port-counter deltas, fault tests,
+and the storage/topology boundary. It does not measure two-rail aggregation.
 
 ---
 

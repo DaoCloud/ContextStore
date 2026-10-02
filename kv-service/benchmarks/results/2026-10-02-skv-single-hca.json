@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "label": "physical RDMA, one active HCA rail; no multi-rail hardware scaling claim",
+  "source_commit": "1bd4821",
+  "environment": {
+    "server": "skv-node1",
+    "client": "skv-node2",
+    "hca": "Mellanox ConnectX-6 Dx mlx5_1, port 1, RoCE v2 GID index 3",
+    "link_speed_mbps": 100000,
+    "numa_node": 1,
+    "pci_bdf": "0000:af:00.1",
+    "cpu": "2 sockets, 80 logical CPUs, Intel Xeon Gold 5218R",
+    "server_storage": "two stripe directories on one /home ext4 filesystem backed by /dev/sde Intel SSDSC2BB96 SATA SSD",
+    "io_executor": "tier_a",
+    "redis": "dedicated local test instance",
+    "verify_stripe_checksums": true,
+    "object_bytes": 67108864,
+    "stripe_bytes": 4194304,
+    "stripes": 16,
+    "object_xxh3": "a0a4cbfa5cad46af"
+  },
+  "single_rail_runs": [
+    {
+      "mode": "slab_128_mib",
+      "warmup": 1,
+      "iterations": 5,
+      "latency_us": [
+        164867,
+        163271,
+        159849,
+        164179,
+        142757
+      ],
+      "median_us": 163271,
+      "client_cpu_user_us_total": 288946,
+      "client_cpu_system_us_total": 313377,
+      "client_peak_rss_kb": 203896,
+      "rail_payload_bytes": 335544320
+    },
+    {
+      "mode": "registered_buffer_fallback_slab_0",
+      "warmup": 1,
+      "iterations": 5,
+      "latency_us": [
+        342838,
+        345929,
+        323655,
+        324635,
+        321299
+      ],
+      "median_us": 324635,
+      "client_cpu_user_us_total": 316567,
+      "client_cpu_system_us_total": 285431,
+      "client_peak_rss_kb": 203856,
+      "rail_payload_bytes": 335544320
+    }
+  ],
+  "hca_counter_probe": {
+    "mode": "slab_128_mib",
+    "warmup": 0,
+    "iterations": 5,
+    "latency_us": [
+      168286,
+      157781,
+      158097,
+      140329,
+      142884
+    ],
+    "median_us": 157781,
+    "payload_bytes": 335544320,
+    "counter_path": "/sys/class/infiniband/mlx5_1/ports/1/counters/{port_xmit_data,port_rcv_data}",
+    "counter_unit_bytes": 4,
+    "counter_unit_reference": "https://www.kernel.org/doc/html/v5.15/admin-guide/abi-stable.html",
+    "server_before": [
+      53088016198567,
+      125676323529852
+    ],
+    "server_after": [
+      53088104837287,
+      125676323565277
+    ],
+    "client_before": [
+      1311584136149,
+      2139962965962
+    ],
+    "client_after": [
+      1311584169427,
+      2140051932362
+    ],
+    "server_delta_bytes": {
+      "transmitted": 354554880,
+      "received": 141700
+    },
+    "client_delta_bytes": {
+      "transmitted": 133112,
+      "received": 355865600
+    },
+    "caveat": "Port counters include any concurrent traffic and protocol overhead; these close deltas are evidence of HCA traffic, not isolated link saturation."
+  },
+  "hardware_gated_tests": {
+    "single_rail_content": "passed, byte-equal 64 MiB object",
+    "dead_listener": "passed, caller buffer unchanged",
+    "cancel_after_inflight": "passed, 256 MiB transfer quiesced and reused buffer unchanged",
+    "checksum_corruption": "passed, stripe 0 mismatch detected; backup restored with matching SHA-256",
+    "late_write_after_timeout": "passed, one-second client deadline versus three-second server pre-WRITE delay; reused buffer unchanged",
+    "recovery_after_fault": "passed, normal read after removing delay",
+    "dual_independent_rails": "not run: every SKV node has only one active physical HCA port; RXE kernel module mismatched loaded OFED ib_core"
+  },
+  "limitations": [
+    "Both stripe directories share one SATA SSD; no multi-NVMe bandwidth evidence.",
+    "Tier A pointer reads may hit the Linux page cache; these samples are not cold-disk throughput.",
+    "One HCA rail only; no two-rail physical or Soft-RoCE expansion result.",
+    "The late-WRITE test observes buffer reuse after timeout but does not expose a CQE timestamp on the client."
+  ]
+}
