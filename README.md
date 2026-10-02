@@ -384,6 +384,11 @@ server example. For real Verbs performance,
 and two rails on the same prewritten objects and saves every latency sample,
 CPU time, RSS, and per-rail bytes. Label RXE runs `soft-roce`: RXE executes the
 Verbs path but does not establish HCA offload or physical link aggregation.
+The CLI's `--concurrency N` option (1–8) runs N complete object reads within
+one process and one shared RailReader, reporting per-request latency and
+aggregate throughput. `kv-service/benchmarks/collect_rail_concurrent.py`
+collects paired 1/2-rail batches for concurrency levels above one; it preserves
+the same object, server, layout, and concurrency within each comparison.
 
 ---
 

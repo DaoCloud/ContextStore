@@ -6,7 +6,7 @@ use contextstore_client_rs::rail_read::{RailLimits, RailReader, RailRoute};
 use contextstore_client_rs::rdma::RdmaClientConfig;
 use contextstore_client_rs::KvClient;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(about = "Read one ContextStore object over independently configured RDMA rails")]
@@ -27,6 +27,9 @@ struct Args {
     warmup: usize,
     #[arg(long, default_value_t = 5)]
     iterations: usize,
+    /// Concurrent object reads within this Worker, sharing one RailReader.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
 }
 
 fn parse_route(spec: &str) -> Result<RailRoute> {
@@ -76,11 +79,131 @@ fn process_usage() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+async fn run_concurrent(
+    args: &Args,
+    client: &KvClient,
+    reader: Arc<RailReader>,
+    size: usize,
+    warmup_bytes: &[u64],
+) -> Result<()> {
+    let mut request_times = Vec::<Duration>::new();
+    let mut batch_times = Vec::<Duration>::new();
+    let mut cpu_user_us = 0u64;
+    let mut cpu_system_us = 0u64;
+    let mut expected_hash = None;
+    for batch in 0..args.iterations {
+        let destinations = (0..args.concurrency)
+            .map(|_| vec![0xA5; size])
+            .collect::<Vec<_>>();
+        let before_cpu = process_usage();
+        let batch_started = Instant::now();
+        let mut handles = Vec::with_capacity(args.concurrency);
+        for (worker, mut destination) in destinations.into_iter().enumerate() {
+            let mut worker_client = client.clone();
+            let worker_reader = Arc::clone(&reader);
+            let namespace = args.namespace.clone();
+            let object_key = args.object_key.clone();
+            handles.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let result = worker_client
+                    .read_multi_rail_into(
+                        worker_reader,
+                        &namespace,
+                        &object_key,
+                        &mut destination,
+                        None,
+                    )
+                    .await;
+                (worker, result, destination, started.elapsed())
+            }));
+        }
+        let mut first_error = None;
+        for handle in handles {
+            let (worker, result, destination, elapsed) = handle.await?;
+            match result {
+                Ok(Some(bytes)) if bytes == size => {
+                    let checksum = twox_hash::xxh3::hash64(&destination);
+                    if expected_hash.is_some_and(|expected| expected != checksum) {
+                        first_error.get_or_insert_with(|| anyhow!("object hash changed"));
+                    }
+                    expected_hash.get_or_insert(checksum);
+                    println!(
+                        "sample,environment={},rails={},concurrency={},batch={},worker={},bytes={},latency_us={},xxh3={checksum:016x}",
+                        args.environment,
+                        reader.snapshots().len(),
+                        args.concurrency,
+                        batch + 1,
+                        worker,
+                        bytes,
+                        elapsed.as_micros()
+                    );
+                    request_times.push(elapsed);
+                }
+                Ok(Some(bytes)) => {
+                    first_error.get_or_insert_with(|| anyhow!("short read: {bytes} of {size}"));
+                }
+                Ok(None) => {
+                    first_error.get_or_insert_with(|| anyhow!("object disappeared"));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let wall = batch_started.elapsed();
+        let after_cpu = process_usage();
+        cpu_user_us += after_cpu.0 - before_cpu.0;
+        cpu_system_us += after_cpu.1 - before_cpu.1;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        println!(
+            "batch,environment={},rails={},concurrency={},iteration={},wall_us={}",
+            args.environment,
+            reader.snapshots().len(),
+            args.concurrency,
+            batch + 1,
+            wall.as_micros()
+        );
+        batch_times.push(wall);
+    }
+    request_times.sort_unstable();
+    batch_times.sort_unstable();
+    let total_wall_seconds: f64 = batch_times.iter().map(Duration::as_secs_f64).sum();
+    let total_bytes = size
+        .checked_mul(args.concurrency)
+        .and_then(|bytes| bytes.checked_mul(args.iterations))
+        .ok_or_else(|| anyhow!("benchmark byte count overflow"))?;
+    let aggregate_gib_per_s = total_bytes as f64 / total_wall_seconds / 1024f64.powi(3);
+    let rail_bytes: Vec<_> = reader
+        .snapshots()
+        .iter()
+        .zip(warmup_bytes)
+        .map(|(snapshot, warmup)| snapshot.bytes - warmup)
+        .collect();
+    println!(
+        "summary_concurrent,environment={},rails={},concurrency={},bytes_per_read={},batches={},median_request_us={},median_batch_us={},aggregate_gib_per_s={aggregate_gib_per_s:.3},cpu_user_us={},cpu_system_us={},peak_rss_kb={},rail_bytes={rail_bytes:?}",
+        args.environment,
+        rail_bytes.len(),
+        args.concurrency,
+        size,
+        args.iterations,
+        request_times[request_times.len() / 2].as_micros(),
+        batch_times[batch_times.len() / 2].as_micros(),
+        cpu_user_us,
+        cpu_system_us,
+        process_usage().2
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if args.iterations == 0 {
-        return Err(anyhow!("--iterations must be positive"));
+    if args.iterations == 0 || !(1..=8).contains(&args.concurrency) {
+        return Err(anyhow!(
+            "--iterations must be positive and --concurrency must be 1..=8"
+        ));
     }
     let routes = args
         .rails
@@ -128,6 +251,9 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("object disappeared during warmup"))?;
     }
     let warmup_bytes: Vec<_> = reader.snapshots().iter().map(|rail| rail.bytes).collect();
+    if args.concurrency > 1 {
+        return run_concurrent(&args, &client, reader, size, &warmup_bytes).await;
+    }
     let mut times = Vec::with_capacity(args.iterations);
     let mut cpu_user_us = 0u64;
     let mut cpu_system_us = 0u64;
