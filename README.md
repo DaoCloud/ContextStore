@@ -352,11 +352,14 @@ budget. No in-request transparent retry is attempted.
 The server's stripe-subset fallback also honors tag-15 scatter destinations
 when its registered slab cannot provide staging space. A fallback WRITE with
 uncertain completion retains its source and MR until its QP is destroyed.
+Uncertain CQ completion terminates the server connection rather than reusing
+that CQ for another request; a client GET control error likewise destroys its
+QP so a late reply cannot be mistaken for a new request's response.
 
 For hardware-independent scheduling and failure checks, run
 `cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
 rail_read::tests`. The ignored `rail_read_e2e` suite contains five single
-real-Rail checks and six dual-Rail checks. Select a test with `--ignored
+real-Rail checks and seven dual-Rail/control-connection checks. Select a test with `--ignored
 --exact <test_name> --nocapture` and configure `CS_RAIL_COORDINATOR`,
 `CS_RAIL_LISTENER0/1`, `CS_RAIL_DEVICE0/1`, and `CS_RAIL_GID0/1` as needed.
 `CS_RDMA_SLAB_MB=0` on the server exercises the registered-buffer fallback.
@@ -392,6 +395,59 @@ one process and one shared RailReader, reporting per-request latency and
 aggregate throughput. `kv-service/benchmarks/collect_rail_concurrent.py`
 collects paired 1/2-rail batches for concurrency levels above one; it preserves
 the same object, server, layout, and concurrency within each comparison.
+
+#### Reproduce two independent Soft-RoCE rails in isolated VMs
+
+The scripts in `kv-service/deploy/softroce-vm/` build two Ubuntu 22.04 KVM
+guests on a Linux x86_64 host. They create two test-only tap/bridge pairs with
+no production NIC attached. Each guest receives two virtio NICs; four RXE
+devices expose separate GIDs and listeners. The VM uses about 8 GiB RAM total
+plus sparse qcow2 overlays. Install QEMU/KVM, `genisoimage`, `iproute2`,
+`curl`, `tmux`, and Rust/Verbs build dependencies on the host first.
+
+```bash
+export CS_VM_DIR=/absolute/path/to/test-only/vm
+export CS_VM_SSH_PUBLIC_KEY=/absolute/path/to/test-key.pub
+export CS_VM_TAP_USER="$(id -un)"
+kv-service/deploy/softroce-vm/prepare-pair.sh
+kv-service/deploy/softroce-vm/setup-host-bridges.sh
+kv-service/deploy/softroce-vm/start-pair.sh
+```
+
+`prepare-pair.sh` verifies Ubuntu's published SHA-256 before boot. Copy
+`kv-service/deploy/softroce-vm/ssh_config.example` outside the repository,
+replace its KVM host alias and private key path, and set `CS_VM_SSH_CONFIG` to
+that file. Run `install-guest-prereqs.sh` and `setup-guest-paths.sh server`
+inside the server guest; use `setup-guest-paths.sh client` inside the client
+guest. The latter creates `rxe_c0/rxe_c1` and `rxe_s0/rxe_s1` over distinct
+`10.31.0.0/24` and `10.32.0.0/24` virtual paths. Check both links with
+`rdma link show` and `ping` before running ContextStore.
+
+Build Linux x86_64 binaries with `build-verbs.sh`. From the Linux build host,
+set `CS_VM_SSH_CONFIG` and run `deploy-verbs.sh`; set `CS_E2E_BIN` to the
+executable printed by `cargo test --test rail_read_e2e --no-run` if deploying
+the ignored hardware tests. The example server config assumes guest user
+`railtest`; edit its paths when using another user. Start
+`start-guest-server.sh` inside the server guest, then write a striped object
+from the client guest with `cs-bench --combined --stream --bytes-pass --only-put`.
+Use `cs-rail-read-bench` with one `--rail` and then both rails, or the paired
+`collect_rail_verbs.py` script. Every measurement must be labeled `soft-roce`.
+
+The recorded VM run has [90 sequential samples](kv-service/benchmarks/results/softroce-vm-paired-samples.csv),
+[concurrent samples](kv-service/benchmarks/results/softroce-vm-concurrent-64-128-samples.csv),
+and [topology/counter evidence](kv-service/benchmarks/results/softroce-vm-topology.json).
+`analyze_rail_verbs.py` recomputes descriptive medians and p95 from those
+CSVs. For cleanup, stop the test server, run `teardown-guest-paths.sh` in
+both guests, power them off, run `stop-pair.sh` if needed, then
+`teardown-host-bridges.sh`. These names target only the test-only resources.
+
+| Deployment / data path | Build and behavior evidence | Performance conclusion |
+| --- | --- | --- |
+| gRPC-only Rust SDK, no `rdma` feature | Builds without libibverbs; prior Redis two-node integration and Python suites pass | Existing path unchanged |
+| One ConnectX-6 Dx HCA rail, Linux x86_64 | Real Verbs object, failure, checksum, late-WRITE and buffer-reuse checks | Single-rail only; test stripes share one SATA SSD |
+| Two RXE rails in isolated Ubuntu KVM guests | Real Verbs single/dual reads, generation, checksum, path fault, cancellation, partial completion, late WRITE and registered-memory limits | Software RoCE/QEMU scaling only; no HCA or separate-NVMe claim |
+| Two physical HCA rails | Not run: only one HCA port was online on each available SKV node | No physical aggregation claim |
+| Linux ARM64 | Earlier RDMA/Mock and server feature suites pass; latest CQ/timeout changes were checked on x86_64 | No ARM64 hardware measurement |
 
 ---
 

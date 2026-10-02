@@ -22,10 +22,9 @@ use crate::rdma::slab::{SlabExtent, SlabPlacement};
 use crate::rdma::wire::{
     self, DescriptorGetReqMsg, GetRespMsg, PutReadyMsg, PutRespMsg, PutStripeLocation,
     PutStripesRespMsg, MSG_GET_DESCRIPTOR_REQ, MSG_GET_DESCRIPTOR_STRIPES_REQ,
-    MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ, MSG_GET_REQ,
-    MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ, MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ, MSG_PUT_REQ,
-    MSG_PUT_STRIPES_REQ, MSG_PUT_WITH_OPTIONS_REQ, PUT_RESULT_EXISTS, PUT_RESULT_FAILED,
-    PUT_RESULT_STORED,
+    MSG_GET_DESCRIPTOR_STRIPES_SGE_REQ, MSG_GET_REQ, MSG_PUT_COMMIT, MSG_PUT_IF_ABSENT_REQ,
+    MSG_PUT_IF_ABSENT_WITH_OPTIONS_REQ, MSG_PUT_REQ, MSG_PUT_STRIPES_REQ, MSG_PUT_WITH_OPTIONS_REQ,
+    PUT_RESULT_EXISTS, PUT_RESULT_FAILED, PUT_RESULT_STORED,
 };
 use crate::router::ObjectKey;
 use crate::KVServiceContext;
@@ -1051,7 +1050,6 @@ fn allocate_subset_staging(kv_ctx: &KVServiceContext, size: usize) -> Result<Sla
     ))
 }
 
-
 /// 把对象字节区间 [object_offset, object_offset+length) 映射到 scatter 段表.
 /// 段表按序覆盖对象字节范围; 一个区间可能跨多个段, 产出多条 (dst_addr, rkey, len).
 /// 返回 Err 当区间超出段表覆盖范围.
@@ -1117,6 +1115,18 @@ fn ensure_subset_complete(expected_bytes: usize, actual_bytes: u64) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn subset_failure_result(uncertain_completion: bool, error: &str) -> Result<(bool, u64, u32)> {
+    if uncertain_completion {
+        // A late CQE must never be consumed by a later request on this QP.
+        // Propagating an error exits handle_client and destroys the QP/CQ.
+        Err(anyhow!(
+            "RDMA connection retired after uncertain stripe-subset completion: {error}"
+        ))
+    } else {
+        Ok((false, 0, 0))
+    }
 }
 
 fn parse_subset_cq_timeout(raw_ms: Option<&str>) -> std::time::Duration {
@@ -1274,7 +1284,10 @@ fn serve_get_stripes(
         )
         .is_err()
         {
-            tracing::warn!("stripe-subset GET destination does not cover stripe {}", idx);
+            tracing::warn!(
+                "stripe-subset GET destination does not cover stripe {}",
+                idx
+            );
             return Ok((false, 0, 0));
         }
         staged_bytes = staged_bytes
@@ -1361,7 +1374,11 @@ fn serve_get_stripes(
                 // tag-15 (SGE): 数据区间按段表映射, 可能拆成多条 WRITE;
                 // tag-12: 单一连续目标, 等价于一个覆盖全对象的段.
                 let targets: Vec<(u64, u32, u64)> = if req.dst_segments.is_empty() {
-                    vec![(req.dst_addr + object_offset as u64, req.dst_rkey, length as u64)]
+                    vec![(
+                        req.dst_addr + object_offset as u64,
+                        req.dst_rkey,
+                        length as u64,
+                    )]
                 } else {
                     match map_range_to_segments(
                         &req.dst_segments,
@@ -1392,6 +1409,7 @@ fn serve_get_stripes(
                         first_error = Some(format!(
                             "post RDMA write for stripe {stripe_index}: {error}"
                         ));
+                        uncertain_write = true;
                         post_failed = true;
                         break;
                     }
@@ -1410,14 +1428,12 @@ fn serve_get_stripes(
                             outstanding -= n;
                             if let Some(error) = completion_error {
                                 uncertain_write = true;
-                                first_error =
-                                    Some(format!("poll RDMA completion window: {error}"));
+                                first_error = Some(format!("poll RDMA completion window: {error}"));
                             }
                         }
                         Err(error) => {
                             uncertain_write = true;
-                            first_error =
-                                Some(format!("poll RDMA completion window: {error}"))
+                            first_error = Some(format!("poll RDMA completion window: {error}"))
                         }
                     }
                     while first_error.is_none() && outstanding >= COMPLETION_WINDOW {
@@ -1425,8 +1441,7 @@ fn serve_get_stripes(
                             Ok(()) => outstanding -= 1,
                             Err(error) => {
                                 uncertain_write = true;
-                                first_error =
-                                    Some(format!("poll RDMA completion window: {error}"))
+                                first_error = Some(format!("poll RDMA completion window: {error}"))
                             }
                         }
                     }
@@ -1483,7 +1498,7 @@ fn serve_get_stripes(
             error = %error,
             "RDMA stripe-subset stream failed without deleting object metadata"
         );
-        return Ok((false, 0, 0));
+        return subset_failure_result(uncertain_write, &error);
     }
     Ok((true, total, req.stripes.len() as u32))
 }
@@ -2126,7 +2141,7 @@ mod tests {
 mod sge_tests {
     use super::{
         ensure_subset_complete, fallback_write_targets, map_range_to_segments,
-        parse_subset_cq_timeout,
+        parse_subset_cq_timeout, subset_failure_result,
     };
 
     #[test]
@@ -2199,6 +2214,15 @@ mod sge_tests {
         assert_eq!(
             parse_subset_cq_timeout(Some("999999")),
             std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn uncertain_cq_completion_forces_connection_error() {
+        assert!(subset_failure_result(true, "CQ timed out").is_err());
+        assert_eq!(
+            subset_failure_result(false, "checksum failure").unwrap(),
+            (false, 0, 0)
         );
     }
 }

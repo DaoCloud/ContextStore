@@ -143,7 +143,7 @@ pub struct RdmaReadOutcome {
 /// control messages. Create one connection per concurrent transfer worker.
 pub struct RdmaClient {
     resources: Arc<RdmaResources>,
-    qp: NonNull<ibv_qp>,
+    qp: Option<NonNull<ibv_qp>>,
     stream: TcpStream,
     /// Cached memory registrations keyed by (base pointer, length).
     ///
@@ -361,7 +361,7 @@ impl RdmaClient {
         match result {
             Ok(stream) => Ok(Self {
                 resources,
-                qp,
+                qp: Some(qp),
                 stream,
                 mr_cache: Vec::new(),
             }),
@@ -370,6 +370,33 @@ impl RdmaClient {
                 Err(error)
             }
         }
+    }
+
+    fn retire_after_control_error(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(qp) = self.qp.take() {
+            unsafe { ibv_destroy_qp(qp.as_ptr()) };
+        }
+        self.mr_cache.clear();
+    }
+
+    fn exchange_get_detailed(&mut self, request: &[u8]) -> Result<Option<RdmaReadOutcome>> {
+        if self.qp.is_none() {
+            return Err(anyhow!(
+                "RDMA connection retired after an earlier control error"
+            ));
+        }
+        let response = (|| {
+            self.stream.write_all(request)?;
+            self.stream.flush()?;
+            read_get_response_detailed(&mut self.stream)
+        })();
+        if response.is_err() {
+            // A timeout does not prove that the server stopped writing. Tear
+            // down the QP before the caller may deregister or reuse its MR.
+            self.retire_after_control_error();
+        }
+        response
     }
 
     /// Like [`Self::register_raw_buffer`], but caches the registration inside
@@ -490,9 +517,8 @@ impl RdmaClient {
             rkey,
             available as u64,
         )?;
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     /// Read only `stripes` of a striped object into `buffer[offset..]`.
@@ -536,9 +562,8 @@ impl RdmaClient {
         for idx in stripes {
             request.extend_from_slice(&idx.to_le_bytes());
         }
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     /// [`Self::get_descriptor_stripes_into`] for a cached [`BufferView`]
@@ -573,9 +598,8 @@ impl RdmaClient {
                 request.extend_from_slice(&idx.to_le_bytes());
             }
         }
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     /// Stripe-subset GET with a scatter destination list (wire tag 15): the
@@ -631,9 +655,7 @@ impl RdmaClient {
             request.extend_from_slice(&rkey.to_le_bytes());
             request.extend_from_slice(&len.to_le_bytes());
         }
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response_detailed(&mut self.stream)
+        self.exchange_get_detailed(&request)
     }
 
     /// Write `buffer[offset..offset + size]` through the RDMA PUT data path.
@@ -831,9 +853,8 @@ impl RdmaClient {
     ) -> Result<RdmaReadResult> {
         let (dst_addr, rkey, available) = buffer.destination(offset)?;
         let request = build_get_request(key, dst_addr, rkey, available as u64)?;
-        self.stream.write_all(&request)?;
-        self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        self.exchange_get_detailed(&request)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
     }
 
     fn write_remote(
@@ -859,7 +880,10 @@ impl RdmaClient {
                 len: len as u32,
                 signaled: index + 1 == writes,
             };
-            post_write(self.qp, &write)?;
+            let qp = self
+                .qp
+                .ok_or_else(|| anyhow!("RDMA connection retired after an earlier control error"))?;
+            post_write(qp, &write)?;
             transferred += len;
             index += 1;
         }
@@ -869,10 +893,10 @@ impl RdmaClient {
 
 impl Drop for RdmaClient {
     fn drop(&mut self) {
-        let _ = self.stream.write_all(&[MSG_BYE]);
-        let _ = self.stream.flush();
-        unsafe {
-            ibv_destroy_qp(self.qp.as_ptr());
+        if let Some(qp) = self.qp.take() {
+            let _ = self.stream.write_all(&[MSG_BYE]);
+            let _ = self.stream.flush();
+            unsafe { ibv_destroy_qp(qp.as_ptr()) };
         }
     }
 }
@@ -1188,10 +1212,6 @@ fn read_string(stream: &mut TcpStream, field: &str) -> Result<String> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     String::from_utf8(buf).map_err(|e| anyhow!("RDMA {field} utf8: {e}"))
-}
-
-fn read_get_response(stream: &mut TcpStream) -> Result<RdmaReadResult> {
-    read_get_response_detailed(stream).map(|outcome| outcome.map(|outcome| outcome.bytes))
 }
 
 fn read_get_response_detailed(stream: &mut TcpStream) -> Result<Option<RdmaReadOutcome>> {

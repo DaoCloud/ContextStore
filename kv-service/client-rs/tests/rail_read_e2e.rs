@@ -6,7 +6,7 @@
 #![cfg(feature = "rdma")]
 
 use contextstore_client_rs::rail_read::{RailCancel, RailLimits, RailReader, RailRoute};
-use contextstore_client_rs::rdma::RdmaClientConfig;
+use contextstore_client_rs::rdma::{RdmaClient, RdmaClientConfig};
 use contextstore_client_rs::KvClient;
 use prost::bytes::Bytes;
 use std::sync::Arc;
@@ -412,6 +412,44 @@ async fn late_second_rail_after_first_completion_cannot_publish_or_corrupt() {
         .snapshots()
         .iter()
         .all(|snapshot| snapshot.inflight_requests == 0 && snapshot.registered_bytes == 0));
+}
+
+#[tokio::test]
+#[ignore = "requires a three-second delay on server nic_idx=1 and a two-second CQ deadline"]
+async fn uncertain_completion_retires_old_server_connection() {
+    let (mut client, key, _payload, _advertised) = seeded_object().await;
+    let descriptor = client
+        .lookup_object("rail-e2e", &key)
+        .await
+        .expect("lookup")
+        .expect("seeded object")
+        .descriptor;
+    let device = setting("CS_RAIL_DEVICE1", "rxe_c1");
+    let listener = setting("CS_RAIL_LISTENER1", "127.0.0.1:50054");
+    let gid = setting("CS_RAIL_GID1", "1")
+        .parse::<u8>()
+        .expect("GID index");
+    let mut rdma = RdmaClient::connect(
+        RdmaClientConfig::new(listener, device)
+            .with_gid_index(gid)
+            .with_io_timeout(Duration::from_secs(1)),
+    )
+    .expect("second rail connects");
+    let mut target = vec![0u8; descriptor.size as usize];
+    let registered = rdma.register_buffer(&mut target).expect("register buffer");
+    let view = registered.view();
+    let segments = [(view.addr(), view.rkey(), descriptor.size)];
+    assert!(rdma
+        .get_descriptor_stripes_sge_detailed(&descriptor, &[1], &segments)
+        .is_err());
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        rdma.get_descriptor_stripes_sge_detailed(&descriptor, &[1], &segments)
+            .is_err(),
+        "server must close the old QP/CQ rather than return a stale response"
+    );
+    drop(rdma);
+    drop(registered);
 }
 
 #[tokio::test]
