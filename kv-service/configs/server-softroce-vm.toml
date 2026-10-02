@@ -8,6 +8,14 @@ grpc_advertise = "10.31.0.2:55151"
 rdma_advertise = "10.31.0.2:55153"
 data_nodes = []
 
+[[cluster.rdma_rails]]
+fabric_id = "fabric-a"
+listener_endpoint = "10.31.0.2:55153"
+
+[[cluster.rdma_rails]]
+fabric_id = "fabric-b"
+listener_endpoint = "10.32.0.2:55154"
+
 [storage]
 devices = ["/home/railtest/data/rail0", "/home/railtest/data/rail1"]
 data_subdir = "contextstore"

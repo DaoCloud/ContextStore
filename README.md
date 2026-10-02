@@ -315,8 +315,12 @@ order and measured limits.
 The Rust SDK can read one striped object over multiple local RDMA devices and
 listeners on the same owning storage node. This uses the existing descriptor
 GET and tag-15 SGE protocol; object placement and disk stripes are unchanged.
-`LookupObject` advertises one primary RDMA endpoint per node, so each rail
-explicitly maps that advertised endpoint to a listener on the same node.
+`LookupObject` advertises one primary RDMA endpoint per node. New servers can
+also attach optional, ephemeral fabric/listener capabilities to Placement;
+`RailReader::discover_from_placement` matches those with locally configured
+fabric/device/port/GID paths. The server does not need to change or persist
+the object's disk stripes. Old clients ignore the extra protobuf field, and
+existing explicit `RailRoute` configurations remain usable with old servers.
 Different rail entries for one node must use different local device/port pairs
 and different remote listeners. A seventh comma-separated rail field may set
 a positive relative scheduling weight; omitted weights default to 1. The
@@ -324,8 +328,8 @@ reader also reports each local device's sysfs NUMA node and PCI address when
 the host exposes them.
 
 ```bash
-# Run against an already stored striped object. Set the server's
-# CS_RDMA_DEVICES for both listeners and advertise its primary listener.
+# Manual listener mapping against an already stored striped object.
+# Set the server's CS_RDMA_DEVICES for both listeners.
 ./target/release/cs-rail-read-bench \
   --environment physical --coordinator http://10.0.0.1:50051 \
   --namespace bench --object-key large-object \
@@ -334,7 +338,33 @@ the host exposes them.
   --warmup 1 --iterations 5
 ```
 
-Use only the first `--rail` for a comparable single-rail run. The CLI labels
+For discovered listeners, configure `[[cluster.rdma_rails]]` on the owning
+server, as in [the two-RXE example](kv-service/configs/server-softroce-vm.toml).
+The client still selects trusted local Verbs devices and fabric IDs, while
+`LookupObject` supplies the remote listeners:
+
+```bash
+./target/release/cs-rail-read-bench \
+  --environment soft-roce --coordinator http://10.31.0.2:55151 \
+  --namespace rust-bench --object-key large-object \
+  --local-rail 'r0,fabric-a,rxe_c0,1,1' \
+  --local-rail 'r1,fabric-b,rxe_c1,1,1' \
+  --warmup 1 --iterations 5
+```
+
+The CLI looks up the object before constructing its reader. SDK callers can
+call `lookup_object`, then `RailReader::discover_from_placement`, then the
+unchanged `read_multi_rail_into` entry point. Discovery rejects an owner or
+fabric mismatch; if advertised capabilities change, rebuild the reader. It
+does not silently fall back to an arbitrary listener; use
+the explicit `--rail` mode for a server without advertised capabilities.
+A fixed limit of 32 configured routes caps per-request worker/QP creation
+before any RDMA connection is opened, without changing the public `RailLimits`
+struct shape.
+The [discovery design and upgrade tests](docs/rail-capability-discovery.md)
+record the wire contract and one/two-rail compatibility behavior.
+
+Use only the first `--rail` or `--local-rail` for a comparable single-rail run. The CLI labels
 physical RDMA and Soft-RoCE separately, reports per-rail bytes, and hashes
 every returned object. Set the server's cache policy and disk-read forcing
 identically for both runs; these flags cannot prove a network bottleneck by

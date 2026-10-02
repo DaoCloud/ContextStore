@@ -122,6 +122,213 @@ fn two_independent_listeners_restore_one_unmodified_placement() {
 }
 
 #[test]
+fn advertised_rails_resolve_local_fabrics_and_restore_one_object() {
+    let bytes: Vec<u8> = (0..64).map(|index| index as u8).collect();
+    let mock = MockTransport::new(bytes.clone());
+    let (descriptor, mut placement) = fixture(64, 8);
+    placement.rdma_rails = vec![
+        pb::RdmaRailEndpoint {
+            node_id: "node-a".into(),
+            advertised_endpoint: "10.0.0.1:50053".into(),
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.1:50053".into(),
+        },
+        pb::RdmaRailEndpoint {
+            node_id: "node-a".into(),
+            advertised_endpoint: "10.0.0.1:50053".into(),
+            fabric_id: "fabric-b".into(),
+            listener_endpoint: "10.0.1.1:50054".into(),
+        },
+    ];
+    let local = vec![
+        LocalRailPath::new("rail0", "fabric-a", "mock0"),
+        LocalRailPath::new("rail1", "fabric-b", "mock1"),
+    ];
+    let reader = RailReader::discover_from_placement(&placement, &local, RailLimits::default())
+        .expect("two discovered rails");
+    assert_eq!(reader.snapshots().len(), 2);
+    assert_eq!(reader.snapshots()[1].listener, "10.0.1.1:50054");
+    let mut destination = vec![0xA5; 64];
+    reader
+        .read_into_with(&descriptor, &placement, &mut destination, &mock, None)
+        .unwrap();
+    assert_eq!(destination, bytes);
+    assert_eq!(reader.snapshots()[0].bytes, 32);
+    assert_eq!(reader.snapshots()[1].bytes, 32);
+}
+
+#[test]
+fn discovery_rejects_a_capability_for_another_owner() {
+    let (_descriptor, mut placement) = fixture(64, 8);
+    placement.rdma_rails = vec![pb::RdmaRailEndpoint {
+        node_id: "unexpected-owner".into(),
+        advertised_endpoint: "10.0.0.1:50053".into(),
+        fabric_id: "fabric-a".into(),
+        listener_endpoint: "10.0.0.1:50053".into(),
+    }];
+    assert!(RailReader::discover_from_placement(
+        &placement,
+        &[LocalRailPath::new("rail0", "fabric-a", "mock0")],
+        RailLimits::default(),
+    )
+    .is_err());
+}
+
+#[test]
+fn discovery_maps_one_local_fabric_to_each_actual_storage_owner() {
+    let bytes: Vec<u8> = (0..16).map(|index| index as u8).collect();
+    let mock = MockTransport::new(bytes.clone());
+    let (descriptor, mut placement) = fixture(16, 8);
+    placement.chunks[1].node_id = "node-b".into();
+    placement.chunks[1].rdma_endpoint = "10.0.0.2:50053".into();
+    placement.rdma_rails = vec![
+        pb::RdmaRailEndpoint {
+            node_id: "node-a".into(),
+            advertised_endpoint: "10.0.0.1:50053".into(),
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.1:50053".into(),
+        },
+        pb::RdmaRailEndpoint {
+            node_id: "node-b".into(),
+            advertised_endpoint: "10.0.0.2:50053".into(),
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.2:50053".into(),
+        },
+    ];
+    let reader = RailReader::discover_from_placement(
+        &placement,
+        &[LocalRailPath::new("rail0", "fabric-a", "mock0")],
+        RailLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(reader.routes().len(), 2);
+    let mut destination = vec![0xA5; 16];
+    reader
+        .read_into_with(&descriptor, &placement, &mut destination, &mock, None)
+        .unwrap();
+    assert_eq!(destination, bytes);
+    let calls = mock.calls.lock().unwrap();
+    assert!(calls.contains(&"10.0.0.1:50053".to_string()));
+    assert!(calls.contains(&"10.0.0.2:50053".to_string()));
+}
+
+#[test]
+fn discovery_rejects_duplicate_fabrics_and_legacy_absence() {
+    let (_descriptor, mut placement) = fixture(16, 8);
+    let local = [LocalRailPath::new("rail0", "fabric-a", "mock0")];
+    assert!(
+        RailReader::discover_from_placement(&placement, &local, RailLimits::default()).is_err()
+    );
+    let endpoint = pb::RdmaRailEndpoint {
+        node_id: "node-a".into(),
+        advertised_endpoint: "10.0.0.1:50053".into(),
+        fabric_id: "fabric-a".into(),
+        listener_endpoint: "10.0.0.1:50053".into(),
+    };
+    placement.rdma_rails = vec![endpoint.clone(), endpoint];
+    assert!(
+        RailReader::discover_from_placement(&placement, &local, RailLimits::default()).is_err()
+    );
+}
+
+#[test]
+fn discovered_reader_rejects_a_changed_listener_before_transport() {
+    let (descriptor, mut placement) = fixture(16, 8);
+    placement.rdma_rails = vec![pb::RdmaRailEndpoint {
+        node_id: "node-a".into(),
+        advertised_endpoint: "10.0.0.1:50053".into(),
+        fabric_id: "fabric-a".into(),
+        listener_endpoint: "10.0.0.1:50053".into(),
+    }];
+    let reader = RailReader::discover_from_placement(
+        &placement,
+        &[LocalRailPath::new("rail0", "fabric-a", "mock0")],
+        RailLimits::default(),
+    )
+    .unwrap();
+    placement.rdma_rails[0].listener_endpoint = "10.0.1.1:50054".into();
+    let mock = MockTransport::new(vec![0x42; 16]);
+    let mut destination = vec![0xA5; 16];
+    assert!(reader
+        .read_into_with(&descriptor, &placement, &mut destination, &mock, None)
+        .is_err());
+    assert!(mock.calls.lock().unwrap().is_empty());
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+}
+
+#[test]
+fn discovered_reader_rejects_a_changed_storage_owner_before_transport() {
+    let (descriptor, mut placement) = fixture(16, 8);
+    placement.rdma_rails = vec![pb::RdmaRailEndpoint {
+        node_id: "node-a".into(),
+        advertised_endpoint: "10.0.0.1:50053".into(),
+        fabric_id: "fabric-a".into(),
+        listener_endpoint: "10.0.0.1:50053".into(),
+    }];
+    let reader = RailReader::discover_from_placement(
+        &placement,
+        &[LocalRailPath::new("rail0", "fabric-a", "mock0")],
+        RailLimits::default(),
+    )
+    .unwrap();
+    placement.chunks[1].node_id = "unexpected-owner".into();
+    let mock = MockTransport::new(vec![0x42; 16]);
+    let mut destination = vec![0xA5; 16];
+    assert!(reader
+        .read_into_with(&descriptor, &placement, &mut destination, &mock, None)
+        .is_err());
+    assert!(mock.calls.lock().unwrap().is_empty());
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+}
+
+#[test]
+fn discovery_rejects_one_listener_claimed_by_two_owners() {
+    let (_descriptor, mut placement) = fixture(16, 8);
+    placement.chunks[1].node_id = "node-b".into();
+    placement.chunks[1].rdma_endpoint = "10.0.0.2:50053".into();
+    placement.rdma_rails = vec![
+        pb::RdmaRailEndpoint {
+            node_id: "node-a".into(),
+            advertised_endpoint: "10.0.0.1:50053".into(),
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.9:50054".into(),
+        },
+        pb::RdmaRailEndpoint {
+            node_id: "node-b".into(),
+            advertised_endpoint: "10.0.0.2:50053".into(),
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.9:50054".into(),
+        },
+    ];
+    assert!(RailReader::discover_from_placement(
+        &placement,
+        &[LocalRailPath::new("rail0", "fabric-a", "mock0")],
+        RailLimits::default(),
+    )
+    .is_err());
+}
+
+#[test]
+fn fixed_task_cap_preserves_nine_routes_and_rejects_excess() {
+    let make_routes = |count| {
+        (0..count)
+            .map(|index| {
+                RailRoute::new(
+                    format!("rail{index}"),
+                    "10.0.0.1:50053",
+                    crate::rdma::RdmaClientConfig::new(
+                        format!("10.0.0.1:{}", 50053 + index),
+                        format!("mock{index}"),
+                    ),
+                )
+            })
+            .collect()
+    };
+    assert!(RailReader::new(make_routes(9), RailLimits::default()).is_ok());
+    assert!(RailReader::new(make_routes(33), RailLimits::default()).is_err());
+}
+
+#[test]
 fn partial_rail_failure_leaves_caller_buffer_unchanged() {
     let mut mock = MockTransport::new(vec![0x42; 64]);
     mock.failing_rail = Some("rail1".into());

@@ -3,6 +3,7 @@
 //! Corresponds to configs/server.toml
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::{KVError, Result};
@@ -33,6 +34,14 @@ pub struct Config {
 
 // ===== Cluster / Placement =====
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RdmaRailAdvertiseConfig {
+    /// Stable fabric name shared with a client's local-path configuration.
+    pub fabric_id: String,
+    /// Reachable RDMA control listener, not a wildcard bind address.
+    pub listener_endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterNodeConfig {
     /// Stable node ID. When empty the endpoint is used as fallback.
     #[serde(default)]
@@ -42,6 +51,9 @@ pub struct ClusterNodeConfig {
     /// Optional RDMA endpoint, e.g. "10.0.0.11:18515".
     #[serde(default)]
     pub rdma_endpoint: String,
+    /// Optional alternative listeners on this storage node.
+    #[serde(default)]
+    pub rdma_rails: Vec<RdmaRailAdvertiseConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,6 +67,9 @@ pub struct ClusterConfig {
     /// This node's outward RDMA endpoint; if empty, read CS_RDMA_ADVERTISE.
     #[serde(default)]
     pub rdma_advertise: String,
+    /// Optional alternative listeners on this node. Does not affect object layout.
+    #[serde(default)]
+    pub rdma_rails: Vec<RdmaRailAdvertiseConfig>,
     /// KVService data nodes eligible for object stripe placement.
     ///
     /// Empty means single-node mode; cross-node placement is enabled only when
@@ -329,12 +344,14 @@ impl Config {
                 "at least one storage device must be configured".to_string(),
             ));
         }
+        validate_rail_advertisements("cluster", &self.cluster.rdma_rails)?;
         for node in &self.cluster.data_nodes {
             if node.grpc_endpoint.trim().is_empty() {
                 return Err(KVError::Config(
                     "cluster.data_nodes.grpc_endpoint must not be empty".to_string(),
                 ));
             }
+            validate_rail_advertisements("cluster.data_nodes", &node.rdma_rails)?;
         }
         match self.router.strategy.as_str() {
             "object_hash" => {}
@@ -396,5 +413,62 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+fn validate_rail_advertisements(owner: &str, rails: &[RdmaRailAdvertiseConfig]) -> Result<()> {
+    let mut fabrics = HashSet::new();
+    let mut listeners = HashSet::new();
+    for rail in rails {
+        if rail.fabric_id.trim().is_empty() || rail.listener_endpoint.trim().is_empty() {
+            return Err(KVError::Config(format!(
+                "{owner}.rdma_rails require nonempty fabric_id and listener_endpoint"
+            )));
+        }
+        if !fabrics.insert(rail.fabric_id.as_str())
+            || !listeners.insert(rail.listener_endpoint.as_str())
+        {
+            return Err(KVError::Config(format!(
+                "{owner}.rdma_rails require distinct fabrics and listeners"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rail_advertisement_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_fabric_or_listener_is_rejected() {
+        let mut config = Config::default();
+        config.cluster.rdma_rails = vec![
+            RdmaRailAdvertiseConfig {
+                fabric_id: "fabric-a".into(),
+                listener_endpoint: "10.31.0.2:55153".into(),
+            },
+            RdmaRailAdvertiseConfig {
+                fabric_id: "fabric-a".into(),
+                listener_endpoint: "10.32.0.2:55154".into(),
+            },
+        ];
+        assert!(config.validate().is_err());
+        config.cluster.rdma_rails[1].fabric_id = "fabric-b".into();
+        config.cluster.rdma_rails[1].listener_endpoint = "10.31.0.2:55153".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn blank_fabric_or_listener_is_rejected() {
+        let mut config = Config::default();
+        config.cluster.rdma_rails = vec![RdmaRailAdvertiseConfig {
+            fabric_id: " ".into(),
+            listener_endpoint: "10.31.0.2:55153".into(),
+        }];
+        assert!(config.validate().is_err());
+        config.cluster.rdma_rails[0].fabric_id = "fabric-a".into();
+        config.cluster.rdma_rails[0].listener_endpoint = " ".into();
+        assert!(config.validate().is_err());
     }
 }

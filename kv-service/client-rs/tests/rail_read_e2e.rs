@@ -5,7 +5,9 @@
 
 #![cfg(feature = "rdma")]
 
-use contextstore_client_rs::rail_read::{RailCancel, RailLimits, RailReader, RailRoute};
+use contextstore_client_rs::rail_read::{
+    LocalRailPath, RailCancel, RailLimits, RailReader, RailRoute,
+};
 use contextstore_client_rs::rdma::{RdmaClient, RdmaClientConfig};
 use contextstore_client_rs::KvClient;
 use prost::bytes::Bytes;
@@ -524,6 +526,104 @@ async fn same_object_matches_single_and_dual_rail() {
         Some(payload.len())
     );
     assert_eq!(single_bytes, dual_bytes);
+}
+
+fn discovered_local_paths() -> [LocalRailPath; 2] {
+    [
+        LocalRailPath::new(
+            "rail0",
+            setting("CS_RAIL_FABRIC0", "fabric-a"),
+            setting("CS_RAIL_DEVICE0", "rxe_c0"),
+        )
+        .with_gid_index(
+            setting("CS_RAIL_GID0", "1")
+                .parse::<u8>()
+                .expect("first rail GID"),
+        ),
+        LocalRailPath::new(
+            "rail1",
+            setting("CS_RAIL_FABRIC1", "fabric-b"),
+            setting("CS_RAIL_DEVICE1", "rxe_c1"),
+        )
+        .with_gid_index(
+            setting("CS_RAIL_GID1", "1")
+                .parse::<u8>()
+                .expect("second rail GID"),
+        ),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "requires two real rails and server-advertised fabric/listener capabilities"]
+async fn advertised_two_rails_restore_one_object() {
+    let (mut client, key, payload, _advertised) = seeded_object().await;
+    let lookup = client
+        .lookup_object("rail-e2e", &key)
+        .await
+        .expect("lookup")
+        .expect("seeded object");
+    let reader = Arc::new(
+        RailReader::discover_from_placement(
+            lookup.placement.as_ref().expect("placement"),
+            &discovered_local_paths(),
+            RailLimits::default(),
+        )
+        .expect("discover rail listeners"),
+    );
+    let mut destination = vec![0xA5; payload.len()];
+    assert_eq!(
+        client
+            .read_multi_rail_into(
+                Arc::clone(&reader),
+                "rail-e2e",
+                &key,
+                &mut destination,
+                None
+            )
+            .await
+            .expect("discovered dual read"),
+        Some(payload.len())
+    );
+    assert_eq!(destination, payload);
+    assert_eq!(reader.snapshots().len(), 2);
+    assert!(reader.snapshots().iter().all(|rail| rail.bytes > 0));
+}
+
+#[tokio::test]
+#[ignore = "requires advertised rails; externally disable the second client RXE link"]
+async fn advertised_second_link_down_cannot_publish_partial_object() {
+    let (mut client, key, payload, _advertised) = seeded_object().await;
+    let lookup = client
+        .lookup_object("rail-e2e", &key)
+        .await
+        .expect("lookup")
+        .expect("seeded object");
+    let reader = Arc::new(
+        RailReader::discover_from_placement(
+            lookup.placement.as_ref().expect("placement"),
+            &discovered_local_paths(),
+            RailLimits {
+                io_timeout: Duration::from_secs(4),
+                ..RailLimits::default()
+            },
+        )
+        .expect("discover rail listeners"),
+    );
+    let mut destination = vec![0xA5; payload.len()];
+    assert!(client
+        .read_multi_rail_into(
+            Arc::clone(&reader),
+            "rail-e2e",
+            &key,
+            &mut destination,
+            None
+        )
+        .await
+        .is_err());
+    let rails = reader.snapshots();
+    assert_eq!(rails[0].reads_ok, 1, "first rail should have completed");
+    assert_eq!(rails[1].reads_err, 1, "disabled second rail should fail");
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
 }
 
 #[tokio::test]

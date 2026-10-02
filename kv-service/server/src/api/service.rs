@@ -1,5 +1,6 @@
 //! gRPC service handler implementation
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,6 +106,7 @@ mod tests {
             node_id: id.to_string(),
             grpc_endpoint: grpc.to_string(),
             rdma_endpoint: String::new(),
+            rdma_rails: Vec::new(),
         }
     }
 
@@ -155,6 +157,114 @@ mod tests {
         assert_eq!(desc.size, 128);
         assert!(!desc.object_handle.is_empty());
         validate_descriptor(&desc, &meta).unwrap();
+    }
+
+    #[test]
+    fn lookup_placement_advertises_two_local_rails_without_changing_stripes() {
+        let mut config = crate::config::Config::default();
+        config.cluster.node_id = "owner-a".into();
+        config.cluster.grpc_advertise = "10.31.0.2:55151".into();
+        config.cluster.rdma_advertise = "10.31.0.2:55153".into();
+        config.cluster.rdma_rails = vec![
+            crate::config::RdmaRailAdvertiseConfig {
+                fabric_id: "rail-a".into(),
+                listener_endpoint: "10.31.0.2:55153".into(),
+            },
+            crate::config::RdmaRailAdvertiseConfig {
+                fabric_id: "rail-b".into(),
+                listener_endpoint: "10.32.0.2:55154".into(),
+            },
+        ];
+        config.metadata.redis_url = "memory://local-rail-advertisement".into();
+        let mut legacy_config = config.clone();
+        legacy_config.cluster.rdma_rails.clear();
+        legacy_config.metadata.redis_url = "memory://local-rail-advertisement-legacy".into();
+        let ctx = KVServiceContext::new(config).unwrap();
+        let placement = placement_from_meta(&ctx, &key(), &meta());
+        let legacy_placement = placement_from_meta(
+            &KVServiceContext::new(legacy_config).unwrap(),
+            &key(),
+            &meta(),
+        );
+
+        assert_eq!(placement.chunks.len(), 1);
+        assert_eq!(placement.chunks, legacy_placement.chunks);
+        assert_eq!(placement.layout_hash, legacy_placement.layout_hash);
+        assert_eq!(placement.placement_epoch, legacy_placement.placement_epoch);
+        assert_eq!(placement.chunks[0].rdma_endpoint, "10.31.0.2:55153");
+        assert_eq!(placement.rdma_rails.len(), 2);
+        assert_eq!(placement.rdma_rails[0].node_id, "owner-a");
+        assert_eq!(
+            placement.rdma_rails[0].advertised_endpoint,
+            "10.31.0.2:55153"
+        );
+        assert_eq!(placement.rdma_rails[1].fabric_id, "rail-b");
+        assert_eq!(placement.rdma_rails[1].listener_endpoint, "10.32.0.2:55154");
+    }
+
+    #[test]
+    fn empty_rail_advertisement_keeps_legacy_placement() {
+        let ctx = ctx_with_nodes(vec![]);
+        let placement = placement_from_meta(&ctx, &key(), &meta());
+        assert!(placement.rdma_rails.is_empty());
+    }
+
+    #[test]
+    fn rail_capabilities_follow_actual_local_and_remote_owners() {
+        let mut remote = data_node("owner-b", "10.0.0.2:50051");
+        // Config permits an empty ID and uses the gRPC endpoint as the node ID.
+        remote.node_id.clear();
+        remote.rdma_endpoint = "10.0.0.2:50053".into();
+        remote.rdma_rails = vec![crate::config::RdmaRailAdvertiseConfig {
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.2:50053".into(),
+        }];
+        let mut config = crate::config::Config::default();
+        config.cluster.node_id = "owner-a".into();
+        config.cluster.rdma_advertise = "10.0.0.1:50053".into();
+        config.cluster.rdma_rails = vec![crate::config::RdmaRailAdvertiseConfig {
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.1:50053".into(),
+        }];
+        config.cluster.data_nodes = vec![remote];
+        config.metadata.redis_url = "memory://multi-owner-rail-advertisement".into();
+        let ctx = KVServiceContext::new(config).unwrap();
+        let mut chunks = placement_from_meta(&ctx, &key(), &meta()).chunks;
+        let mut remote_chunk = chunks[0].clone();
+        remote_chunk.node_id = "10.0.0.2:50051".into();
+        remote_chunk.rdma_endpoint = "10.0.0.2:50053".into();
+        chunks.push(remote_chunk);
+
+        let rails = advertised_rails_for_chunks(&ctx, &chunks);
+        assert_eq!(rails.len(), 2);
+        assert_eq!(rails[0].node_id, "owner-a");
+        assert_eq!(rails[1].node_id, "10.0.0.2:50051");
+        assert_eq!(rails[1].listener_endpoint, "10.0.0.2:50053");
+    }
+
+    #[test]
+    fn local_cluster_entry_without_node_id_uses_local_rail_advertisements() {
+        let mut config = crate::config::Config::default();
+        config.cluster.node_id = "owner-a".into();
+        config.cluster.grpc_advertise = "10.0.0.1:50051".into();
+        config.cluster.rdma_advertise = "10.0.0.1:50053".into();
+        config.cluster.rdma_rails = vec![crate::config::RdmaRailAdvertiseConfig {
+            fabric_id: "fabric-a".into(),
+            listener_endpoint: "10.0.0.1:50053".into(),
+        }];
+        config.cluster.data_nodes = vec![ClusterNodeConfig {
+            node_id: String::new(),
+            grpc_endpoint: "10.0.0.1:50051".into(),
+            rdma_endpoint: "10.0.0.1:50053".into(),
+            rdma_rails: Vec::new(),
+        }];
+        config.metadata.redis_url = "memory://local-node-id-fallback-rails".into();
+        let ctx = KVServiceContext::new(config).unwrap();
+        let mut chunk = placement_from_meta(&ctx, &key(), &meta()).chunks.remove(0);
+        chunk.node_id = "10.0.0.1:50051".into();
+        let rails = advertised_rails_for_chunks(&ctx, &[chunk]);
+        assert_eq!(rails.len(), 1);
+        assert_eq!(rails[0].node_id, "10.0.0.1:50051");
     }
 
     #[test]
@@ -1534,15 +1644,19 @@ fn configured_data_nodes(ctx: &KVServiceContext) -> Vec<DataNode> {
         .data_nodes
         .iter()
         .map(|n: &ClusterNodeConfig| DataNode {
-            node_id: if n.node_id.is_empty() {
-                n.grpc_endpoint.clone()
-            } else {
-                n.node_id.clone()
-            },
+            node_id: configured_node_id(n).to_string(),
             grpc_endpoint: n.grpc_endpoint.clone(),
             rdma_endpoint: n.rdma_endpoint.clone(),
         })
         .collect()
+}
+
+fn configured_node_id(node: &ClusterNodeConfig) -> &str {
+    if node.node_id.is_empty() {
+        &node.grpc_endpoint
+    } else {
+        &node.node_id
+    }
 }
 
 fn is_local_node(ctx: &KVServiceContext, node: &DataNode) -> bool {
@@ -1741,6 +1855,7 @@ fn placement_from_meta(
         ));
     }
 
+    let rdma_rails = advertised_rails_for_chunks(ctx, &chunks);
     pb::PlacementDescriptor {
         key: Some(internal_key_to_pb(key)),
         placement_epoch,
@@ -1750,7 +1865,59 @@ fn placement_from_meta(
         primary_grpc_endpoint: local.grpc_endpoint,
         primary_rdma_endpoint: local.rdma_endpoint,
         chunks,
+        rdma_rails,
     }
+}
+
+fn advertised_rails_for_chunks(
+    ctx: &KVServiceContext,
+    chunks: &[pb::PlacementChunk],
+) -> Vec<pb::RdmaRailEndpoint> {
+    if ctx.config.cluster.rdma_rails.is_empty()
+        && ctx
+            .config
+            .cluster
+            .data_nodes
+            .iter()
+            .all(|node| node.rdma_rails.is_empty())
+    {
+        return Vec::new();
+    }
+    let local = local_node(ctx);
+    let mut seen_owners = HashSet::new();
+    let mut advertised = Vec::new();
+    for chunk in chunks {
+        if chunk.rdma_endpoint.is_empty()
+            || !seen_owners.insert((chunk.node_id.clone(), chunk.rdma_endpoint.clone()))
+        {
+            continue;
+        }
+        let configured = if (chunk.node_id == local.node_id
+            || chunk.grpc_endpoint == local.grpc_endpoint)
+            && chunk.rdma_endpoint == local.rdma_endpoint
+        {
+            Some(ctx.config.cluster.rdma_rails.as_slice())
+        } else {
+            ctx.config
+                .cluster
+                .data_nodes
+                .iter()
+                .find(|node| {
+                    configured_node_id(node) == chunk.node_id
+                        && node.rdma_endpoint == chunk.rdma_endpoint
+                })
+                .map(|node| node.rdma_rails.as_slice())
+        };
+        if let Some(rails) = configured {
+            advertised.extend(rails.iter().map(|rail| pb::RdmaRailEndpoint {
+                node_id: chunk.node_id.clone(),
+                advertised_endpoint: chunk.rdma_endpoint.clone(),
+                fabric_id: rail.fabric_id.clone(),
+                listener_endpoint: rail.listener_endpoint.clone(),
+            }));
+        }
+    }
+    advertised
 }
 
 fn key_from_descriptor(desc: &pb::ObjectDescriptor) -> Result<InternalKey, Status> {
@@ -2202,6 +2369,7 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             primary_grpc_endpoint: local.grpc_endpoint,
             primary_rdma_endpoint: local.rdma_endpoint,
             chunks,
+            rdma_rails: Vec::new(),
         };
         Ok(Response::new(pb::PrepareDistributedPutResponse {
             accepted: true,

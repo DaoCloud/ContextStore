@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use contextstore_client_rs::rail_read::{RailLimits, RailReader, RailRoute};
+use contextstore_client_rs::rail_read::{LocalRailPath, RailLimits, RailReader, RailRoute};
 use contextstore_client_rs::rdma::RdmaClientConfig;
 use contextstore_client_rs::KvClient;
 use std::sync::Arc;
@@ -18,8 +18,12 @@ struct Args {
     #[arg(long)]
     object_key: String,
     /// Repeat: id,local_device,advertised_endpoint,listener,port,gid_index[,weight].
-    #[arg(long = "rail", required = true)]
+    #[arg(long = "rail", conflicts_with = "local_rails")]
     rails: Vec<String>,
+    /// Repeat: id,fabric_id,local_device,port,gid_index[,weight].
+    /// Remote listener is discovered from the object's PlacementDescriptor.
+    #[arg(long = "local-rail", conflicts_with = "rails")]
+    local_rails: Vec<String>,
     /// State which real Verbs environment produced these measurements.
     #[arg(long, value_parser = ["physical", "soft-roce"])]
     environment: String,
@@ -59,6 +63,40 @@ fn parse_route(spec: &str) -> Result<RailRoute> {
             .with_gid_index(gid),
     )
     .with_weight(weight))
+}
+
+fn parse_local_path(spec: &str) -> Result<LocalRailPath> {
+    let fields: Vec<_> = spec.split(',').map(str::trim).collect();
+    if !(5..=6).contains(&fields.len()) || fields[..3].iter().any(|field| field.is_empty()) {
+        return Err(anyhow!(
+            "local rail spec must be id,fabric_id,device,port,gid_index[,weight]"
+        ));
+    }
+    let port = fields[3]
+        .parse::<u8>()
+        .context("local rail port is not a u8")?;
+    if port == 0 {
+        return Err(anyhow!("local rail port must be positive"));
+    }
+    let gid = fields[4]
+        .parse::<u8>()
+        .context("local rail GID index is not a u8")?;
+    let weight = fields
+        .get(5)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .context("local rail weight is not a u32")
+        })
+        .transpose()?
+        .unwrap_or(1);
+    if weight == 0 {
+        return Err(anyhow!("local rail weight must be positive"));
+    }
+    Ok(LocalRailPath::new(fields[0], fields[1], fields[2])
+        .with_port(port)
+        .with_gid_index(gid)
+        .with_weight(weight))
 }
 
 #[cfg(target_os = "linux")]
@@ -205,12 +243,21 @@ async fn main() -> Result<()> {
             "--iterations must be positive and --concurrency must be 1..=8"
         ));
     }
-    let routes = args
+    if args.rails.is_empty() == args.local_rails.is_empty() {
+        return Err(anyhow!(
+            "provide either --rail for explicit listeners or --local-rail for discovered listeners"
+        ));
+    }
+    let explicit_routes = args
         .rails
         .iter()
         .map(|spec| parse_route(spec))
         .collect::<Result<Vec<_>>>()?;
-    let reader = Arc::new(RailReader::new(routes.clone(), RailLimits::default())?);
+    let local_paths = args
+        .local_rails
+        .iter()
+        .map(|spec| parse_local_path(spec))
+        .collect::<Result<Vec<_>>>()?;
     let endpoint =
         if args.coordinator.starts_with("http://") || args.coordinator.starts_with("https://") {
             args.coordinator.clone()
@@ -224,9 +271,18 @@ async fn main() -> Result<()> {
         .lookup_object(&args.namespace, &args.object_key)
         .await?
         .ok_or_else(|| anyhow!("object not found"))?;
+    let reader = Arc::new(if local_paths.is_empty() {
+        RailReader::new(explicit_routes, RailLimits::default())?
+    } else {
+        let placement = lookup
+            .placement
+            .as_ref()
+            .ok_or_else(|| anyhow!("object lookup returned no placement"))?;
+        RailReader::discover_from_placement(placement, &local_paths, RailLimits::default())?
+    });
     let size = usize::try_from(lookup.descriptor.size)?;
     let mut destination = vec![0u8; size];
-    for route in &routes {
+    for route in reader.routes() {
         println!(
             "route,id={},device={},port={},gid={},weight={},advertised={},listener={}",
             route.id,
@@ -283,7 +339,7 @@ async fn main() -> Result<()> {
         println!(
             "sample,environment={},rails={},iteration={},bytes={},latency_us={},gib_per_s={gib_per_s:.3},xxh3={checksum:016x}",
             args.environment,
-            routes.len(),
+            reader.routes().len(),
             iteration + 1,
             bytes,
             elapsed.as_micros(),
@@ -301,7 +357,7 @@ async fn main() -> Result<()> {
     println!(
         "summary,environment={},rails={},bytes_per_iter={},iters={},median_us={},cpu_user_us={},cpu_system_us={},peak_rss_kb={},rail_bytes={rail_bytes:?}",
         args.environment,
-        routes.len(),
+        reader.routes().len(),
         size,
         args.iterations,
         median.as_micros(),
@@ -354,5 +410,12 @@ mod tests {
     fn rail_spec_accepts_a_capacity_weight() {
         let route = parse_route("r1,mlx5_1,10.0.0.1:50053,10.0.1.1:50054,1,3,4").unwrap();
         assert_eq!(route.weight, 4);
+    }
+
+    #[test]
+    fn local_rail_spec_names_a_fabric_without_hardcoding_a_listener() {
+        assert!(parse_local_path("r1,fabric-b,mlx5_1,1,3,4").is_ok());
+        assert!(parse_local_path("r1,,mlx5_1,1,3").is_err());
+        assert!(parse_local_path("r1,fabric-b,mlx5_1,0,3").is_err());
     }
 }

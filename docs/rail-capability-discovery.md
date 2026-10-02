@@ -1,0 +1,21 @@
+# Optional RDMA rail capability discovery
+
+## Problem and boundary
+
+The current `RailReader` safely reads an object over multiple rails, but deployments must manually repeat every remote listener in client configuration. The storage layout and public read method remain unchanged. This extension puts optional network capabilities in the ephemeral `LookupObject` placement response; it does not store them with object metadata or change the stripe owner, offset, checksum or `layout_hash`.
+
+## Wire and configuration
+
+`PlacementDescriptor` gains repeated `RdmaRailEndpoint` entries. Each contains the owning node ID, the existing advertised RDMA endpoint used by its chunks, a stable fabric ID, and the actual listener endpoint. Protobuf readers that do not know the new field ignore it. Servers with no `cluster.rdma_rails` configuration emit an empty list and retain their current behavior. The local node config and each optional `cluster.data_nodes` entry may advertise several fabric/listener pairs. Config validation rejects blank IDs/endpoints and duplicates within one node before serving traffic. Bind addresses and advertised listener addresses are intentionally separate; operators must provide reachable addresses.
+
+## Client mapping
+
+`LocalRailPath` names one local Verbs device/port/GID and its fabric ID. `RailReader::discover_from_placement` matches an advertised capability to a local path with the same fabric ID, producing ordinary `RailRoute` entries, one per (owning endpoint, fabric). This reuses the existing scheduler, state machine, resource accounting and private receive buffers. Discovery never treats two listeners on the same local port as independent rails or one listener as two storage owners. An internal 32-route cap bounds worker/QP tasks before transfer without changing the public `RailLimits` struct shape; existing nine-route manual configurations remain valid. A missing or ambiguous capability returns an explicit error; callers can still use the existing manual `RailReader::new` path for older servers. It does not attempt to infer GIDs, bypass local device configuration or accept a capability for a different object owner.
+
+## Consistency and upgrade
+
+`LookupObject` creates the capability list from current cluster configuration after it knows the actual chunk owners, including the existing `grpc_endpoint` fallback for local or remote `data_nodes` entries configured without an explicit ID. Local ownership follows the same gRPC-address fallback as the existing storage path and also checks the advertised RDMA endpoint. The client validates that every discovered entry matches a chunk owner and its advertised RDMA endpoint, rejects duplicates, and only constructs routes for configured local fabric IDs. A discovered reader pins the capability and owner/endpoint snapshots used to build its routes: if a later `LookupObject` changes either, it rejects the request before transport and must be rebuilt. The existing post-read placement comparison also rejects a change during transfer. Rollout order is server advertisement first, client discovery second; existing clients and manual-route reads remain compatible.
+
+## Acceptance
+
+Unit tests cover empty legacy advertisement, one owner with two independent rails, multi-owner routing (including omitted remote node IDs), duplicate/blank configuration, a mismatched owner or endpoint, capability/owner changes after reader construction, cross-owner listener reuse, the worker/QP task cap, and single-rail compatibility. On two isolated RXE paths, the discovery CLI resolved `rxe_c0` to `10.31.0.2:55153` and `rxe_c1` to `10.32.0.2:55154` using only local fabric IDs. One Worker restored the same 64 MiB / 16-stripe object with 32 MiB per rail and xxh3 `a0a4cbfa5cad46af`. An externally disabled second client link left the first rail completed, the second rail failed, and the caller buffer unchanged; after link restoration the same object read succeeded. An old client read the new server's optional field successfully, and a new client used manual routes against the old server. Discovery mode against the old server failed clearly without attempting an arbitrary route. [Raw test receipts](../kv-service/benchmarks/results/softroce-vm-discovery.json) preserve these observations. Physical HCA aggregation is not inferred from this feature.

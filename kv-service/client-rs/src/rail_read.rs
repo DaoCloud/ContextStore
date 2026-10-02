@@ -2,7 +2,7 @@
 
 use crate::pb;
 use crate::rdma::{RdmaClient, RdmaClientConfig, RdmaReadOutcome};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,6 +80,50 @@ impl RailRoute {
     }
 
     /// Set a positive relative scheduling weight for this path.
+    pub fn with_weight(mut self, weight: u32) -> Self {
+        self.weight = weight.max(1);
+        self
+    }
+}
+
+/// A local Verbs path whose fabric ID is matched to a server-advertised listener.
+/// No remote endpoint is accepted from local configuration in discovery mode.
+#[derive(Clone, Debug)]
+pub struct LocalRailPath {
+    id: String,
+    fabric_id: String,
+    device: String,
+    port: u8,
+    gid_index: u8,
+    weight: u32,
+}
+
+impl LocalRailPath {
+    pub fn new(
+        id: impl Into<String>,
+        fabric_id: impl Into<String>,
+        device: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            fabric_id: fabric_id.into(),
+            device: device.into(),
+            port: 1,
+            gid_index: 3,
+            weight: 1,
+        }
+    }
+
+    pub fn with_port(mut self, port: u8) -> Self {
+        self.port = port;
+        self
+    }
+
+    pub fn with_gid_index(mut self, gid_index: u8) -> Self {
+        self.gid_index = gid_index;
+        self
+    }
+
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight.max(1);
         self
@@ -534,9 +578,14 @@ struct BudgetState {
     rail_inflight_bytes: Vec<u64>,
 }
 
+// Preserve the RailLimits struct API while bounding one request's worker/QP count.
+const MAX_RAIL_TASKS_PER_READ: usize = 32;
+
 /// Bounded multi-rail reader; one active request uses one QP per chosen rail.
 pub struct RailReader {
     routes: Vec<RailRoute>,
+    discovered_capabilities: Option<Vec<pb::RdmaRailEndpoint>>,
+    discovered_owners: Option<HashSet<(String, String)>>,
     topologies: Vec<RailTopology>,
     limits: RailLimits,
     counters: Vec<RailCounters>,
@@ -619,6 +668,105 @@ fn process_memlock_limit() -> Option<u64> {
 }
 
 impl RailReader {
+    /// Resolve remote listeners advertised by `LookupObject` against known
+    /// local fabrics. Existing manual routes remain available for older servers.
+    pub fn discover_from_placement(
+        placement: &pb::PlacementDescriptor,
+        local_paths: &[LocalRailPath],
+        limits: RailLimits,
+    ) -> Result<Self, RailReadError> {
+        if placement.chunks.is_empty() || placement.rdma_rails.is_empty() {
+            return Err(RailReadError::InvalidPlacement(
+                "placement has no rail capabilities; use manual routes for older servers".into(),
+            ));
+        }
+        let mut local_ids = HashSet::new();
+        let mut local_fabrics = HashSet::new();
+        let mut local_ports = HashSet::new();
+        for path in local_paths {
+            if path.id.trim().is_empty()
+                || path.fabric_id.trim().is_empty()
+                || path.device.trim().is_empty()
+                || path.port == 0
+                || !local_ids.insert(path.id.as_str())
+                || !local_fabrics.insert(path.fabric_id.as_str())
+                || !local_ports.insert((path.device.as_str(), path.port))
+            {
+                return Err(RailReadError::InvalidPlacement(
+                    "local rail IDs, fabrics, devices and ports must be distinct".into(),
+                ));
+            }
+        }
+        let mut owners = HashSet::new();
+        let mut endpoint_owners = HashMap::new();
+        for chunk in &placement.chunks {
+            if chunk.node_id.trim().is_empty() || chunk.rdma_endpoint.trim().is_empty() {
+                return Err(RailReadError::InvalidPlacement(
+                    "stripe owner or RDMA endpoint is empty".into(),
+                ));
+            }
+            if let Some(previous) = endpoint_owners.insert(&chunk.rdma_endpoint, &chunk.node_id) {
+                if previous != &chunk.node_id {
+                    return Err(RailReadError::InvalidPlacement(
+                        "one RDMA endpoint identifies two storage owners".into(),
+                    ));
+                }
+            }
+            owners.insert((&chunk.node_id, &chunk.rdma_endpoint));
+        }
+        let mut seen_fabrics = HashSet::new();
+        let mut seen_listeners = HashSet::new();
+        let mut routes = Vec::new();
+        for rail in &placement.rdma_rails {
+            if rail.node_id.trim().is_empty()
+                || rail.advertised_endpoint.trim().is_empty()
+                || rail.fabric_id.trim().is_empty()
+                || rail.listener_endpoint.trim().is_empty()
+                || !owners.contains(&(&rail.node_id, &rail.advertised_endpoint))
+                || !seen_fabrics.insert((&rail.node_id, &rail.advertised_endpoint, &rail.fabric_id))
+                || !seen_listeners.insert(&rail.listener_endpoint)
+            {
+                return Err(RailReadError::InvalidPlacement(
+                    "advertised rail is blank, duplicated, or not an object owner".into(),
+                ));
+            }
+            if let Some(path) = local_paths
+                .iter()
+                .find(|path| path.fabric_id == rail.fabric_id)
+            {
+                let connection = RdmaClientConfig::new(&rail.listener_endpoint, &path.device)
+                    .with_port(path.port)
+                    .with_gid_index(path.gid_index);
+                routes.push(
+                    RailRoute::new(
+                        format!("{}/{}/{}", rail.node_id, rail.advertised_endpoint, path.id),
+                        &rail.advertised_endpoint,
+                        connection,
+                    )
+                    .with_weight(path.weight),
+                );
+            }
+        }
+        if owners.iter().any(|(_, endpoint)| {
+            !routes
+                .iter()
+                .any(|route| route.advertised_endpoint == **endpoint)
+        }) {
+            return Err(RailReadError::InvalidPlacement(
+                "no matching local fabric for a storage owner".into(),
+            ));
+        }
+        let mut reader = Self::new(routes, limits)?;
+        reader.discovered_capabilities = Some(placement.rdma_rails.clone());
+        reader.discovered_owners = Some(
+            owners
+                .into_iter()
+                .map(|(node, endpoint)| (node.clone(), endpoint.clone()))
+                .collect(),
+        );
+        Ok(reader)
+    }
+
     /// Validate routes and create an RDMA reader without opening connections.
     pub fn new(routes: Vec<RailRoute>, mut limits: RailLimits) -> Result<Self, RailReadError> {
         if routes.is_empty()
@@ -628,6 +776,12 @@ impl RailReader {
             return Err(RailReadError::InvalidPlacement(
                 "at least one rail and one active read slot are required".into(),
             ));
+        }
+        if routes.len() > MAX_RAIL_TASKS_PER_READ {
+            return Err(RailReadError::ResourceExhausted(format!(
+                "configured rail count exceeds per-read task limit ({})",
+                MAX_RAIL_TASKS_PER_READ
+            )));
         }
         let mut ids = HashSet::new();
         let mut paths = HashSet::new();
@@ -671,6 +825,8 @@ impl RailReader {
             effective_registered_budget(limits.max_registered_bytes, process_memlock_limit());
         Ok(Self {
             routes,
+            discovered_capabilities: None,
+            discovered_owners: None,
             topologies,
             limits,
             counters,
@@ -680,6 +836,11 @@ impl RailReader {
                 ..BudgetState::default()
             })),
         })
+    }
+
+    /// The resolved route map used by this reader, including discovered listeners.
+    pub fn routes(&self) -> &[RailRoute] {
+        &self.routes
     }
 
     /// Read per-rail counters without blocking in-flight transfers.
@@ -788,6 +949,31 @@ impl RailReader {
         transport: &T,
         cancel: Option<&RailCancel>,
     ) -> Result<StagedRailRead, RailReadError> {
+        if let Some(expected) = &self.discovered_owners {
+            let current: HashSet<(&str, &str)> = placement
+                .chunks
+                .iter()
+                .map(|chunk| (chunk.node_id.as_str(), chunk.rdma_endpoint.as_str()))
+                .collect();
+            if current.len() != expected.len()
+                || expected
+                    .iter()
+                    .any(|(node, endpoint)| !current.contains(&(node.as_str(), endpoint.as_str())))
+            {
+                return Err(RailReadError::InvalidPlacement(
+                    "stripe owner changed; rebuild the discovered reader".into(),
+                ));
+            }
+        }
+        if self
+            .discovered_capabilities
+            .as_ref()
+            .is_some_and(|expected| expected != &placement.rdma_rails)
+        {
+            return Err(RailReadError::InvalidPlacement(
+                "advertised rail capabilities changed; rebuild the discovered reader".into(),
+            ));
+        }
         let mut available = self.routes.clone();
         for (route, counters) in available.iter_mut().zip(&self.counters) {
             route.enabled = counters.is_available();

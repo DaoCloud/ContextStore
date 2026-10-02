@@ -8,7 +8,7 @@ Concurrent disks can supply a large KV-cache object faster than one network path
 
 ## 2. Insight
 
-The placement already describes the object's physical stripes and owning storage endpoint. It does not require a new disk layout to select a network path. The client can map one advertised endpoint to two listener/device pairs, assign whole stripes by weighted bytes, and receive each rail into private registered memory. The caller's buffer remains untouched until the full object is validated.
+The placement already describes the object's physical stripes and owning storage endpoint. It does not require a new disk layout to select a network path. The server can optionally advertise additional fabric/listener capabilities in `LookupObject`; the client matches these to locally configured Verbs devices, assigns whole stripes by weighted bytes, and receives each rail into private registered memory. Older servers remain usable through explicit route mapping. The caller's buffer remains untouched until the full object is validated.
 
 ## 3. Mechanism
 
