@@ -343,9 +343,12 @@ publishing share a gate, so whichever starts first determines the result;
 a failed or cancelled read leaves its caller buffer unchanged. Each rail owns
 a compact registered receive buffer. The reader bounds concurrent tasks and
 aggregate in-flight bytes per rail across simultaneous requests. It retains
-the active-read and final-staging budget through the post-read lookup and publish step; transfer
-and MR reservations end after all rail workers finish. No in-request
-transparent retry is attempted.
+the active-read and final-staging budget through the post-read lookup and
+publish step; transfer and MR reservations end after all rail workers finish.
+On Linux, the reader caps its registered-memory budget at 80% of the process's
+soft `RLIMIT_MEMLOCK` when finite, rejecting excess reads before dispatch.
+Multiple independent RailReader instances still need a deployment-wide
+budget. No in-request transparent retry is attempted.
 The server's stripe-subset fallback also honors tag-15 scatter destinations
 when its registered slab cannot provide staging space. A fallback WRITE with
 uncertain completion retains its source and MR until its QP is destroyed.
@@ -353,7 +356,7 @@ uncertain completion retains its source and MR until its QP is destroyed.
 For hardware-independent scheduling and failure checks, run
 `cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
 rail_read::tests`. The ignored `rail_read_e2e` suite contains five single
-real-Rail checks and four dual-Rail checks. Select a test with `--ignored
+real-Rail checks and six dual-Rail checks. Select a test with `--ignored
 --exact <test_name> --nocapture` and configure `CS_RAIL_COORDINATOR`,
 `CS_RAIL_LISTENER0/1`, `CS_RAIL_DEVICE0/1`, and `CS_RAIL_GID0/1` as needed.
 `CS_RDMA_SLAB_MB=0` on the server exercises the registered-buffer fallback.

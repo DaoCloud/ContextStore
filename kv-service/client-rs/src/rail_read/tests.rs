@@ -166,6 +166,14 @@ fn registration_budget_rejects_before_transport() {
 }
 
 #[test]
+fn process_memlock_headroom_caps_registered_bytes_before_dispatch() {
+    let budget = effective_registered_budget(4 * 1024 * 1024 * 1024, Some(500_012 * 1024));
+    assert_eq!(budget, 500_012 * 1024 - (500_012 * 1024) / 5);
+    assert!(budget < 4 * 128 * 1024 * 1024);
+    assert_eq!(effective_registered_budget(1024, None), 1024);
+}
+
+#[test]
 fn per_rail_inflight_limit_counts_concurrent_requests() {
     let (descriptor, placement) = fixture(64, 8);
     let configured = vec![routes()[0].clone()];

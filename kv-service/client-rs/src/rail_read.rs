@@ -595,9 +595,32 @@ impl StagedRailRead {
     }
 }
 
+fn effective_registered_budget(configured: u64, soft_memlock_limit: Option<u64>) -> u64 {
+    match soft_memlock_limit {
+        Some(limit) => configured.min(limit.saturating_sub(limit / 5)),
+        None => configured,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_memlock_limit() -> Option<u64> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0
+        || limit.rlim_cur == libc::RLIM_INFINITY
+    {
+        return None;
+    }
+    Some(limit.rlim_cur)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memlock_limit() -> Option<u64> {
+    None
+}
+
 impl RailReader {
     /// Validate routes and create an RDMA reader without opening connections.
-    pub fn new(routes: Vec<RailRoute>, limits: RailLimits) -> Result<Self, RailReadError> {
+    pub fn new(routes: Vec<RailRoute>, mut limits: RailLimits) -> Result<Self, RailReadError> {
         if routes.is_empty()
             || limits.max_active_reads == 0
             || limits.max_active_reads_per_rail == 0
@@ -644,6 +667,8 @@ impl RailReader {
             })
             .collect();
         let route_count = routes.len();
+        limits.max_registered_bytes =
+            effective_registered_budget(limits.max_registered_bytes, process_memlock_limit());
         Ok(Self {
             routes,
             topologies,
@@ -716,9 +741,14 @@ impl RailReader {
             .map(|task| (task.route_index, task.packed_len as u64))
             .collect();
         let mut budget = self.budget.lock().unwrap();
+        if budget.registered_bytes.saturating_add(registered) > self.limits.max_registered_bytes {
+            return Err(RailReadError::ResourceExhausted(format!(
+                "registered bytes exceed configured or process memlock budget ({} bytes)",
+                self.limits.max_registered_bytes
+            )));
+        }
         if budget.active_reads >= self.limits.max_active_reads
             || budget.staging_bytes.saturating_add(staging) > self.limits.max_staging_bytes
-            || budget.registered_bytes.saturating_add(registered) > self.limits.max_registered_bytes
             || budget.inflight_bytes.saturating_add(inflight) > self.limits.max_inflight_bytes
         {
             return Err(RailReadError::ResourceExhausted(

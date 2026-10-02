@@ -190,6 +190,69 @@ async fn cancellation_after_real_transfer_starts_cannot_write_reused_buffer() {
 }
 
 #[tokio::test]
+#[ignore = "requires two real rails and a large striped object"]
+async fn cancellation_during_two_rail_transfer_preserves_reused_buffer() {
+    let (mut client, key, payload, advertised) = seeded_object().await;
+    let listener0 = setting("CS_RAIL_LISTENER0", &advertised);
+    let listener1 = setting("CS_RAIL_LISTENER1", "127.0.0.1:50054");
+    let reader = Arc::new(
+        RailReader::new(
+            vec![
+                route(&advertised, 0, &listener0),
+                route(&advertised, 1, &listener1),
+            ],
+            RailLimits::default(),
+        )
+        .expect("dual reader"),
+    );
+    let cancel = RailCancel::default();
+    let task_reader = Arc::clone(&reader);
+    let task_cancel = cancel.clone();
+    let read_task = tokio::spawn(async move {
+        let mut destination = vec![0xA5; payload.len()];
+        let result = client
+            .read_multi_rail_into(
+                task_reader,
+                "rail-e2e",
+                &key,
+                &mut destination,
+                Some(task_cancel),
+            )
+            .await;
+        (result, destination)
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !reader
+        .snapshots()
+        .iter()
+        .all(|snapshot| snapshot.inflight_requests > 0)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "both RDMA rails never entered flight"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    cancel.cancel();
+    let (result, mut destination) = tokio::time::timeout(Duration::from_secs(40), read_task)
+        .await
+        .expect("cancelled dual transfer did not quiesce")
+        .expect("read task joined");
+    assert!(result
+        .expect_err("cancelled dual transfer must fail")
+        .to_string()
+        .contains("cancelled"));
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+    destination.fill(0x33);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(destination.iter().all(|byte| *byte == 0x33));
+    assert!(reader
+        .snapshots()
+        .iter()
+        .all(|snapshot| snapshot.inflight_requests == 0 && snapshot.registered_bytes == 0));
+}
+
+#[tokio::test]
 #[ignore = "requires an existing striped object with one deliberately corrupted physical stripe"]
 async fn corrupted_real_stripe_does_not_publish_bytes() {
     let coordinator = setting("CS_RAIL_COORDINATOR", "http://127.0.0.1:50051");
@@ -224,6 +287,62 @@ async fn corrupted_real_stripe_does_not_publish_bytes() {
         .await
         .is_err());
     assert!(destination.iter().all(|byte| *byte == 0xA5));
+}
+
+#[tokio::test]
+#[ignore = "requires two real rails and a deliberately corrupted stripe 1 on an isolated object"]
+async fn corrupt_stripe_on_second_rail_cannot_publish_partial_object() {
+    let coordinator = setting("CS_RAIL_COORDINATOR", "http://127.0.0.1:50051");
+    let namespace = setting("CS_RAIL_EXISTING_NAMESPACE", "rust-bench");
+    let key = setting("CS_RAIL_EXISTING_KEY", "rail-corrupt0/__combined__");
+    let mut client = KvClient::connect(coordinator).await.expect("connect gRPC");
+    let lookup = client
+        .lookup_object(&namespace, &key)
+        .await
+        .expect("lookup")
+        .expect("object exists");
+    let placement = lookup.placement.expect("placement");
+    assert!(
+        placement
+            .chunks
+            .iter()
+            .all(|chunk| !chunk.checksum.is_empty()),
+        "a newly written checksummed object is required"
+    );
+    let advertised = placement.chunks[0].rdma_endpoint.clone();
+    let listener0 = setting("CS_RAIL_LISTENER0", &advertised);
+    let listener1 = setting("CS_RAIL_LISTENER1", "127.0.0.1:50054");
+    let reader = Arc::new(
+        RailReader::new(
+            vec![
+                route(&advertised, 0, &listener0),
+                route(&advertised, 1, &listener1),
+            ],
+            RailLimits::default(),
+        )
+        .expect("dual reader"),
+    );
+    let mut destination = vec![0xA5; lookup.descriptor.size as usize];
+    assert!(client
+        .read_multi_rail_into(
+            Arc::clone(&reader),
+            &namespace,
+            &key,
+            &mut destination,
+            None
+        )
+        .await
+        .is_err());
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+    let snapshots = reader.snapshots();
+    assert!(
+        snapshots[0].bytes > 0,
+        "healthy first rail should have finished"
+    );
+    assert!(
+        snapshots[1].reads_err > 0 || snapshots[1].bytes > 0,
+        "second rail must have been involved"
+    );
 }
 
 #[tokio::test]
