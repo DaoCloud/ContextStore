@@ -253,6 +253,49 @@ async fn late_server_write_after_timeout_cannot_corrupt_reused_buffer() {
 }
 
 #[tokio::test]
+#[ignore = "requires two real rails and a three-second pre-WRITE delay on server nic_idx=1"]
+async fn late_second_rail_after_first_completion_cannot_publish_or_corrupt() {
+    let (mut client, key, payload, advertised) = seeded_object().await;
+    let listener0 = setting("CS_RAIL_LISTENER0", &advertised);
+    let listener1 = setting("CS_RAIL_LISTENER1", "127.0.0.1:50054");
+    let reader = Arc::new(
+        RailReader::new(
+            vec![
+                route(&advertised, 0, &listener0),
+                route(&advertised, 1, &listener1),
+            ],
+            RailLimits {
+                io_timeout: Duration::from_secs(1),
+                ..RailLimits::default()
+            },
+        )
+        .expect("dual reader"),
+    );
+    let mut destination = vec![0xA5; payload.len()];
+    assert!(client
+        .read_multi_rail_into(
+            Arc::clone(&reader),
+            "rail-e2e",
+            &key,
+            &mut destination,
+            None,
+        )
+        .await
+        .is_err());
+    let snapshots = reader.snapshots();
+    assert_eq!(snapshots[0].reads_ok, 1, "first rail must have completed");
+    assert_eq!(snapshots[1].reads_err, 1, "second rail must have failed");
+    assert!(destination.iter().all(|byte| *byte == 0xA5));
+    destination.fill(0x33);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(destination.iter().all(|byte| *byte == 0x33));
+    assert!(reader
+        .snapshots()
+        .iter()
+        .all(|snapshot| snapshot.inflight_requests == 0 && snapshot.registered_bytes == 0));
+}
+
+#[tokio::test]
 #[ignore = "requires two reachable RDMA listeners on the same storage node"]
 async fn same_object_matches_single_and_dual_rail() {
     let (mut client, key, payload, advertised) = seeded_object().await;

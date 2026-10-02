@@ -252,6 +252,15 @@ impl RcQp {
 
     /// Wait for N work completions. Simple busy poll for PoC use.
     pub fn poll_n(cq: NonNull<ibv_cq>, expected: usize) -> Result<()> {
+        Self::poll_n_timeout(cq, expected, std::time::Duration::from_secs(30))
+    }
+
+    /// Wait for N work completions within a caller-selected deadline.
+    pub fn poll_n_timeout(
+        cq: NonNull<ibv_cq>,
+        expected: usize,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         unsafe {
             // ibv_wc does not implement Clone; use push instead of vec!.
             let mut wcs: Vec<ibv_wc> = Vec::with_capacity(expected.max(1));
@@ -285,8 +294,13 @@ impl RcQp {
                     }
                     got += n as usize;
                 }
-                if start.elapsed().as_secs() > 30 {
-                    return Err(anyhow!("poll_n timeout after 30s, got {}/{}", got, expected));
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "poll_n timeout after {}ms, got {}/{}",
+                        timeout.as_millis(),
+                        got,
+                        expected
+                    ));
                 }
             }
             match first_error {

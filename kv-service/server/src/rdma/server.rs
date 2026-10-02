@@ -1119,6 +1119,18 @@ fn ensure_subset_complete(expected_bytes: usize, actual_bytes: u64) -> Result<()
     Ok(())
 }
 
+fn parse_subset_cq_timeout(raw_ms: Option<&str>) -> std::time::Duration {
+    let millis = raw_ms
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(30_000)
+        .clamp(100, 30_000);
+    std::time::Duration::from_millis(millis)
+}
+
+fn subset_cq_timeout() -> std::time::Duration {
+    parse_subset_cq_timeout(std::env::var("CS_RDMA_CQ_TIMEOUT_MS").ok().as_deref())
+}
+
 fn serve_get_stripes_fallback(
     kv_ctx: &Arc<KVServiceContext>,
     rdma: &Arc<RdmaContext>,
@@ -1127,6 +1139,7 @@ fn serve_get_stripes_fallback(
     striping: &StripingInfo,
     req: &DescriptorGetReqMsg,
 ) -> Result<(bool, u64, u32)> {
+    let cq_timeout = subset_cq_timeout();
     let indices = req
         .stripes
         .iter()
@@ -1175,7 +1188,7 @@ fn serve_get_stripes_fallback(
                 length,
                 true,
             )?;
-            if let Err(error) = RcQp::poll_n(client_cq, 1) {
+            if let Err(error) = RcQp::poll_n_timeout(client_cq, 1, cq_timeout) {
                 qp.retain_uncertain_write(mr, segment);
                 return Err(error);
             }
@@ -1311,10 +1324,15 @@ fn serve_get_stripes(
     // its QP/MR before this server attempts a late WRITE. Unset in production.
     if let Ok(raw_delay) = std::env::var("CS_RDMA_TEST_PRE_WRITE_DELAY_MS") {
         if let Ok(delay_ms) = raw_delay.parse::<u64>() {
-            if delay_ms > 0 {
+            let nic_matches = match std::env::var("CS_RDMA_TEST_PRE_WRITE_NIC_IDX") {
+                Ok(raw_nic) => raw_nic.parse::<usize>().ok() == Some(nic_idx),
+                Err(_) => true,
+            };
+            if delay_ms > 0 && nic_matches {
                 let bounded_ms = delay_ms.min(5_000);
                 tracing::warn!(
                     event = "rdma_test_pre_write_delay",
+                    nic_idx,
                     delay_ms = bounded_ms,
                     "delaying stripe-subset WRITEs for fault injection"
                 );
@@ -1324,6 +1342,7 @@ fn serve_get_stripes(
     }
     let view = extent.view(nic_idx);
     const COMPLETION_WINDOW: usize = RcQp::MAX_SEND_WR / 2;
+    let cq_timeout = subset_cq_timeout();
     let mut outstanding = 0usize;
     let mut writes_posted = 0usize;
     let mut total = 0u64;
@@ -1402,7 +1421,7 @@ fn serve_get_stripes(
                         }
                     }
                     while first_error.is_none() && outstanding >= COMPLETION_WINDOW {
-                        match RcQp::poll_n(client_cq, 1) {
+                        match RcQp::poll_n_timeout(client_cq, 1, cq_timeout) {
                             Ok(()) => outstanding -= 1,
                             Err(error) => {
                                 uncertain_write = true;
@@ -1428,7 +1447,7 @@ fn serve_get_stripes(
 
     if outstanding > 0 && !uncertain_write {
         let poll_start = std::time::Instant::now();
-        let poll_result = RcQp::poll_n(client_cq, outstanding);
+        let poll_result = RcQp::poll_n_timeout(client_cq, outstanding, cq_timeout);
         poll_us += poll_start.elapsed().as_micros() as u64;
         if let Err(error) = poll_result {
             uncertain_write = true;
@@ -2105,7 +2124,10 @@ mod tests {
 
 #[cfg(test)]
 mod sge_tests {
-    use super::{ensure_subset_complete, fallback_write_targets, map_range_to_segments};
+    use super::{
+        ensure_subset_complete, fallback_write_targets, map_range_to_segments,
+        parse_subset_cq_timeout,
+    };
 
     #[test]
     fn range_within_one_segment() {
@@ -2158,5 +2180,25 @@ mod sge_tests {
         assert!(ensure_subset_complete(64, 32).is_err());
         assert!(ensure_subset_complete(64, 128).is_err());
         assert!(ensure_subset_complete(64, 64).is_ok());
+    }
+
+    #[test]
+    fn cq_timeout_configuration_is_bounded() {
+        assert_eq!(
+            parse_subset_cq_timeout(None),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_subset_cq_timeout(Some("2000")),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse_subset_cq_timeout(Some("0")),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            parse_subset_cq_timeout(Some("999999")),
+            std::time::Duration::from_secs(30)
+        );
     }
 }

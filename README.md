@@ -353,13 +353,17 @@ uncertain completion retains its source and MR until its QP is destroyed.
 For hardware-independent scheduling and failure checks, run
 `cargo test --manifest-path kv-service/client-rs/Cargo.toml --features rdma
 rail_read::tests`. The ignored `rail_read_e2e` suite contains five single
-real-Rail checks and three dual-Rail checks. Select a test with `--ignored
+real-Rail checks and four dual-Rail checks. Select a test with `--ignored
 --exact <test_name> --nocapture` and configure `CS_RAIL_COORDINATOR`,
 `CS_RAIL_LISTENER0/1`, `CS_RAIL_DEVICE0/1`, and `CS_RAIL_GID0/1` as needed.
 `CS_RDMA_SLAB_MB=0` on the server exercises the registered-buffer fallback.
 On an isolated server only, `CS_RDMA_TEST_PRE_WRITE_DELAY_MS=3000` delays
 stripe-subset WRITEs for the late-completion test; the delay is bounded to
-five seconds and must be unset after that test. A physical-stripe corruption
+five seconds. Add `CS_RDMA_TEST_PRE_WRITE_NIC_IDX=1` to delay only the second
+listener and exercise partial completion. `CS_RDMA_CQ_TIMEOUT_MS` bounds the
+stripe-subset CQ poll between 100 and 30,000 ms (default 30,000); use 2,000
+ms for isolated late-WRITE injection. Unset both fault-injection variables
+after testing. A physical-stripe corruption
 test additionally requires checksum verification enabled before writing its
 object and a reversible fault injection into one test-only stripe file.
 The ignored `software_only_mock_benchmark` exercises scheduling and memory
@@ -374,6 +378,12 @@ that Mock results are host-specific software measurements.
 The separate `kv-service/benchmarks/results/2026-10-02-skv-single-hca.json`
 records physical single-rail Verbs reads, HCA port-counter deltas, fault tests,
 and the storage/topology boundary. It does not measure two-rail aggregation.
+Use `kv-service/configs/server-rail-validation.toml` as a small, checksummed
+server example. For real Verbs performance,
+`kv-service/benchmarks/collect_rail_verbs.py` pairs one
+and two rails on the same prewritten objects and saves every latency sample,
+CPU time, RSS, and per-rail bytes. Label RXE runs `soft-roce`: RXE executes the
+Verbs path but does not establish HCA offload or physical link aggregation.
 
 ---
 
