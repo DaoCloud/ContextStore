@@ -61,7 +61,7 @@
       "side": "client",
       "file": "cq-retire-red.log",
       "status": "expected failure",
-      "purpose": "old client and server reused stale control response",
+      "purpose": "old client accepted a stale reply after its GET timed out; server CQ retirement alone did not prevent that",
       "raw_sha256": "6c5637e5924edfbc41a8034cd1d3dbe7af2567c45c57271175c02c6145b9f6f9",
       "raw_bytes": 531
     },

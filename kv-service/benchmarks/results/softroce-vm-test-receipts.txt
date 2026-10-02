@@ -62,7 +62,7 @@ summary,environment=soft-roce,rails=2,bytes_per_iter=67108864,iters=3,median_us=
 rail_stats,id=r0,device=rxe_c0,listener=10.31.0.2:55153,numa=None,pci=None,healthy=true,cooldown_ms=0,reads_ok=4,reads_err=0,bytes=134217728,avg_us=274448,inflight_requests=0,inflight_bytes=0,peak_inflight_bytes=33554432,registered_bytes_reserved=0,peak_registered_bytes=37748736
 rail_stats,id=r1,device=rxe_c1,listener=10.32.0.2:55154,numa=None,pci=None,healthy=true,cooldown_ms=0,reads_ok=4,reads_err=0,bytes=134217728,avg_us=269701,inflight_requests=0,inflight_bytes=0,peak_inflight_bytes=33554432,registered_bytes_reserved=0,peak_registered_bytes=37748736
 
-=== client/cq-retire-red.log | expected failure | old client and server reused stale control response ===
+=== client/cq-retire-red.log | expected failure | old client accepted a stale reply after GET timeout; server CQ retirement alone was insufficient ===
 
 running 1 test
 
