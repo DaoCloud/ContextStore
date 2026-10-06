@@ -10,8 +10,8 @@
 //! `RegisteredBuffer` carries the borrow of the caller's buffer, so the memory
 //! cannot be released while its memory region is registered with the NIC.
 
-use crate::pb;
 use crate::multi_rail::{RailReader, RailRegistration};
+use crate::pb;
 use anyhow::{anyhow, Context, Result};
 use rdma_sys::*;
 use std::ffi::{c_void, CStr};

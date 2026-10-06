@@ -19,7 +19,7 @@
 //! Default features; does not depend on libibverbs / GPU.
 
 use contextstore_client_rs::mock_rail::{MockRailClient, MockStore};
-use contextstore_client_rs::multi_rail::{RailManager, RailReader, RailReadStats};
+use contextstore_client_rs::multi_rail::{RailManager, RailReadStats, RailReader};
 use contextstore_client_rs::pb;
 use std::sync::{Arc, Mutex};
 
@@ -108,13 +108,11 @@ fn main() {
         // Build r rails (same mock bandwidth each), hand them to RailManager.
         let mut rails: Vec<Box<dyn RailReader>> = Vec::with_capacity(r);
         for i in 0..r {
-            rails.push(
-                Box::new(MockRailClient::new(
-                    format!("mock-{i}"),
-                    per_rail_bps,
-                    store.clone(),
-                )) as Box<dyn RailReader>,
-            );
+            rails.push(Box::new(MockRailClient::new(
+                format!("mock-{i}"),
+                per_rail_bps,
+                store.clone(),
+            )) as Box<dyn RailReader>);
         }
         let mut manager = RailManager::new(rails);
         let mut reader = manager.reader();

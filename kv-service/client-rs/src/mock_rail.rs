@@ -63,7 +63,11 @@ pub struct MockRailClient {
 }
 
 impl MockRailClient {
-    pub fn new(rail_id: impl Into<String>, bandwidth_bps: f64, store: Arc<Mutex<MockStore>>) -> Self {
+    pub fn new(
+        rail_id: impl Into<String>,
+        bandwidth_bps: f64,
+        store: Arc<Mutex<MockStore>>,
+    ) -> Self {
         Self {
             rail_id: rail_id.into(),
             bandwidth_bps,
@@ -101,7 +105,9 @@ impl RailReader for MockRailClient {
         // surface as an error so the aggregator fails the whole read safely
         // (it must never return partial or stale data to the caller).
         if self.fault.fail {
-            return Err(anyhow::anyhow!("injected rail disconnect (fault injection)"));
+            return Err(anyhow::anyhow!(
+                "injected rail disconnect (fault injection)"
+            ));
         }
 
         let canon = canonical_key(descriptor);
@@ -185,9 +191,11 @@ impl RailReader for MockRailClient {
 
         // Fault injection: a late write after cancel, guarded by the epoch.
         if self.fault.late_write_after_cancel {
-            if let (Some(epoch), Some(live), Some((voff, vlen))) =
-                (&self.fault.epoch, &self.fault.live, self.fault.victim_region)
-            {
+            if let (Some(epoch), Some(live), Some((voff, vlen))) = (
+                &self.fault.epoch,
+                &self.fault.live,
+                self.fault.victim_region,
+            ) {
                 let captured = epoch.load(Ordering::SeqCst);
                 let garbage = self.fault.garbage;
                 let base = segments.first().map(|s| s.0 as usize).unwrap_or(0);

@@ -49,11 +49,18 @@ fn multi_rail_read_aggregates_stripes() {
     let desc = make_descriptor(stripe_count, chunk, stripe_count as u64 * chunk);
     let mut buf = vec![0u8; (stripe_count as usize) * chunk as usize];
     let checksums: Vec<Option<String>> = (0..stripe_count as usize)
-        .map(|i| Some(stripe_checksum(&data[i * chunk as usize..(i + 1) * chunk as usize])))
+        .map(|i| {
+            Some(stripe_checksum(
+                &data[i * chunk as usize..(i + 1) * chunk as usize],
+            ))
+        })
         .collect();
 
     let stats = reader.read(&desc, &checksums, &mut buf).unwrap();
-    assert_eq!(buf, data, "multi-rail read must reconstruct the object exactly");
+    assert_eq!(
+        buf, data,
+        "multi-rail read must reconstruct the object exactly"
+    );
     assert_eq!(stats.rail_count, 2);
     assert!(stats.verify_ok);
 }
@@ -115,7 +122,9 @@ fn epoch_guard_blocks_late_write_after_cancel() {
         let mut reader = MultiRailReader::new(vec![rail]);
         let desc = make_descriptor(stripe_count, chunk, stripe_count as u64 * chunk);
         let mut buf = vec![0u8; data.len()];
-        reader.read(&desc, &vec![None; stripe_count as usize], &mut buf).unwrap();
+        reader
+            .read(&desc, &vec![None; stripe_count as usize], &mut buf)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(
             buf[0], 0xAB,
@@ -139,7 +148,9 @@ fn epoch_guard_blocks_late_write_after_cancel() {
         let mut reader = MultiRailReader::new(vec![rail]);
         let desc = make_descriptor(stripe_count, chunk, stripe_count as u64 * chunk);
         let mut buf = vec![0u8; data.len()];
-        reader.read(&desc, &vec![None; stripe_count as usize], &mut buf).unwrap();
+        reader
+            .read(&desc, &vec![None; stripe_count as usize], &mut buf)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(80));
         assert_ne!(
             buf[0], 0xAB,
@@ -186,7 +197,11 @@ fn test_stripe_checksum_failure_detected() {
     // Supply the *correct* per-stripe checksums so the consistency layer can
     // detect the in-transit corruption injected above.
     let checksums: Vec<Option<String>> = (0..stripe_count as usize)
-        .map(|i| Some(stripe_checksum(&data[i * chunk as usize..(i + 1) * chunk as usize])))
+        .map(|i| {
+            Some(stripe_checksum(
+                &data[i * chunk as usize..(i + 1) * chunk as usize],
+            ))
+        })
         .collect();
     let res = reader.read(&desc, &checksums, &mut buf);
     assert!(res.is_err(), "checksum mismatch must surface as an error");
@@ -256,7 +271,11 @@ fn test_partial_completion_under_delivery_detected() {
     // Supply the *correct* per-stripe checksums so the consistency layer can
     // detect the missing bytes left behind by the under-delivering rail.
     let checksums: Vec<Option<String>> = (0..stripe_count as usize)
-        .map(|i| Some(stripe_checksum(&data[i * chunk as usize..(i + 1) * chunk as usize])))
+        .map(|i| {
+            Some(stripe_checksum(
+                &data[i * chunk as usize..(i + 1) * chunk as usize],
+            ))
+        })
         .collect();
     let res = reader.read(&desc, &checksums, &mut buf);
     assert!(
@@ -312,7 +331,11 @@ fn test_single_rail_timeout_safe_fail() {
         "error must name the timeout"
     );
     // The caller's buffer must be untouched on timeout.
-    assert_eq!(buf, vec![0u8; data.len()], "buffer must be untouched on timeout");
+    assert_eq!(
+        buf,
+        vec![0u8; data.len()],
+        "buffer must be untouched on timeout"
+    );
 }
 
 /// Resource budget: object exceeds the inflight budget -> backpressure rejection;

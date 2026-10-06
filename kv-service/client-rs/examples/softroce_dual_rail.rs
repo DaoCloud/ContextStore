@@ -34,9 +34,7 @@ fn main() {
     // Wrap each real RDMA path as a `Box<dyn RailReader>` and hand it to RailManager.
     let mut rails: Vec<Box<dyn RailReader>> = Vec::with_capacity(2);
     for i in 0..2 {
-        rails.push(
-            Box::new(RdmaClient::new(endpoints[i], devices[i])) as Box<dyn RailReader>,
-        );
+        rails.push(Box::new(RdmaClient::new(endpoints[i], devices[i])) as Box<dyn RailReader>);
     }
 
     let manager = RailManager::new(rails);

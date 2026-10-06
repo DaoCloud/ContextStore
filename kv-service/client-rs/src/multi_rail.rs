@@ -15,8 +15,8 @@
 
 use crate::pb;
 use anyhow::{anyhow, Result};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -288,7 +288,9 @@ fn aggregate(
     };
 
     if !verify_ok {
-        return Err(anyhow!("stripe checksum mismatch after multi-rail aggregation"));
+        return Err(anyhow!(
+            "stripe checksum mismatch after multi-rail aggregation"
+        ));
     }
     if per_rail.iter().any(|p| !p.outcome.ok) {
         return Err(anyhow!("one or more rails failed during multi-rail read"));
@@ -359,7 +361,8 @@ impl MultiRailReader {
             if max_inflight > 0 && descriptor.size > max_inflight {
                 return Err(anyhow!(
                     "object size {} exceeds multi-rail inflight budget {} bytes (backpressure)",
-                    descriptor.size, max_inflight
+                    descriptor.size,
+                    max_inflight
                 ));
             }
         }
@@ -417,7 +420,10 @@ impl MultiRailReader {
                     } else {
                         unsafe { do_rail_read(rail, desc, plan, base as *mut u8, blen) }
                     };
-                    RailTimed { outcome, elapsed: t0.elapsed() }
+                    RailTimed {
+                        outcome,
+                        elapsed: t0.elapsed(),
+                    }
                 }));
             }
             handles
@@ -484,9 +490,8 @@ impl MultiRailReader {
             let base_usize = base as usize;
             let h = thread::spawn(move || {
                 let t0 = Instant::now();
-                let outcome = unsafe {
-                    do_rail_read(&mut rail, &desc, &plan, base_usize as *mut u8, size)
-                };
+                let outcome =
+                    unsafe { do_rail_read(&mut rail, &desc, &plan, base_usize as *mut u8, size) };
                 res_slot.lock().unwrap()[i] = Some(RailTimed {
                     outcome,
                     elapsed: t0.elapsed(),
@@ -524,7 +529,9 @@ impl MultiRailReader {
             self.rails = Vec::new();
             return Err(anyhow!(
                 "multi-rail read timed out after {:.0?} ({}/{} rails completed)",
-                timeout, completed, rail_count
+                timeout,
+                completed,
+                rail_count
             ));
         }
 
@@ -539,7 +546,14 @@ impl MultiRailReader {
             .map(|o| o.clone().unwrap())
             .collect::<Vec<_>>();
         let object_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
-        let stats = aggregate(&plans, &per_rail, &shared[..], checksums, object_ms, schedule_ms)?;
+        let stats = aggregate(
+            &plans,
+            &per_rail,
+            &shared[..],
+            checksums,
+            object_ms,
+            schedule_ms,
+        )?;
         // Only copy to the caller's buffer after a clean, verified success.
         let n = size.min(buffer.len());
         buffer[..n].copy_from_slice(&shared[..n]);
