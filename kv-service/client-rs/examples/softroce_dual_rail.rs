@@ -24,7 +24,7 @@
 //!
 //! Environment knobs (all optional):
 //!   CS_GRPC            gRPC endpoint            (default http://127.0.0.1:50051)
-//!   CS_RAIL_ENDPOINTS  RDMA control endpoints   (default 127.0.0.1:50053,127.0.0.1:50054)
+//!   CS_RAIL_ENDPOINTS  RDMA control endpoints   (default 192.168.96.110:50053,192.168.96.111:50054)
 //!   CS_RAIL_DEVICES    RDMA device per rail     (default rxe0,rxe1)
 //!   CS_RAIL_GID        GID index (RXE=1, mlx5 host RoCEv2=3)  (default 1)
 //!   CS_DEMO_MIB        object size in MiB       (default 64)
@@ -58,7 +58,13 @@ fn print_stats(label: &str, s: &RailReadStats) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let grpc = env_or("CS_GRPC", "http://127.0.0.1:50051");
-    let endpoints = env_list("CS_RAIL_ENDPOINTS", "127.0.0.1:50053,127.0.0.1:50054");
+    // NOTE: RDMA control endpoints must be the veth IPs the rxe devices are bound to
+    // (setup-wsl2-rxe.sh: rxe0->veth0=192.168.96.110, rxe1->veth1=192.168.96.111).
+    // 127.0.0.1 would resolve RDMA-CM to loopback, where no rxe device exists.
+    let endpoints = env_list(
+        "CS_RAIL_ENDPOINTS",
+        "192.168.96.110:50053,192.168.96.111:50054",
+    );
     let devices = env_list("CS_RAIL_DEVICES", "rxe0,rxe1");
     let gid: u8 = env_or("CS_RAIL_GID", "1").parse()?;
     let mib: usize = env_or("CS_DEMO_MIB", "64").parse()?;
