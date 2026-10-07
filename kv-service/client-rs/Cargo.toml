@@ -22,6 +22,10 @@ path = "src/bin/cs_mock_bench.rs"
 name = "softroce_dual_rail"
 required-features = ["rdma"]
 
+[[example]]
+name = "softroce_concurrency"
+required-features = ["rdma"]
+
 [dependencies]
 # gRPC (versions aligned with the server)
 tonic = "0.11"

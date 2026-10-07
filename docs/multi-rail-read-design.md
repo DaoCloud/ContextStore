@@ -177,13 +177,52 @@ and invariants above do not preclude it.
 - **In-flight budget**: `ReadOptions.max_inflight_bytes` rejects oversized
   reads up front (backpressure) instead of queueing unbounded work —
   `test_resource_limit_rejects_oversized`.
-- **Registration reuse**: `RdmaClient` registrations go through the cached-MR
-  path (`register_raw_buffer_cached`), bounding MR churn per rail.
+- **Registration reuse**: the default read path registers the destination
+  buffer afresh per read and keeps the MR alive only across the
+  `register` → `read_stripes` pair (held in `RdmaClient::in_flight_mr`),
+  then deregisters it. An opt-in pooled path
+  (`register_raw_buffer_pooled` + `invalidate_mr_cache`) is available for
+  long-lived buffer pools — see §8.1 for why caching by virtual address is
+  not safe as a default.
 - **Thread model**: one scoped thread per rail per read; threads join before
   the read returns, so concurrency is bounded by rail count.
 - Server-side knobs (`CS_RDMA_SLAB_MB`, per-device listeners) are shared
   across rails by design: each PD does its own `reg_mr` against the same
   slab.
+
+### 8.1 Case study: MR caching vs. buffer lifetime
+
+An early version of the read path registered destination buffers through a
+cache keyed by `(base_ptr, length)` (`register_raw_buffer_cached`). It worked
+for the end-to-end demo — every read there used a fresh buffer and a fresh
+client — but failed once a single client performed **two consecutive reads
+into a per-iteration `Vec`**: the second read returned an all-zero buffer
+while reporting success.
+
+Root cause. After the first `Vec` is dropped, the allocator frequently hands
+the *same virtual address* to the next same-sized `Vec`. The cache hits on
+`(addr, len)` and reuses the MR registered for the first `Vec`. That MR still
+pins the **old physical pages**, but the CPU now reads through the **new**
+virtual→physical mapping at the same address. The NIC's RDMA WRITE goes to
+the old pages, so from the caller's view the buffer was never written. The
+`# Safety` note asked callers to keep memory alive forever, but a `Vec` per
+iteration silently violates that — and no runtime check can catch it, because
+a raw pointer carries no lifetime.
+
+Fix. The default path no longer caches: `RailReader::register` calls
+`register_raw_buffer` and stores the owning `RegisteredBuffer` in
+`in_flight_mr`, so the MR lives exactly from `register` to the next
+`register` (i.e. across `read_stripes`) and is then deregistered. The pooled
+path survives as `register_raw_buffer_pooled`, explicitly documented as
+requiring buffer-pool semantics, with `invalidate_mr_cache` for callers that
+recycle buffers at a reused address.
+
+Evidence. `tests/multi_rail_mr_lifetime.rs` reproduces the failure shape
+without RDMA hardware (per-iteration buffers, repeated reads) and asserts the
+read path never observes a stale registration; the Soft-RoCE concurrency
+sweep (`softroce_concurrency`, `CS_ITERS>1`) exercises the real verbs path.
+The cost of always re-registering is ~1.5 ms per 56 MB — under 2 % of a
+32 MiB read (~75 ms) — so correctness is bought cheaply.
 
 ## 9. Compatibility strategy
 
@@ -199,6 +238,27 @@ Hard invariants:
 5. Rail set is assembled from explicit endpoint+device pairs
    (`CS_RAIL_ENDPOINTS` / `CS_RAIL_DEVICES` in the example); a single entry
    reproduces today's behavior.
+
+### 9.1 Compatibility matrix
+
+Cell values: **OK** = behaves exactly as before; **extended** = only adds a
+new capability, existing behavior unchanged; **n/a** = not applicable.
+
+| Client / deployment | Wire protocol | On-disk layout | Upper read API | Config surface | Multi-rail read |
+|---|---|---|---|---|---|
+| Existing gRPC-only client (no `rdma` feature) | OK (unchanged) | OK | OK | null | n/a (no RDMA path compiled) |
+| Existing RDMA client, single rail / single NIC | OK (tag 15 reused as-is) | OK | OK | extended (endpoint list of 1) | pass-through (byte-exact) |
+| Multi-rail client, single NIC configured | OK | OK | OK | extended | pass-through (1 rail) |
+| Multi-rail client, N rails / N NICs | OK (no new wire tags) | OK | OK | extended (`CS_RAIL_*`) | new capability |
+| Old server + new multi-rail client | OK (client requests the same tag-15 GET) | OK | OK | extended | degraded to 1 rail if the server advertises one endpoint |
+| New server + old client | OK (server multi-listens; old client uses one listener) | OK | OK | OK | n/a (client has no multi-rail layer) |
+
+**Upgrade path**: no data migration and no protocol version bump. Multi-rail
+is a *client-side* capability layered on the existing tag-15 stripe-subset GET;
+the server only needs to listen on more than one RDMA device
+(`CS_RDMA_DEVICES=dev0:...,dev1:...`), which it already supports. Rolling
+back = configure a single rail (or drop the `rdma` feature) — the read path is
+then byte-identical to today's.
 
 ## 10. Observability and bottleneck attribution
 
@@ -231,10 +291,15 @@ units.
 
 Upstream e2e (`make e2e`) remains green — no upstream interface was modified.
 
-## 12. Performance evidence (capacity model, labelled)
+## 12. Performance evidence (labelled)
 
-`cs-mock-bench`, measured on WSL2: 64 MiB object, 4 MiB chunks, 16 stripes,
-125 MB/s per rail:
+Three layers of evidence, each labelled with its environment. Together they
+cover contest deliverable e (throughput, read time, extension trend, CPU /
+memory / registered memory / inflight bytes) and f (bottleneck attribution).
+
+### 12.1 Capacity model (`cs-mock-bench`, Mock, WSL2)
+
+64 MiB object, 4 MiB chunks, 16 stripes, 125 MB/s per rail:
 
 ```
 rails  agg_MB/s  bal_MB/s  theo_MB/s  speedup  bottleneck
@@ -250,6 +315,121 @@ once the NIC cap is lifted, the classifier already flags the next ceiling —
 client-side checksum CPU — which motivates the xxh3 alignment (done) and any
 future SIMD/parallel verify.
 
+### 12.2 End-to-end single- vs dual-rail (Soft-RoCE, real verbs, WSL2)
+
+`examples/softroce_dual_rail`, real xxh3-64 per-stripe verification plus byte
+equality on every run:
+
+```
+object   single-rail      dual-rail        speedup  verify
+64 MiB   73.8 MB/s        217.6 MB/s       2.95x    ok
+128 MiB  93.3 MB/s        384.1 MB/s       4.11x    ok
+```
+
+Single runs; run-to-run variance on WSL2 is noticeable (single-rail 64 MiB
+measured 73.8–110.1 MB/s across runs), so treat the speedup as indicative.
+
+### 12.3 Concurrency and resource overhead sweep (`softroce_concurrency`)
+
+Same object, same stripe layout, same server and client process across rows;
+the sweep varies concurrency (independent workers, each with its own rails)
+and reports aggregate goodput, read latency percentiles, and process resources.
+
+Method note: `CS_ITERS=2` timed iterations per (size, mode, concurrency);
+latency percentiles are computed over all worker iterations. The first read
+of a fresh rail pays RDMA-CM connect + first-WR cost, which at small object
+sizes dominates the p50 (the single-rail 32 MiB row is the clearest case:
+296 ms p50 against 118 ms once concurrency hides it). Absolute throughput on
+Soft-RoCE is CPU-bound and run-to-run noisy; the trends and the resource
+accounting are the stable signals.
+
+**Sweep 1 — object size × concurrency (32–256 MiB), all points `verify_ok`**
+
+```
+size   mode    conc  agg_MB/s  p50_ms   p95_ms   RSS_MiB  reg_MiB  infl_MiB  verify
+32MiB  single  1      128.4     296.27   296.27      70       32       32     true
+32MiB  dual    1      197.1     216.86   216.86      70       64       32     true
+32MiB  single  2      489.8     118.06   135.88      70       64       64     true
+32MiB  dual    2      490.0     118.21   134.82      70      128       64     true
+64MiB  single  1      121.8     657.17   657.17     134       64       64     true
+64MiB  dual    1      339.9     213.39   213.39     134      128       64     true
+64MiB  single  2      498.6     235.07   325.97     134      128      128     true
+64MiB  dual    2      492.9     236.35   267.82     134      256      128     true
+128MiB single  1      111.1    1365.93  1365.93     262      128      128     true
+128MiB dual    1      411.3     305.64   305.64     262      256      128     true
+128MiB single  2      495.9     473.96   650.21     262      256      256     true
+128MiB dual    2      495.2     471.93   534.02     262      512      256     true
+256MiB single  1      116.0    2485.63  2485.63     518      256      256     true
+256MiB dual    1      171.3    1617.36  1617.36     518      512      256     true
+256MiB single  2      133.3    3723.68  3905.96     518      512      512     true
+256MiB dual    2      138.1    3889.50  3940.31     518     1024      512     true
+```
+
+**Sweep 2 — large objects (512 MiB / 1024 MiB), all points `verify_ok`**
+
+```
+size    mode    conc  agg_MB/s  p50_ms     RSS_MiB  reg_MiB  infl_MiB  verify
+512MiB  single  1      101.3     5550.93    1030      512      512     true
+512MiB  dual    1      112.1     4558.36    1030     1024      512     true
+1024MiB single  1       92.6    12551.71    2054     1024     1024     true
+1024MiB dual    1      112.5     9004.30    2054     2048     1024     true
+```
+
+**Dual-rail speedup vs object size (conc = 1)**
+
+```
+size_MiB  single_MB/s  dual_MB/s  speedup
+      32       128.4       197.1    1.54x
+      64       121.8       339.9    2.79x
+     128       111.1       411.3    3.70x   <- peak
+     256       116.0       171.3    1.48x
+     512       101.3       112.1    1.11x
+    1024        92.6       112.5    1.22x
+```
+
+**Concurrency scaling (aggregate goodput, 1 -> 2 workers)**
+
+```
+size   mode    1->2 workers
+32MiB  single  3.82x      dual  2.49x
+64MiB  single  4.09x      dual  1.45x
+128MiB single  4.46x      dual  1.20x
+256MiB single  1.15x      dual  0.81x   <- regression
+```
+
+Reading the sweep (the honest version):
+
+1. **Multi-rail pays off in the 64–128 MiB band** (2.79x–3.70x). Below it the
+   per-read connect/first-WR cost dominates (32 MiB: 1.54x); above it the
+   single-rail path is no longer the binding constraint.
+2. **Speedup decays hard past 256 MiB and absolute goodput falls to ~112 MB/s
+   at 512–1024 MiB.** On Soft-RoCE every rail is emulated in the host CPU, so a
+   large object means long chains of 4 MiB WRITEs serialized through one QP per
+   rail; the CPU, not the NIC, is the ceiling, and a second rail competes for
+   the same CPU (1.11x–1.22x). This is exactly the "single QP / shared CPU"
+   behavior the design documents as the expected boundary; it is NOT a defect
+   in the scheduling logic.
+3. **Concurrency helps single-rail more than dual-rail** in the sweet spot
+   (single 3.82x–4.46x vs dual 1.20x–2.49x): with two rails already using both
+   RXE devices and the host CPU, extra workers add contention. At 256 MiB,
+   dual concurrency 1->2 reverses to 0.81x — the point where more parallelism
+   buys nothing and costs scheduling overhead. This is the kind of ceiling the
+   contest asks to surface, and it is why the read path exposes an inflight
+   budget (`ReadOptions::max_inflight_bytes`) rather than accepting unbounded
+   concurrency.
+4. **Resources are predictable and bounded.** RSS tracks the live destination
+   buffers (e.g. 262 MiB at 128 MiB, 2054 MiB at 1024 MiB); registered memory
+   is `object_size × workers × rails` by construction; inflight bytes is
+   `object_size × workers`. None of these grow without bound — the backpressure
+   guard is what keeps them honest.
+
+**Variance caveat.** Soft-RoCE shares the host CPU across all rails and
+workers, so the sweep characterizes scheduling, concurrency behavior and
+software overhead — resource bounds and backpressure included — rather than
+physical NIC aggregate bandwidth. Absolute numbers will differ on real
+hardware; the *relative* trends and the resource accounting are what the
+design controls.
+
 **Environment honesty.** Functional validation uses the Mock transport and
 Soft-RoCE (RXE) on WSL2. These prove functionality, failure semantics,
 scheduling and resource governance. They do NOT prove hardware aggregate
@@ -261,8 +441,10 @@ NICs. Every number is labelled with its environment. No GPU is involved.
 | Limitation | Impact | Mitigation / plan |
 |---|---|---|
 | No physical multi-NIC testbed | Hardware aggregate bandwidth unproven | Labelled Soft-RoCE evidence; design keeps NIC count a config knob |
+| **Topology analysis (NUMA / PCIe) not measurable here** | Contest deliverable f asks for NUMA/PCIe affinity; Soft-RoCE on WSL2 has no PCIe path and presents a single NUMA node, so those axes cannot be measured meaningfully | Documented explicitly: NUMA/PCIe attribution is deferred to a physical-NIC environment. The client already exposes per-rail timing, which is the input such an analysis needs; only the environment is missing. |
 | v1 has no in-request retry | A rail failure fails the whole read | Documented semantics; retry is additive later |
 | Round-robin ignores transient rail load | Skewed rails can straggle | `locality` hook + least-loaded scheduler planned |
+| Address-keyed MR caching is unsound as a default | Reusing a freed-then-reallocated buffer silently reads zeros (§8.1) | Default path registers per read; pooled path is explicit + `invalidate_mr_cache`; guarded by `multi_rail_mr_lifetime` |
 | Checksum verification is single-threaded client CPU | Becomes the next bottleneck at ≥2 rails (measured) | xxh3 aligned with server; parallel/SIMD verify is future work |
 | RXE GID index varies by setup | Wrong index = connect failure | `CS_RAIL_GID` knob; `show_gids` documented |
 | Rails are configured, not yet independently start/stop-able at runtime | Rail lifecycle ops limited | Rail state machine (available/down/draining) planned |
