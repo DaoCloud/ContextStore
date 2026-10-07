@@ -32,7 +32,7 @@
 
 use anyhow::{anyhow, ensure, Result};
 use contextstore_client_rs::multi_rail::{stripe_checksum, RailManager, RailReader, RailReadStats};
-use contextstore_client_rs::rdma::RdmaClient;
+use contextstore_client_rs::rdma::{RdmaClient, RdmaClientConfig};
 use contextstore_client_rs::KvClient;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -109,6 +109,10 @@ async fn main() -> Result<()> {
         "[setup] descriptor: size={} stripes={} chunk={} generation={} layout_v={}",
         desc.size, desc.stripe_count, desc.chunk_size, desc.object_generation, desc.layout_version
     );
+    println!(
+        "[setup] descriptor: object_handle={:?} content_etag={:?}",
+        desc.object_handle, desc.content_etag
+    );
     ensure!(
         desc.is_striped && desc.stripe_count >= 2,
         "object is not striped (stripe_count={}); multi-rail needs >= 2 stripes",
@@ -129,14 +133,22 @@ async fn main() -> Result<()> {
     let build_rails = |n: usize| -> Vec<Box<dyn RailReader>> {
         (0..n)
             .map(|i| {
-                Box::new(
-                    RdmaClient::new(endpoints[i].clone(), devices[i].clone()).with_gid_index(gid),
-                ) as Box<dyn RailReader>
+                let config =
+                    RdmaClientConfig::new(endpoints[i].clone(), devices[i].clone())
+                        .with_gid_index(gid);
+                let client = RdmaClient::connect(config).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to connect RDMA rail {} ({}): {e:#}",
+                        devices[i], endpoints[i]
+                    )
+                });
+                Box::new(client) as Box<dyn RailReader>
             })
             .collect()
     };
 
-    // 5. Single-rail baseline (rxe0 only).
+    // 5. Single-rail baseline (rxe0 only). Real xxh3-64 per-stripe
+    // verification is on; a mismatch surfaces as a byte-level diff below.
     let mut buf1 = vec![0u8; desc.size as usize];
     let stats1 = {
         let mut mgr = RailManager::new(build_rails(1));
@@ -145,13 +157,29 @@ async fn main() -> Result<()> {
         mgr.reclaim(reader);
         s
     };
-    ensure!(
-        buf1 == data,
-        "single-rail read content mismatch (corruption detected)"
-    );
     print_stats("single-rail", &stats1);
+    if buf1 != data {
+        let chunk = desc.chunk_size as usize;
+        let mut bad = Vec::new();
+        for i in 0..desc.stripe_count as usize {
+            let start = i * chunk;
+            let end = ((i + 1) * chunk).min(data.len());
+            if buf1[start..end] != data[start..end] {
+                let all_zero = buf1[start..end].iter().all(|&b| b == 0);
+                bad.push(format!("stripe {i} (all_zero={all_zero})"));
+            }
+        }
+        ensure!(
+            false,
+            "single-rail read content mismatch: {} of {} stripes wrong -> {:?}",
+            bad.len(),
+            desc.stripe_count,
+            bad
+        );
+    }
 
-    // 6. Multi-rail read across all configured rails.
+    // 6. Multi-rail read across all configured rails, with the same real
+    // per-stripe verification as the baseline.
     let n_rails = endpoints.len();
     let mut buf2 = vec![0u8; desc.size as usize];
     let stats2 = {
@@ -166,11 +194,28 @@ async fn main() -> Result<()> {
         mgr.reclaim(reader);
         s
     };
-    ensure!(
-        buf2 == data,
-        "multi-rail read content mismatch (corruption detected)"
-    );
     print_stats("dual-rail", &stats2);
+    if buf2 != data {
+        let chunk = desc.chunk_size as usize;
+        let mut bad = Vec::new();
+        for i in 0..desc.stripe_count as usize {
+            let start = i * chunk;
+            let end = ((i + 1) * chunk).min(data.len());
+            if buf2[start..end] != data[start..end] {
+                let all_zero = buf2[start..end].iter().all(|&b| b == 0);
+                // Which rail owns this stripe under round-robin scheduling.
+                let owner = i % n_rails;
+                bad.push(format!("stripe {i} (rail{owner}, all_zero={all_zero})"));
+            }
+        }
+        ensure!(
+            false,
+            "dual-rail read content mismatch: {} of {} stripes wrong -> {:?}",
+            bad.len(),
+            desc.stripe_count,
+            bad
+        );
+    }
 
     // 7. Verdict.
     let speedup = stats1.object_ms / stats2.object_ms.max(1e-9);

@@ -144,6 +144,16 @@ impl BufferView {
         self.rkey
     }
 
+    /// Length of the registered region in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the registered region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     fn destination(&self, offset: usize) -> Result<(u64, u32, usize)> {
         let available = self
             .len
@@ -1274,7 +1284,43 @@ impl RailReader for RdmaClient {
         stripes: &[u32],
         segments: &[(u64, u32, u64)],
     ) -> Result<usize> {
-        self.get_descriptor_stripes_sge(descriptor, stripes, segments)
+        // Translate the trait's per-stripe segments (segments[k] is the
+        // destination of stripes[k] at its natural object offset) into the
+        // tag-15 wire contract: the server maps each stripe's object offset
+        // onto the segment table as *contiguous object-space coverage from
+        // byte 0* (see map_range_to_segments). Forwarding the sparse subset
+        // directly would shift every write to a wrong offset, so advertise
+        // one segment spanning the whole object window of this registration.
+        if stripes.is_empty() {
+            return Ok(0);
+        }
+        if stripes.len() != segments.len() {
+            return Err(anyhow!(
+                "read_stripes expects one segment per stripe ({} stripes, {} segments)",
+                stripes.len(),
+                segments.len()
+            ));
+        }
+        let chunk = descriptor.chunk_size as u64;
+        let (first_addr, rkey, _) = segments[0];
+        let window_base = first_addr
+            .checked_sub(stripes[0] as u64 * chunk)
+            .ok_or_else(|| anyhow!("stripe segment address underflows object window"))?;
+        // Every segment must resolve to the same window base, i.e. all of
+        // them point into one registration at natural object offsets.
+        for (k, &si) in stripes.iter().enumerate() {
+            let expected = window_base + si as u64 * chunk;
+            if segments[k].0 != expected {
+                return Err(anyhow!(
+                    "read_stripes requires segments at natural object offsets: \
+                     stripe {si} segment addr {:#x} != expected {:#x}",
+                    segments[k].0,
+                    expected
+                ));
+            }
+        }
+        let window = [(window_base, rkey, descriptor.size)];
+        self.get_descriptor_stripes_sge(descriptor, stripes, &window)
             .map(|r| r.unwrap_or(0))
     }
 }
@@ -1318,7 +1364,7 @@ mod tests {
     fn request_rejects_oversized_wire_string() {
         let key = "x".repeat(u16::MAX as usize + 1);
         assert!(build_get_request(&key, 1, 2, 3).is_err());
-        assert!(build_put_request(MSG_PUT_REQ, &key, 3).is_err());
+        assert!(build_put_request(MSG_PUT_REQ, &key, 3, 0).is_err());
     }
 
     #[test]

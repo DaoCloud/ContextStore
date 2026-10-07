@@ -293,7 +293,21 @@ fn aggregate(
         ));
     }
     if per_rail.iter().any(|p| !p.outcome.ok) {
-        return Err(anyhow!("one or more rails failed during multi-rail read"));
+        let details: Vec<String> = per_rail
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.outcome.ok)
+            .map(|(i, p)| {
+                format!(
+                    "rail {i}: {}",
+                    p.outcome.error.as_deref().unwrap_or("unknown error")
+                )
+            })
+            .collect();
+        return Err(anyhow!(
+            "one or more rails failed during multi-rail read: {}",
+            details.join("; ")
+        ));
     }
     Ok(stats)
 }
