@@ -1,0 +1,61 @@
+# ContextStore KV Service — WSL2 Soft-RoCE dual-rail demo config
+#
+# Purpose: end-to-end multi-rail read validation on a single WSL2 machine.
+#   - gRPC control plane on :50051
+#   - RDMA control channels on :50053 (rxe0) / :50054 (rxe1), started via
+#     CS_RDMA_DEVICES=rxe0:0.0.0.0:50053:1,rxe1:0.0.0.0:50054:1
+#   - local directories stand in for NVMe devices (functional demo only;
+#     no hardware-bandwidth claims)
+#   - striping threshold lowered to 4 MiB so the 64 MiB demo object is
+#     actually striped (16 stripes x 4 MiB); the production default
+#     (256 MiB threshold) would store it as a single blob.
+
+[api]
+listen = "0.0.0.0:50051"
+max_connections = 2000
+
+[storage]
+devices = [
+    "/tmp/cs-data/dev0",
+    "/tmp/cs-data/dev1",
+]
+data_subdir = "contextstore"
+striping_threshold = 4194304      # 4 MiB: demo objects get striped
+striping_chunk_size = 4194304     # 4 MiB stripes -> 64 MiB object = 16 stripes
+rdma_stream_chunk_size = 4194304
+verify_stripe_checksums = false
+
+[memory_tier]
+capacity_mb = 256
+slab_size_mb = 64
+use_pinned_memory = false
+
+[io_executor]
+# tier_b (io_uring + O_DIRECT) is required: the stripe-subset RDMA read path
+# uses read_aligned_into_ptr_batch, which only tier_b implements. tier_a
+# (ThreadPool + POSIX) fails with "not implemented by this executor".
+kind = "tier_b"
+thread_pool_size = 16
+io_uring_depth = 256
+
+[router]
+strategy = "object_hash"
+
+[metadata]
+redis_url = "redis://127.0.0.1:6379/"
+redis_key_prefix = "contextstore:metadata:"
+redis_connect_timeout_ms = 1000
+redis_command_timeout_ms = 1000
+
+[gc]
+# Disabled for the demo (no generation churn), but all fields are required
+# by the config parser.
+enabled = false
+interval_seconds = 300
+grace_seconds = 600
+max_tasks_per_run = 1000
+task_lease_seconds = 300
+
+[metrics]
+enabled = false
+listen = "0.0.0.0:9090"

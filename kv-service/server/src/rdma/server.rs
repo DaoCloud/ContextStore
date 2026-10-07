@@ -1181,16 +1181,24 @@ fn serve_get_stripes(
             tracing::warn!("stripe-subset GET: index {} out of range", idx);
             return Ok((false, 0, 0));
         }
-        let end = (idx as u64) * chunk_size
-            + chunk_size.min(striping.total_size - (idx as u64) * chunk_size);
-        if end > req.max_size {
-            tracing::warn!(
-                "stripe-subset GET: stripe {} ends at {} beyond client window {}",
-                idx,
-                end,
-                req.max_size
-            );
-            return Ok((false, 0, 0));
+        // The contiguous-window check only applies to the tag-12 layout, where
+        // every stripe lands at dst_addr + object_offset and max_size spans the
+        // whole object window. Tag-15 (SGE) supplies per-stripe segments whose
+        // combined length covers only this rail's subset, so object-space ends
+        // routinely exceed max_size; bounds are instead enforced per stripe by
+        // map_range_to_segments below.
+        if req.dst_segments.is_empty() {
+            let end = (idx as u64) * chunk_size
+                + chunk_size.min(striping.total_size - (idx as u64) * chunk_size);
+            if end > req.max_size {
+                tracing::warn!(
+                    "stripe-subset GET: stripe {} ends at {} beyond client window {}",
+                    idx,
+                    end,
+                    req.max_size
+                );
+                return Ok((false, 0, 0));
+            }
         }
         if locations_are_complete && !chunk_is_local(kv_ctx, &striping.chunk_locations[idx]) {
             tracing::warn!(

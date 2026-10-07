@@ -10,6 +10,7 @@
 //! `RegisteredBuffer` carries the borrow of the caller's buffer, so the memory
 //! cannot be released while its memory region is registered with the NIC.
 
+use crate::multi_rail::{RailReader, RailRegistration};
 use crate::pb;
 use anyhow::{anyhow, Context, Result};
 use rdma_sys::*;
@@ -96,6 +97,8 @@ pub struct RdmaClient {
     resources: Arc<RdmaResources>,
     qp: NonNull<ibv_qp>,
     stream: TcpStream,
+    /// Stable rail identifier (RDMA device name), surfaced to the multi-rail layer.
+    rail_id: String,
     /// Cached memory registrations keyed by (base pointer, length).
     ///
     /// `ibv_reg_mr` costs ~1.5 ms per 56 MB region; callers that reuse the
@@ -105,10 +108,29 @@ pub struct RdmaClient {
     /// `Arc<RdmaResources>`), and the cache is bounded — inserting beyond
     /// the cap evicts the oldest entry.
     ///
-    /// SAFETY contract with callers of [`Self::register_raw_buffer_cached`]:
-    /// the memory behind a cached registration must stay valid for the whole
-    /// lifetime of this client (buffer pools that never free satisfy this).
+    /// # Safety contract (opt-in, pooled callers only)
+    /// The cache is keyed by *virtual address* and therefore CANNOT detect a
+    /// buffer that was freed and then reallocated at the same address: the
+    /// stale MR would keep pinning the old physical pages while the CPU sees
+    /// the new mapping, so NIC writes silently land where the caller never
+    /// reads them. It is only sound when the memory behind a cached
+    /// registration stays valid, at the same address, for the whole lifetime
+    /// of this client (long-lived buffer pools satisfy this; per-read `Vec`s
+    /// do NOT). Because that contract cannot be checked at runtime, the
+    /// default data path ([`RailReader::register`]) never uses this cache —
+    /// only [`Self::register_raw_buffer_pooled`] does, and callers that
+    /// recycle buffers must call [`Self::invalidate_mr_cache`] first.
     mr_cache: Vec<((usize, usize), RegisteredBuffer<'static>)>,
+    /// Registration of the destination buffer for the read currently in
+    /// flight on this rail (the last [`RailReader::register`] call).
+    ///
+    /// The multi-rail reader's contract is "register once, then
+    /// `read_stripes`, then next read"; the MR must stay alive across those
+    /// two trait calls, but `RailRegistration` is a `Copy` value that carries
+    /// no ownership. Holding the owning `RegisteredBuffer` here gives the MR
+    /// exactly that lifetime: it is dropped (deregistered) when the next
+    /// `register` replaces it, or when the client is dropped.
+    in_flight_mr: Option<RegisteredBuffer<'static>>,
 }
 
 // SAFETY: A client is exclusively accessed through `&mut self`; libibverbs
@@ -121,7 +143,7 @@ unsafe impl Send for RdmaClient {}
 /// The buffer must remain registered for the full RDMA operation. The lifetime
 /// parameter and the private marker enforce that requirement for the safe API.
 /// A `Copy` view of a cached registration: destination address, rkey, and
-/// length. Produced by [`RdmaClient::register_raw_buffer_cached`]; the backing
+/// length. Produced by [`RdmaClient::register_raw_buffer_pooled`]; the backing
 /// MR stays alive inside the client's cache.
 #[derive(Clone, Copy)]
 pub struct BufferView {
@@ -139,6 +161,16 @@ impl BufferView {
     /// Remote key of the registration.
     pub fn rkey(&self) -> u32 {
         self.rkey
+    }
+
+    /// Length of the registered region in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the registered region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     fn destination(&self, offset: usize) -> Result<(u64, u32, usize)> {
@@ -320,7 +352,9 @@ impl RdmaClient {
                 resources,
                 qp,
                 stream,
+                rail_id: config.device.clone(),
                 mr_cache: Vec::new(),
+                in_flight_mr: None,
             }),
             Err(error) => {
                 unsafe { ibv_destroy_qp(qp.as_ptr()) };
@@ -332,16 +366,28 @@ impl RdmaClient {
     /// Like [`Self::register_raw_buffer`], but caches the registration inside
     /// this client keyed by `(ptr, len)` and returns a `Copy` view of it:
     /// repeated calls with the same region skip `ibv_reg_mr` (~1.5 ms per
-    /// 56 MB). Intended for pooled staging buffers reused across many
-    /// operations on a pooled client.
+    /// 56 MB).
+    ///
+    /// # When to use this
+    /// Only for **long-lived buffer pools** whose memory stays mapped at the
+    /// same address for the entire lifetime of this client. Do NOT point it
+    /// at a fresh `Vec` per read: after the `Vec` is freed, the allocator may
+    /// hand the same virtual address to a later allocation, the cache would
+    /// hit on the stale key, and the NIC would write to the *old* physical
+    /// pages — silently returning zeros to the caller. This is a correctness
+    /// (memory-safety) hazard, not a performance trade-off.
+    ///
+    /// If you recycle buffers at the same address, call
+    /// [`Self::invalidate_mr_cache`] before reusing them.
     ///
     /// # Safety
     /// In addition to [`Self::register_raw_buffer`]'s requirements, the
-    /// memory must remain valid for the entire lifetime of this client —
-    /// the registration is only released when the client is dropped (or when
-    /// evicted after `MR_CACHE_CAP` other regions have been registered; the
-    /// caller must not use a view older than 16 distinct registrations).
-    pub unsafe fn register_raw_buffer_cached(
+    /// memory must remain valid *and stay at the same address* for the entire
+    /// lifetime of this client. The registration is only released when the
+    /// client is dropped (or when evicted after `MR_CACHE_CAP` other regions
+    /// have been registered; the caller must not use a view older than 16
+    /// distinct registrations).
+    pub unsafe fn register_raw_buffer_pooled(
         &mut self,
         ptr: *mut u8,
         len: usize,
@@ -358,6 +404,15 @@ impl RdmaClient {
         }
         self.mr_cache.push((key, registered));
         Ok(view)
+    }
+
+    /// Drop every cached registration. Call this before recycling a pooled
+    /// buffer at an address the cache may already hold, so the next pooled
+    /// registration re-pins the current physical pages instead of reusing a
+    /// stale MR. Cheap when the cache is empty; otherwise one `ibv_dereg_mr`
+    /// per entry.
+    pub fn invalidate_mr_cache(&mut self) {
+        self.mr_cache.clear();
     }
 
     /// Register a mutable host buffer for use as an RDMA read target or write
@@ -499,7 +554,7 @@ impl RdmaClient {
     }
 
     /// [`Self::get_descriptor_stripes_into`] for a cached [`BufferView`]
-    /// (see [`Self::register_raw_buffer_cached`]). Splitting the borrow this
+    /// (see [`Self::register_raw_buffer_pooled`]). Splitting the borrow this
     /// way lets the view be produced by `&mut self` and then used by another
     /// `&mut self` call without conflicting borrows.
     pub fn get_descriptor_stripes_into_view(
@@ -1249,6 +1304,79 @@ fn poll_completion(cq: NonNull<ibv_cq>) -> Result<()> {
     }
 }
 
+#[cfg(feature = "rdma")]
+impl RailReader for RdmaClient {
+    fn rail_id(&self) -> String {
+        self.rail_id.clone()
+    }
+
+    unsafe fn register(&mut self, base: *mut u8, len: usize) -> Result<RailRegistration> {
+        // The default data path never uses the `(ptr, len)` MR cache: that
+        // cache cannot tell "same buffer reused" from "old buffer freed and a
+        // new one landed at the same address", and mistaking the two makes
+        // RDMA WRITEs land in pages the caller never reads (silent zeros).
+        // Register afresh for each read and keep the MR alive across the
+        // following `read_stripes` call via `in_flight_mr`.
+        let registered = unsafe { self.register_raw_buffer(base, len)? };
+        let view = registered.view();
+        // Replacing the previous in-flight MR deregisters it (Drop), which is
+        // exactly the "previous read has completed" boundary the trait
+        // contract assumes.
+        self.in_flight_mr = Some(registered);
+        Ok(RailRegistration {
+            addr: view.addr(),
+            rkey: view.rkey(),
+            len: view.len(),
+        })
+    }
+
+    fn read_stripes(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        segments: &[(u64, u32, u64)],
+    ) -> Result<usize> {
+        // Translate the trait's per-stripe segments (segments[k] is the
+        // destination of stripes[k] at its natural object offset) into the
+        // tag-15 wire contract: the server maps each stripe's object offset
+        // onto the segment table as *contiguous object-space coverage from
+        // byte 0* (see map_range_to_segments). Forwarding the sparse subset
+        // directly would shift every write to a wrong offset, so advertise
+        // one segment spanning the whole object window of this registration.
+        if stripes.is_empty() {
+            return Ok(0);
+        }
+        if stripes.len() != segments.len() {
+            return Err(anyhow!(
+                "read_stripes expects one segment per stripe ({} stripes, {} segments)",
+                stripes.len(),
+                segments.len()
+            ));
+        }
+        let chunk = descriptor.chunk_size as u64;
+        let (first_addr, rkey, _) = segments[0];
+        let window_base = first_addr
+            .checked_sub(stripes[0] as u64 * chunk)
+            .ok_or_else(|| anyhow!("stripe segment address underflows object window"))?;
+        // Every segment must resolve to the same window base, i.e. all of
+        // them point into one registration at natural object offsets.
+        for (k, &si) in stripes.iter().enumerate() {
+            let expected = window_base + si as u64 * chunk;
+            if segments[k].0 != expected {
+                return Err(anyhow!(
+                    "read_stripes requires segments at natural object offsets: \
+                     stripe {si} segment addr {:#x} != expected {:#x}",
+                    segments[k].0,
+                    expected
+                ));
+            }
+        }
+        let window = [(window_base, rkey, descriptor.size)];
+        self.get_descriptor_stripes_sge(descriptor, stripes, &window)
+            .map(|r| r.unwrap_or(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,7 +1416,7 @@ mod tests {
     fn request_rejects_oversized_wire_string() {
         let key = "x".repeat(u16::MAX as usize + 1);
         assert!(build_get_request(&key, 1, 2, 3).is_err());
-        assert!(build_put_request(MSG_PUT_REQ, &key, 3).is_err());
+        assert!(build_put_request(MSG_PUT_REQ, &key, 3, 0).is_err());
     }
 
     #[test]

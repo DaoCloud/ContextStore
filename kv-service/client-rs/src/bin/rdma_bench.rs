@@ -920,6 +920,10 @@ mod tests {
             buf_mb: 512,
             iters: 5,
             clear_buffer: false,
+            mode: "get".to_string(),
+            put_mb: 480,
+            ttl_seconds: 0,
+            sge_segments: 0,
         };
         assert_eq!(
             resolve_object_key(&args).unwrap(),

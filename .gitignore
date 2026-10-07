@@ -46,6 +46,8 @@ src/contextstore/kvservice_client/_pb/*.pyi
 *.swp
 *.swo
 *~
+.workbuddy/
+.codegraph/
 
 # Data & logs
 /tmp/

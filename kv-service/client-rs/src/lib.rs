@@ -19,6 +19,14 @@ pub mod pb {
 #[cfg(feature = "rdma")]
 pub mod rdma;
 
+/// Multi-rail parallel read layer (transport-agnostic). Always available so it
+/// can be exercised on machines without RDMA hardware via the Mock transport.
+pub mod multi_rail;
+
+/// Mock transport implementing [`multi_rail::RailReader`] for hardware-free
+/// functional / fault-injection testing.
+pub mod mock_rail;
+
 use pb::kv_service_client::KvServiceClient;
 use prost::bytes::Bytes;
 use tonic::transport::Channel;

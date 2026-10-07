@@ -14,6 +14,18 @@ name = "cs-rdma-bench"
 path = "src/bin/rdma_bench.rs"
 required-features = ["rdma"]
 
+[[bin]]
+name = "cs-mock-bench"
+path = "src/bin/cs_mock_bench.rs"
+
+[[example]]
+name = "softroce_dual_rail"
+required-features = ["rdma"]
+
+[[example]]
+name = "softroce_concurrency"
+required-features = ["rdma"]
+
 [dependencies]
 # gRPC (versions aligned with the server)
 tonic = "0.11"
@@ -25,14 +37,27 @@ futures = "0.3"
 # CLI / timing
 clap = { version = "4", features = ["derive"] }
 
+# Stripe checksums: same xxh3-64 the server uses (storage_tier.rs
+# `format!("{:016x}", twox_hash::xxh3::hash64(data))`), so the client's
+# consistency layer verifies against the server's `chunk_checksums` exactly.
+twox-hash = "1.6"
+
+# Build robustness: force indexmap 1.x's `std` feature. Its build script
+# otherwise probes for libstd with autocfg, which mis-detects on some Windows
+# toolchain layouts and breaks `tower` 0.4's `IndexMap<K, V>` (E0107). Enabling
+# the feature makes the build script skip the probe (no-op on Linux/macOS).
+indexmap = { version = "1", features = ["std"] }
+
 # RDMA (enabled by the `rdma` feature)
 rdma-sys = { version = "0.3", optional = true }
-anyhow = { version = "1", optional = true }
+# `anyhow` is always available: the multi-rail / Mock layer (which runs without
+# RDMA hardware) uses it for error handling.
+anyhow = "1"
 libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-rdma = ["dep:rdma-sys", "dep:anyhow", "dep:libc"]
+rdma = ["dep:rdma-sys", "dep:libc"]
 
 [build-dependencies]
 tonic-build = "0.11"
