@@ -90,6 +90,43 @@ Modules (all in `kv-service/client-rs`):
 | `examples/softroce_dual_rail.rs` | Soft-RoCE end-to-end: PUT → lookup → single- vs dual-rail read → verification + speedup report |
 | `kv-service/configs/server-wsl2-softroce.toml` | Single-machine demo config (4 MiB striping threshold so demo objects actually stripe) |
 
+### 4.1 Path model
+
+A **rail** is the tuple
+`(rail_id, local RDMA device + port + GID, remote endpoint, QP/CQ, PD + MRs)`:
+
+- The *remote endpoint* is one of the server's per-NIC RDMA control listeners
+  (`CS_RDMA_DEVICES=dev:host:port[:gid],...`), so each rail terminates on a
+  distinct server-side NIC/QP group.
+- The *local device* is the client NIC whose fabric path reaches that
+  endpoint. In the single-machine Soft-RoCE demo both sides share the rxe
+  pair (client rxe0 ↔ server rxe0, rxe1 ↔ rxe1 over two veth subnets); in a
+  multi-NIC deployment the operator pairs each server listener with the
+  client NIC on the same subnet.
+- **Discovery v1 is static config**: rails are assembled from explicit
+  endpoint+device pairs (`CS_RAIL_ENDPOINTS` / `CS_RAIL_DEVICES` in the
+  example). Rails are individually identifiable (`rail_id`), individually
+  configurable, and individually fault-injectable (mock `MockFault` knobs).
+  Independent runtime start/stop and a `down`/`draining` state machine are
+  planned work (§13); the `RailReader` contract already isolates per-rail
+  state so this is additive.
+
+### 4.2 Connection and memory lifecycle
+
+- **QP/CQ**: each rail's QP is established against its endpoint on first use
+  and reused for the rail's lifetime. Completion is observed through the
+  existing `GET_RESP` TCP control signal — no new polling loops, no CQ
+  threading changes.
+- **Memory regions**: the destination buffer is registered per rail through
+  the cached-MR path at read start, pinned until join, and deregistered only
+  after every rail's completion has been accounted for.
+- **WR/CQE matching**: one striped GET (wire tag 15) per rail per object;
+  completions are matched to their request, and a completion arriving after
+  cancel is dropped by the epoch guard (§6).
+- **Buffer**: the caller's buffer is never treated as read output until
+  aggregation and verification succeed; on timeout it is provably untouched
+  (test 8 in §11).
+
 ## 5. Stripe→rail scheduling
 
 `plan_stripes(total_size, chunk_size, stripe_count, rail_count, locality)`:
