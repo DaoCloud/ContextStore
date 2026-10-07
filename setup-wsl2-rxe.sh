@@ -23,13 +23,20 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-echo "== [1/4] load the Soft-RoCE kernel module =="
-if ! modprobe rdma_rxe; then
-    echo "modprobe rdma_rxe failed: your WSL2 kernel lacks CONFIG_RDMA_RXE." >&2
+echo "== [1/4] ensure the Soft-RoCE (RXE) driver is available =="
+# CONFIG_RDMA_RXE=y builds RXE into the kernel; modprobe then reports
+# "not found" even though the driver is active. Probe functionally:
+# a built-in RXE can create (and delete) a link right away.
+if modprobe rdma_rxe 2>/dev/null; then
+    echo "    rdma_rxe module loaded"
+elif rdma link add rxe-probe type rxe netdev eth0 2>/dev/null; then
+    rdma link delete rxe-probe
+    echo "    rdma_rxe is built into the kernel (modprobe n/a) - OK"
+else
+    echo "RXE unavailable: your WSL2 kernel lacks CONFIG_RDMA_RXE." >&2
     echo "Build and switch kernels per wsl2-softroce-setup.md first." >&2
     exit 1
 fi
-echo "    rdma_rxe loaded"
 
 echo "== [2/4] create the veth pair (two independent L3 paths) =="
 # veth pair: veth0 <--> veth1, distinct addresses on a dedicated subnet,
