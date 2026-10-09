@@ -355,6 +355,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "twox-hash",
 ]
 
 [[package]]
@@ -362,6 +363,7 @@ name = "contextstore-rdma-ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "contextstore-client-rs",
  "libc",
  "rdma-sys",
 ]

@@ -16,7 +16,7 @@ use rdma_sys::*;
 use std::ffi::{c_void, CStr};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,6 +59,17 @@ pub struct RdmaClientConfig {
     pub port: u8,
     /// GID index used to construct the RoCE address handle.
     pub gid_index: u8,
+    /// Per-operation timeout applied to the TCP control channel. A blocked or
+    /// dead peer surfaces as an io error instead of an indefinite hang, which
+    /// is what lets multi-rail callers fail a rail safely.
+    pub io_timeout: Option<Duration>,
+    /// Bound on the TCP connect phase itself.
+    pub connect_timeout: Option<Duration>,
+    /// RC path MTU in bytes (512/1024/2048/4096). Must not exceed the network
+    /// MTU; jumbo-frame RoCE fabrics want 4096.
+    pub path_mtu: u16,
+    /// GRH hop limit. 1 fits same-subnet fabrics; routed RoCE needs more.
+    pub hop_limit: u8,
 }
 
 impl RdmaClientConfig {
@@ -69,6 +80,10 @@ impl RdmaClientConfig {
             device: device.into(),
             port: 1,
             gid_index: 3,
+            io_timeout: None,
+            connect_timeout: None,
+            path_mtu: 1024,
+            hop_limit: 1,
         }
     }
 
@@ -82,6 +97,114 @@ impl RdmaClientConfig {
     pub fn with_gid_index(mut self, gid_index: u8) -> Self {
         self.gid_index = gid_index;
         self
+    }
+
+    /// Set the per-operation TCP control-channel timeout.
+    pub fn with_io_timeout(mut self, timeout: Duration) -> Self {
+        self.io_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the TCP connect timeout.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the RC path MTU in bytes (rounded down to 512/1024/2048/4096).
+    pub fn with_path_mtu(mut self, bytes: u16) -> Self {
+        self.path_mtu = bytes;
+        self
+    }
+
+    /// Set the GRH hop limit (routed RoCE fabrics need more than 1).
+    pub fn with_hop_limit(mut self, hops: u8) -> Self {
+        self.hop_limit = hops;
+        self
+    }
+}
+
+/// Map a byte count onto the closest supported RC path MTU.
+fn path_mtu_enum(bytes: u16) -> ibv_mtu::Type {
+    match bytes {
+        0..=512 => ibv_mtu::IBV_MTU_512,
+        513..=1024 => ibv_mtu::IBV_MTU_1024,
+        1025..=2048 => ibv_mtu::IBV_MTU_2048,
+        _ => ibv_mtu::IBV_MTU_4096,
+    }
+}
+
+/// Outcome of a descriptor GET: how many bytes the server placed in the
+/// destination and how many stripes/chunks it served. `num_chunks` comes from
+/// the tag-3 response body and lets callers detect missing or duplicated
+/// stripes server-side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetOutcome {
+    pub bytes: usize,
+    pub num_chunks: u32,
+}
+
+/// Enumerate the verbs devices present on this host, by name.
+pub fn list_device_names() -> Vec<String> {
+    unsafe {
+        let mut count = 0i32;
+        let devices = ibv_get_device_list(&mut count);
+        if devices.is_null() {
+            return Vec::new();
+        }
+        let mut names = Vec::with_capacity(count.max(0) as usize);
+        for index in 0..count {
+            let device = *devices.offset(index as isize);
+            if device.is_null() {
+                continue;
+            }
+            names.push(
+                CStr::from_ptr(ibv_get_device_name(device))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        ibv_free_device_list(devices);
+        names
+    }
+}
+
+/// Read one GID of a device without keeping a context open. Used by callers
+/// that need the local address (e.g. for subnet-affinity rail selection).
+pub fn query_gid_raw(device: &str, port: u8, gid_index: u8) -> Option<[u8; 16]> {
+    unsafe {
+        let mut count = 0i32;
+        let devices = ibv_get_device_list(&mut count);
+        if devices.is_null() {
+            return None;
+        }
+        let mut selected = ptr::null_mut();
+        for index in 0..count {
+            let candidate = *devices.offset(index as isize);
+            if candidate.is_null() {
+                continue;
+            }
+            if CStr::from_ptr(ibv_get_device_name(candidate)).to_string_lossy() == device {
+                selected = candidate;
+                break;
+            }
+        }
+        if selected.is_null() {
+            ibv_free_device_list(devices);
+            return None;
+        }
+        let context = ibv_open_device(selected);
+        ibv_free_device_list(devices);
+        if context.is_null() {
+            return None;
+        }
+        let mut gid: ibv_gid = std::mem::zeroed();
+        let rc = ibv_query_gid(context, port, gid_index as i32, &mut gid);
+        ibv_close_device(context);
+        if rc != 0 {
+            return None;
+        }
+        Some(gid.raw)
     }
 }
 
@@ -296,13 +419,20 @@ impl RdmaClient {
         }
 
         let result = (|| -> Result<TcpStream> {
-            let mut stream = TcpStream::connect(&config.endpoint)
-                .with_context(|| format!("connect RDMA control endpoint {}", config.endpoint))?;
+            let mut stream = tcp_connect(&config)?;
             // 控制面小包必须即时发出: Nagle + delayed-ACK 在多连接并发时会给每个
             // 请求注入 ~40-200ms 延迟 (数据面 RDMA WRITE 不经 TCP, 不受影响).
             stream
                 .set_nodelay(true)
                 .context("set TCP_NODELAY on RDMA control stream")?;
+            if let Some(timeout) = config.io_timeout {
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .context("set RDMA control read timeout")?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .context("set RDMA control write timeout")?;
+            }
             let local = QpInfo {
                 qpn: unsafe { (*qp.as_ptr()).qp_num },
                 psn: random_psn(),
@@ -310,7 +440,14 @@ impl RdmaClient {
             };
             write_hello(&mut stream, local)?;
             let remote = read_hello(&mut stream)?;
-            transition_qp_to_rtr(qp, &remote, config.port, config.gid_index)?;
+            transition_qp_to_rtr(
+                qp,
+                &remote,
+                config.port,
+                config.gid_index,
+                config.path_mtu,
+                config.hop_limit,
+            )?;
             transition_qp_to_rts(qp, local.psn)?;
             Ok(stream)
         })();
@@ -509,6 +646,20 @@ impl RdmaClient {
         view: BufferView,
         offset: usize,
     ) -> Result<RdmaReadResult> {
+        self.get_descriptor_stripes_into_view_detailed(descriptor, stripes, view, offset)
+            .map(|outcome| outcome.map(|outcome| outcome.bytes))
+    }
+
+    /// Detailed variant of [`Self::get_descriptor_stripes_into_view`] that also
+    /// reports how many stripes the server actually served, enabling
+    /// missing/duplicate-stripe detection on the caller side.
+    pub fn get_descriptor_stripes_into_view_detailed(
+        &mut self,
+        descriptor: &pb::ObjectDescriptor,
+        stripes: &[u32],
+        view: BufferView,
+        offset: usize,
+    ) -> Result<Option<GetOutcome>> {
         let key = descriptor
             .key
             .as_ref()
@@ -532,7 +683,26 @@ impl RdmaClient {
         }
         self.stream.write_all(&request)?;
         self.stream.flush()?;
-        read_get_response(&mut self.stream)
+        read_get_response_detailed(&mut self.stream)
+    }
+
+    /// Drop every cached registration whose base pointer is `base`,
+    /// deregistering the memory regions. Returns how many bytes were
+    /// deregistered. Multi-rail callers use this to quiesce registrations of
+    /// a caller buffer synchronously before returning it.
+    pub fn evict_registrations_for(&mut self, base: usize) -> usize {
+        let before = self
+            .mr_cache
+            .iter()
+            .map(|((ptr, len), _)| if *ptr == base { *len } else { 0 })
+            .sum();
+        self.mr_cache.retain(|((ptr, _), _)| *ptr != base);
+        before
+    }
+
+    /// Total bytes currently pinned by cached registrations.
+    pub fn registered_cache_bytes(&self) -> usize {
+        self.mr_cache.iter().map(|((_, len), _)| *len).sum()
     }
 
     /// Stripe-subset GET with a scatter destination list (wire tag 15): the
@@ -916,6 +1086,22 @@ fn random_psn() -> u32 {
         & 0x00ff_ffff
 }
 
+fn tcp_connect(config: &RdmaClientConfig) -> Result<TcpStream> {
+    let mut addresses = config
+        .endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("resolve RDMA control endpoint {}", config.endpoint))?;
+    let address = addresses
+        .next()
+        .ok_or_else(|| anyhow!("RDMA endpoint resolved to no address: {}", config.endpoint))?;
+    match config.connect_timeout {
+        Some(timeout) => TcpStream::connect_timeout(&address, timeout)
+            .with_context(|| format!("connect RDMA control endpoint {address}")),
+        None => TcpStream::connect(address)
+            .with_context(|| format!("connect RDMA control endpoint {address}")),
+    }
+}
+
 fn create_qp(resources: &RdmaResources) -> Result<NonNull<ibv_qp>> {
     let mut attr = ibv_qp_init_attr {
         qp_context: ptr::null_mut(),
@@ -962,11 +1148,13 @@ fn transition_qp_to_rtr(
     remote: &QpInfo,
     port: u8,
     gid_index: u8,
+    path_mtu_bytes: u16,
+    hop_limit: u8,
 ) -> Result<()> {
     unsafe {
         let mut attr: ibv_qp_attr = std::mem::zeroed();
         attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
-        attr.path_mtu = ibv_mtu::IBV_MTU_1024;
+        attr.path_mtu = path_mtu_enum(path_mtu_bytes);
         attr.dest_qp_num = remote.qpn;
         attr.rq_psn = remote.psn;
         attr.max_dest_rd_atomic = 1;
@@ -974,7 +1162,7 @@ fn transition_qp_to_rtr(
         attr.ah_attr.is_global = 1;
         attr.ah_attr.port_num = port;
         attr.ah_attr.grh.dgid = remote.gid;
-        attr.ah_attr.grh.hop_limit = 1;
+        attr.ah_attr.grh.hop_limit = hop_limit;
         attr.ah_attr.grh.sgid_index = gid_index;
         let mask = ibv_qp_attr_mask::IBV_QP_STATE
             | ibv_qp_attr_mask::IBV_QP_AV
@@ -1137,6 +1325,10 @@ fn read_string(stream: &mut TcpStream, field: &str) -> Result<String> {
 }
 
 fn read_get_response(stream: &mut TcpStream) -> Result<RdmaReadResult> {
+    Ok(read_get_response_detailed(stream)?.map(|outcome| outcome.bytes))
+}
+
+fn read_get_response_detailed(stream: &mut TcpStream) -> Result<Option<GetOutcome>> {
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag)?;
     if tag[0] != MSG_GET_RESP {
@@ -1149,7 +1341,8 @@ fn read_get_response(stream: &mut TcpStream) -> Result<RdmaReadResult> {
     }
     let bytes = u64::from_le_bytes(body[1..9].try_into().expect("fixed get response length"));
     let bytes = usize::try_from(bytes).map_err(|_| anyhow!("RDMA read size exceeds usize"))?;
-    Ok(Some(bytes))
+    let num_chunks = u32::from_le_bytes(body[9..13].try_into().expect("fixed chunk count"));
+    Ok(Some(GetOutcome { bytes, num_chunks }))
 }
 
 struct PutReady {
@@ -1288,7 +1481,7 @@ mod tests {
     fn request_rejects_oversized_wire_string() {
         let key = "x".repeat(u16::MAX as usize + 1);
         assert!(build_get_request(&key, 1, 2, 3).is_err());
-        assert!(build_put_request(MSG_PUT_REQ, &key, 3).is_err());
+        assert!(build_put_request(MSG_PUT_REQ, &key, 3, 0).is_err());
     }
 
     #[test]

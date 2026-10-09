@@ -9,6 +9,11 @@
 //! - `metadata`    : Prefix Index + Block Allocator
 //! - `config`      : configuration loading
 
+// tonic-build's generated service stubs return Result<_, tonic::Status>;
+// newer clippy versions flag the Status size on that generated code. The
+// generated file is vendored from the proto, so silence the lint crate-wide.
+#![allow(clippy::result_large_err)]
+
 pub mod api;
 pub mod config;
 pub mod error;

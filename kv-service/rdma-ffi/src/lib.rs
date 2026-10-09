@@ -37,6 +37,8 @@
 //! void cs_rdma_client_free(void* client);
 //! ```
 
+pub mod multirail;
+
 use anyhow::{anyhow, Result};
 use rdma_sys::*;
 use std::ffi::{c_char, c_int, CStr};

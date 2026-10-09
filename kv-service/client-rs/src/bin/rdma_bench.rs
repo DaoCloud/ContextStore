@@ -161,7 +161,9 @@ fn main() -> Result<()> {
 /// WRITE + commit + striped O_DIRECT pwrite) instead of dedup-skipping.
 fn run_put(args: &Args) -> Result<()> {
     if args.coordinator.is_some() {
-        return Err(anyhow!("--mode put does not support --coordinator (single endpoint only)"));
+        return Err(anyhow!(
+            "--mode put does not support --coordinator (single endpoint only)"
+        ));
     }
     let namespace = args
         .namespace
@@ -694,11 +696,10 @@ fn run_multi_endpoint(args: &Args, coordinator: &str) -> Result<()> {
                             // 把整个目标 buffer 均分为 N 段 (同一 MR, 不同偏移),
                             // 走 tag-15 SGE 路径; server 按段映射逐段 WRITE.
                             let view = registered.view();
-                            let seg_len = (buf_size / sge_segments).max(1) as u64;
+                            let seg_len = (buf_size / sge_segments.max(1)).max(1) as u64;
                             let mut segments = Vec::with_capacity(sge_segments);
                             let mut off = 0u64;
-                            let (base, rkey, total) =
-                                (view.addr(), view.rkey(), buf_size as u64);
+                            let (base, rkey, total) = (view.addr(), view.rkey(), buf_size as u64);
                             while off < total {
                                 let n = seg_len.min(total - off);
                                 segments.push((base + off, rkey, n));

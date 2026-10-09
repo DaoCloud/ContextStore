@@ -14,3 +14,4 @@ path = "src/lib.rs"
 rdma-sys = "0.3"
 anyhow = "1"
 libc = "0.2"
+contextstore-client-rs = { path = "../client-rs", features = ["rdma"] }

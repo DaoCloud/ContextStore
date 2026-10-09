@@ -30,7 +30,7 @@ use crate::rdma::wire::{
 use crate::router::ObjectKey;
 use crate::KVServiceContext;
 use anyhow::{anyhow, Result};
-use rdma_sys::ibv_access_flags;
+use rdma_sys::{ibv_access_flags, ibv_mtu};
 use std::net::{TcpListener, TcpStream};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -265,7 +265,13 @@ fn handle_client(
     let remote = wire::recv_hello(&mut stream)?;
     wire::send_hello(&mut stream, &qp.local)?;
 
-    qp.to_rtr(&remote, port_num, gid_index)?;
+    qp.to_rtr(
+        &remote,
+        port_num,
+        gid_index,
+        path_mtu_from_env(),
+        hop_limit_from_env(),
+    )?;
     qp.to_rts()?;
     tracing::info!(
         "RDMA QP established: local_qpn={} remote_qpn={}",
@@ -972,6 +978,29 @@ fn descriptor_meta_from_req(
     }
 
     Ok(meta)
+}
+
+/// RC path MTU override (bytes) for listener QPs: CS_RDMA_PATH_MTU=
+/// 512|1024|2048|4096, default 1024 (safe for standard 1500-byte networks).
+fn path_mtu_from_env() -> ibv_mtu::Type {
+    match std::env::var("CS_RDMA_PATH_MTU")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        Some(mtu) if mtu <= 512 => ibv_mtu::IBV_MTU_512,
+        Some(mtu) if mtu <= 1024 => ibv_mtu::IBV_MTU_1024,
+        Some(mtu) if mtu <= 2048 => ibv_mtu::IBV_MTU_2048,
+        Some(mtu) if mtu <= 4096 => ibv_mtu::IBV_MTU_4096,
+        _ => ibv_mtu::IBV_MTU_1024,
+    }
+}
+
+/// GRH hop limit override: CS_RDMA_HOP_LIMIT (default 1, same-subnet).
+fn hop_limit_from_env() -> u8 {
+    std::env::var("CS_RDMA_HOP_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .unwrap_or(1)
 }
 
 fn chunk_is_local(ctx: &KVServiceContext, location: &crate::metadata::ChunkLocation) -> bool {
